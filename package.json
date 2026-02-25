@@ -37,5 +37,11 @@
     "keeper",
     "liquidation",
     "defi"
-  ]
+  ],
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@percolator/sdk",
+      "@percolator/shared"
+    ]
+  }
 }
