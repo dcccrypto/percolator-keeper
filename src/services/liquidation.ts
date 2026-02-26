@@ -112,14 +112,39 @@ export class LiquidationService {
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
 
-      // Determine if this is a Pyth-pinned market (oracle_authority == [0;32])
-      const isPythPinned = cfg.oracleAuthority.equals(new PublicKey(new Uint8Array(32)));
+      // Determine market oracle mode:
+      // 1. Pyth-pinned: oracle_authority == [0;32] && index_feed_id != [0;32]
+      //    → use lastEffectivePriceE6 (staleness enforced on-chain by Pyth CPI)
+      // 2. Hyperp (DEX oracle): index_feed_id == [0;32]
+      //    → authority_price_e6 = mark, last_effective_price_e6 = index
+      //    → authority_timestamp stores funding rate, NOT a real timestamp
+      //    → use lastEffectivePriceE6 (index price, updated by on-chain crank)
+      // 3. Admin oracle: oracle_authority != [0;32] && index_feed_id != [0;32]
+      //    → use authorityPriceE6 with off-chain staleness check
+      const zeroKey = new PublicKey(new Uint8Array(32));
+      const isPythPinned = cfg.oracleAuthority.equals(zeroKey) && !cfg.indexFeedId.equals(zeroKey);
+      const isHyperp = cfg.indexFeedId.equals(zeroKey);
 
       let price: bigint;
       if (isPythPinned) {
         // Pyth-pinned: use lastEffectivePriceE6 (staleness enforced on-chain by Pyth CPI)
         price = cfg.lastEffectivePriceE6;
         if (price === 0n) return []; // No price resolved yet
+      } else if (isHyperp) {
+        // Hyperp mode: use index price (lastEffectivePriceE6), which is the on-chain
+        // crank's output from get_engine_oracle_price_e6. This is the price used for
+        // PnL settlement. DO NOT check authorityTimestamp — it stores funding rate,
+        // not a real timestamp.
+        price = cfg.lastEffectivePriceE6;
+        if (price === 0n) return []; // Market not bootstrapped yet
+
+        // Sanity check: mark price should also be non-zero in a healthy Hyperp market
+        if (cfg.authorityPriceE6 === 0n) {
+          if (engine.totalOpenInterest > 0n) {
+            logger.warn("Hyperp market has zero mark price, skipping", { slabAddress });
+          }
+          return [];
+        }
       } else {
         // Authority-pushed: use authorityPriceE6 with off-chain staleness check
         price = cfg.authorityPriceE6;
@@ -305,7 +330,13 @@ export class LiquidationService {
           return null;
         }
 
-        const freshPrice = freshCfg.authorityPriceE6;
+        // Use the same price source as scanMarket based on market mode
+        const freshZeroKey = new PublicKey(new Uint8Array(32));
+        const freshIsHyperp = freshCfg.indexFeedId.equals(freshZeroKey);
+        const freshIsPythPinned = freshCfg.oracleAuthority.equals(freshZeroKey) && !freshIsHyperp;
+        const freshPrice = (freshIsPythPinned || freshIsHyperp)
+          ? freshCfg.lastEffectivePriceE6
+          : freshCfg.authorityPriceE6;
         if (freshPrice > 0n) {
           const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
           if (notional > 0n) {

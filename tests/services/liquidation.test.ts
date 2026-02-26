@@ -121,6 +121,59 @@ import { LiquidationService } from '../../src/services/liquidation.js';
 import * as core from '@percolator/sdk';
 import * as shared from '@percolator/shared';
 
+// Helper to create a mock PublicKey with equals()
+function mockPubkey(base58: string) {
+  return {
+    toBase58: () => base58,
+    toBuffer: () => Buffer.alloc(32),
+    toBytes: () => new Uint8Array(32),
+    equals: (other: any) => {
+      if (!other) return false;
+      const otherStr = typeof other.toBase58 === 'function' ? other.toBase58() : String(other);
+      return otherStr === base58;
+    },
+  };
+}
+
+// Zero key (all zeros) - used for Pyth-pinned oracleAuthority and Hyperp indexFeedId
+const ZERO_KEY = (() => {
+  const pk = new PublicKey(new Uint8Array(32));
+  return pk;
+})();
+
+function mockZeroKey() {
+  return {
+    toBase58: () => ZERO_KEY.toBase58(),
+    toBuffer: () => Buffer.alloc(32),
+    toBytes: () => new Uint8Array(32),
+    equals: (other: any) => {
+      if (!other) return false;
+      // Check if all-zeros
+      if (typeof other.toBase58 === 'function') {
+        return other.toBase58() === ZERO_KEY.toBase58();
+      }
+      return false;
+    },
+  };
+}
+
+function mockNonZeroKey(base58 = 'NonZero1111111111111111111111111111111111') {
+  return {
+    toBase58: () => base58,
+    toBuffer: () => Buffer.from(base58),
+    toBytes: () => {
+      const bytes = new Uint8Array(32);
+      bytes[0] = 1; // Non-zero
+      return bytes;
+    },
+    equals: (other: any) => {
+      if (!other) return false;
+      const otherStr = typeof other.toBase58 === 'function' ? other.toBase58() : String(other);
+      return otherStr === base58;
+    },
+  };
+}
+
 describe('LiquidationService', () => {
   let liquidationService: LiquidationService;
   let mockOracleService: any;
@@ -144,101 +197,189 @@ describe('LiquidationService', () => {
   });
 
   describe('scanMarket', () => {
-    it('should find undercollateralized accounts', async () => {
+    it('should find undercollateralized accounts in Hyperp mode', async () => {
+      // Hyperp mode: indexFeedId == [0;32], oracleAuthority != [0;32]
       const mockMarket = {
         slabAddress: { toBase58: () => 'Market111111111111111111111111111111111' },
         programId: { toBase58: () => 'Program11111111111111111111111111111111' },
         config: {
           collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
-          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-          oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
-          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
-        },
-        params: {
-          maintenanceMarginBps: 500n, // 5%
-        },
-        header: {
-          admin: { toBase58: () => 'Admin111111111111111111111111111111111' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(), // Hyperp mode
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: 0n, // In Hyperp mode this is funding rate, NOT a timestamp
         },
       };
 
-      const mockSlabData = new Uint8Array(1024);
-
-      vi.mocked(core.fetchSlab).mockResolvedValue(mockSlabData);
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
       vi.mocked(core.parseEngine).mockReturnValue({
         totalOpenInterest: 100_000_000n,
-        numUsedAccounts: 1,
-        vault: 1000_000n,
-        insuranceFund: { balance: 500_000n, feeRevenue: 0n },
       } as any);
       vi.mocked(core.parseParams).mockReturnValue({
         maintenanceMarginBps: 500n,
       } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
-        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockZeroKey(), // Hyperp mode
+        authorityPriceE6: 1_000_000n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: 0n,
       } as any);
       vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
       vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
 
-      // Undercollateralized account: 100 USDC capital, 10,000 units position @ $1
-      // Notional = 10,000, margin ratio = 100 / 10,000 = 1% (below 5% maintenance)
+      // Undercollateralized: 100 USDC capital, 10,000 units @ $1 → 1% margin < 5% maintenance
       vi.mocked(core.parseAccount).mockReturnValue({
-        kind: 0, // User account
+        kind: 0,
         owner: { toBase58: () => 'User1111111111111111111111111111111111111' },
-        positionSize: 10_000_000_000n, // 10,000 units (6 decimals)
-        capital: 100_000_000n, // 100 USDC
+        positionSize: 10_000_000_000n,
+        capital: 100_000_000n,
+        entryPrice: 1_000_000n,
+      } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+      // Should find the candidate — Hyperp mode uses lastEffectivePriceE6, bypasses staleness check
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0].accountIdx).toBe(0);
+      expect(candidates[0].marginRatio).toBeLessThan(5);
+    });
+
+    it('should skip admin-oracle markets with stale oracle prices', async () => {
+      // Admin oracle mode: indexFeedId != [0;32], oracleAuthority != [0;32]
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market211111111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'), // Admin oracle (non-Hyperp)
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120), // 2 minutes old
+        },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({
+        totalOpenInterest: 100_000_000n,
+      } as any);
+      vi.mocked(core.parseParams).mockReturnValue({
+        maintenanceMarginBps: 500n,
+      } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'),
+        authorityPriceE6: 1_000_000n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120), // 2 minutes old
+      } as any);
+      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+      expect(candidates).toHaveLength(0); // Skipped due to stale price in admin oracle mode
+    });
+
+    it('should NOT skip Hyperp markets even when authorityTimestamp is zero', async () => {
+      // This is the critical regression test: Hyperp mode with authorityTimestamp=0
+      // (which stores funding rate, not a timestamp)
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market311111111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(), // Hyperp mode
+          authorityPriceE6: 2_000_000n,   // mark price = $2
+          lastEffectivePriceE6: 2_000_000n, // index price = $2
+          authorityTimestamp: 0n,           // Funding rate = 0 (NOT a timestamp!)
+        },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({
+        totalOpenInterest: 100_000_000n,
+      } as any);
+      vi.mocked(core.parseParams).mockReturnValue({
+        maintenanceMarginBps: 500n,
+      } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockZeroKey(),
+        authorityPriceE6: 2_000_000n,
+        lastEffectivePriceE6: 2_000_000n,
+        authorityTimestamp: 0n,
+      } as any);
+      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+      vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
+
+      // Undercollateralized account
+      vi.mocked(core.parseAccount).mockReturnValue({
+        kind: 0,
+        owner: { toBase58: () => 'User1111111111111111111111111111111111111' },
+        positionSize: 10_000_000_000n,
+        capital: 100_000_000n,
+        entryPrice: 2_000_000n,
+      } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+      // Should find the candidate — Hyperp mode bypasses the staleness check
+      expect(candidates).toHaveLength(1);
+    });
+
+    it('should find undercollateralized accounts in Pyth-pinned mode', async () => {
+      // Pyth-pinned: oracleAuthority == [0;32], indexFeedId != [0;32]
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market411111111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockZeroKey(), // Pyth-pinned
+          indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'),
+          authorityPriceE6: 0n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: 0n,
+        },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({
+        totalOpenInterest: 100_000_000n,
+      } as any);
+      vi.mocked(core.parseParams).mockReturnValue({
+        maintenanceMarginBps: 500n,
+      } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockZeroKey(),
+        indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'),
+        authorityPriceE6: 0n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: 0n,
+      } as any);
+      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+      vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
+
+      vi.mocked(core.parseAccount).mockReturnValue({
+        kind: 0,
+        owner: { toBase58: () => 'User1111111111111111111111111111111111111' },
+        positionSize: 10_000_000_000n,
+        capital: 100_000_000n,
         entryPrice: 1_000_000n,
       } as any);
 
       const candidates = await liquidationService.scanMarket(mockMarket as any);
 
       expect(candidates).toHaveLength(1);
-      expect(candidates[0].accountIdx).toBe(0);
-      expect(candidates[0].marginRatio).toBeLessThan(5); // Below 5%
-    });
-
-    it('should skip accounts with stale oracle prices', async () => {
-      const mockMarket = {
-        slabAddress: { toBase58: () => 'Market211111111111111111111111111111111' },
-        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
-        config: {
-          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
-          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-          oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
-          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120), // 2 minutes old
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
-      };
-
-      const mockSlabData = new Uint8Array(1024);
-
-      vi.mocked(core.fetchSlab).mockResolvedValue(mockSlabData);
-      vi.mocked(core.parseEngine).mockReturnValue({
-        totalOpenInterest: 100_000_000n,
-      } as any);
-      vi.mocked(core.parseParams).mockReturnValue({
-        maintenanceMarginBps: 500n,
-      } as any);
-      vi.mocked(core.parseConfig).mockReturnValue({
-        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
-        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120), // 2 minutes old (>60s)
-      } as any);
-      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
-
-      const candidates = await liquidationService.scanMarket(mockMarket as any);
-
-      expect(candidates).toHaveLength(0); // Skipped due to stale price
     });
   });
 
   describe('liquidate', () => {
     it('should execute liquidation with multi-instruction transaction', async () => {
       const mockMarket = {
-        slabAddress: { toBase58: () => 'Market311111111111111111111111111111111' },
+        slabAddress: { toBase58: () => 'Market511111111111111111111111111111111' },
         programId: { toBase58: () => 'Program11111111111111111111111111111111' },
         config: {
           collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
@@ -250,20 +391,19 @@ describe('LiquidationService', () => {
               return otherStr === '11111111111111111111111111111111';
             },
           },
-          indexFeedId: { toBytes: () => new Uint8Array(32).fill(0) },
+          indexFeedId: mockZeroKey(), // Hyperp mode
         },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
       };
 
-      const mockSlabData = new Uint8Array(1024);
-
-      vi.mocked(core.fetchSlab).mockResolvedValue(mockSlabData);
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
       vi.mocked(core.parseEngine).mockReturnValue({} as any);
       vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
-        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockZeroKey(),
+        authorityPriceE6: 1_000_000n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: 0n,
       } as any);
       vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
       vi.mocked(core.parseAccount).mockReturnValue({
@@ -286,7 +426,7 @@ describe('LiquidationService', () => {
 
     it('should increment liquidation count on success', async () => {
       const mockMarket = {
-        slabAddress: { toBase58: () => 'Market411111111111111111111111111111111' },
+        slabAddress: { toBase58: () => 'Market611111111111111111111111111111111' },
         programId: { toBase58: () => 'Program11111111111111111111111111111111' },
         config: {
           collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
@@ -298,18 +438,19 @@ describe('LiquidationService', () => {
               return otherStr === '11111111111111111111111111111111';
             },
           },
-          indexFeedId: { toBytes: () => new Uint8Array(32).fill(0) },
+          indexFeedId: mockZeroKey(),
         },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
       };
 
       vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
       vi.mocked(core.parseEngine).mockReturnValue({} as any);
       vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
-        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockZeroKey(),
+        authorityPriceE6: 1_000_000n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: 0n,
       } as any);
       vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
       vi.mocked(core.parseAccount).mockReturnValue({
