@@ -18,13 +18,6 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Build git dependencies
-        run: |
-          # pnpm 10 may skip prepare scripts for git deps; build them explicitly
-          SHARED=$(node -e "console.log(require.resolve('@percolator/shared/package.json').replace('/package.json',''))")
-          SDK=$(node -e "console.log(require.resolve('@percolator/sdk/package.json').replace('/package.json',''))")
-          (cd "$SHARED" && npx tsc)
-          (cd "$SDK" && npx tsup && npx tsc --emitDeclarationOnly --declaration --outDir dist)
       - run: pnpm build
       - run: pnpm test
 
