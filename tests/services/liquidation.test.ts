@@ -152,7 +152,7 @@ describe('LiquidationService', () => {
           collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
           oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
           indexFeedId: { toBytes: () => new Uint8Array(32) },
-          authorityPriceE6: 1_000_000n,
+          oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
           authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
         },
         params: {
@@ -176,7 +176,7 @@ describe('LiquidationService', () => {
         maintenanceMarginBps: 500n,
       } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        authorityPriceE6: 1_000_000n,
+        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
         authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
       } as any);
       vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
@@ -207,7 +207,7 @@ describe('LiquidationService', () => {
           collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
           oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
           indexFeedId: { toBytes: () => new Uint8Array(32) },
-          authorityPriceE6: 1_000_000n,
+          oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
           authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120), // 2 minutes old
         },
         params: { maintenanceMarginBps: 500n },
@@ -224,7 +224,7 @@ describe('LiquidationService', () => {
         maintenanceMarginBps: 500n,
       } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        authorityPriceE6: 1_000_000n,
+        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
         authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120), // 2 minutes old (>60s)
       } as any);
       vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
@@ -262,7 +262,7 @@ describe('LiquidationService', () => {
       vi.mocked(core.parseEngine).mockReturnValue({} as any);
       vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        authorityPriceE6: 1_000_000n,
+        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
         authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
       } as any);
       vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
@@ -308,7 +308,7 @@ describe('LiquidationService', () => {
       vi.mocked(core.parseEngine).mockReturnValue({} as any);
       vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
       vi.mocked(core.parseConfig).mockReturnValue({
-        authorityPriceE6: 1_000_000n,
+        oracleAuthority: { equals: () => false } as any, authorityPriceE6: 1_000_000n, lastEffectivePriceE6: 1_000_000n,
         authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
       } as any);
       vi.mocked(core.parseUsedIndices).mockReturnValue([0]);

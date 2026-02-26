@@ -111,19 +111,30 @@ export class LiquidationService {
 
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
-      const price = cfg.authorityPriceE6;
 
-      if (price === 0n) return []; // No price set
+      // Determine if this is a Pyth-pinned market (oracle_authority == [0;32])
+      const isPythPinned = cfg.oracleAuthority.equals(new PublicKey(new Uint8Array(32)));
 
-      // BC2: Check oracle staleness - reject if timestamp > 60s old
-      const now = BigInt(Math.floor(Date.now() / 1000));
-      const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
-      if (priceAge > 60n) {
-        // Only log for markets with actual positions (reduce noise)
-        if (engine.totalOpenInterest > 0n) {
-          logger.warn("Stale oracle price, skipping", { slabAddress, priceAgeSeconds: Number(priceAge), maxAge: 60 });
+      let price: bigint;
+      if (isPythPinned) {
+        // Pyth-pinned: use lastEffectivePriceE6 (staleness enforced on-chain by Pyth CPI)
+        price = cfg.lastEffectivePriceE6;
+        if (price === 0n) return []; // No price resolved yet
+      } else {
+        // Authority-pushed: use authorityPriceE6 with off-chain staleness check
+        price = cfg.authorityPriceE6;
+        if (price === 0n) return []; // No price set
+
+        // BC2: Check oracle staleness - reject if timestamp > 60s old
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
+        if (priceAge > 60n) {
+          // Only log for markets with actual positions (reduce noise)
+          if (engine.totalOpenInterest > 0n) {
+            logger.warn("Stale oracle price, skipping", { slabAddress, priceAgeSeconds: Number(priceAge), maxAge: 60 });
+          }
+          return []; // Don't liquidate with stale prices
         }
-        return []; // Don't liquidate with stale prices
       }
 
       // Use bitmap to find actually-used account indices (not sequential iteration)
