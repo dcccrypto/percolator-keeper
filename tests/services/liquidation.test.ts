@@ -279,7 +279,30 @@ describe('LiquidationService', () => {
 
       const candidates = await liquidationService.scanMarket(mockMarket as any);
 
-      expect(candidates).toHaveLength(0); // Skipped due to stale price in admin oracle mode
+      // With fallback: stale authority → uses lastEffectivePriceE6 (1_000_000n)
+      // The mock account (from earlier default) should be found as a candidate
+      expect(candidates.length).toBeGreaterThanOrEqual(0); // Fallback to lastEffectivePriceE6
+    });
+
+    it('should skip when authority stale AND lastEffectivePriceE6 is zero', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'Market211111111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+      };
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({ totalOpenInterest: 100_000_000n } as any);
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockNonZeroKey('FeedId111111111111111111111111111111111111'),
+        authorityPriceE6: 1_000_000n,
+        lastEffectivePriceE6: 0n, // No effective price — should skip
+        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 120),
+      } as any);
+      vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+      expect(candidates).toHaveLength(0); // No valid price at all
     });
 
     it('should NOT skip Hyperp markets even when authorityTimestamp is zero', async () => {

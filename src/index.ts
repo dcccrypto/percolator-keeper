@@ -41,6 +41,7 @@ crankService.getMarkets().forEach((_, slabAddress) => {
 });
 
 // Health endpoint
+const startupTime = Date.now();
 const healthPort = Number(process.env.KEEPER_HEALTH_PORT ?? 8081);
 const healthServer = http.createServer((req, res) => {
   if (req.url === "/health" && req.method === "GET") {
@@ -69,8 +70,12 @@ const healthServer = http.createServer((req, res) => {
     const timeSinceLastOracle = mostRecentOracle > 0 ? now - mostRecentOracle : Infinity;
     
     // Determine health status
-    let status: "ok" | "degraded" | "down";
-    if (timeSinceLastCrank < 60_000) {
+    // Grace period: allow 5 minutes after startup before marking as "down"
+    const uptimeMs = now - startupTime;
+    let status: "ok" | "degraded" | "down" | "starting";
+    if (uptimeMs < 300_000 && mostRecentCrank === 0) {
+      status = "starting"; // Still warming up, no cranks yet
+    } else if (timeSinceLastCrank < 60_000) {
       status = "ok";
     } else if (timeSinceLastCrank < 300_000) {
       status = "degraded";
@@ -92,7 +97,7 @@ const healthServer = http.createServer((req, res) => {
       },
     };
     
-    const statusCode = status === "down" ? 503 : 200;
+    const statusCode = status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
     res.writeHead(statusCode, { "Content-Type": "application/json" });
     res.end(JSON.stringify(healthData));
   } else {
