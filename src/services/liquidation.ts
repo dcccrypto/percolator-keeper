@@ -146,19 +146,36 @@ export class LiquidationService {
           return [];
         }
       } else {
-        // Authority-pushed: use authorityPriceE6 with off-chain staleness check
-        price = cfg.authorityPriceE6;
-        if (price === 0n) return []; // No price set
-
-        // BC2: Check oracle staleness - reject if timestamp > 60s old
+        // Authority-pushed: try authorityPriceE6 with off-chain staleness check
         const now = BigInt(Math.floor(Date.now() / 1000));
         const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
-        if (priceAge > 60n) {
-          // Only log for markets with actual positions (reduce noise)
-          if (engine.totalOpenInterest > 0n) {
-            logger.warn("Stale oracle price, skipping", { slabAddress, priceAgeSeconds: Number(priceAge), maxAge: 60 });
+        const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
+
+        if (authorityFresh) {
+          price = cfg.authorityPriceE6;
+        } else {
+          // Authority stale or absent — fall back to lastEffectivePriceE6.
+          // This mirrors the on-chain behavior: read_price_with_authority falls back
+          // to Pyth/Chainlink/DEX when authority is stale. lastEffectivePriceE6 is the
+          // clamped result from the last on-chain oracle resolution (any source).
+          price = cfg.lastEffectivePriceE6;
+          if (price === 0n) {
+            // No effective price at all — market not yet bootstrapped
+            if (engine.totalOpenInterest > 0n) {
+              logger.warn("No valid price (authority stale, no effective price), skipping", {
+                slabAddress,
+                authorityTimestamp: Number(cfg.authorityTimestamp),
+                priceAgeSeconds: Number(priceAge),
+              });
+            }
+            return [];
           }
-          return []; // Don't liquidate with stale prices
+          // Log the fallback at debug level (this is expected for most markets)
+          logger.debug("Authority price stale, using lastEffectivePriceE6", {
+            slabAddress,
+            priceAgeSeconds: Number(priceAge),
+            lastEffectivePriceE6: price.toString(),
+          });
         }
       }
 
