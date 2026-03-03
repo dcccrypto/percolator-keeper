@@ -273,17 +273,19 @@ export class OracleService {
     const mint = marketConfig.collateralMint.toBase58();
     let priceEntry = await this.fetchPrice(mint, slabAddress);
 
-    // Fallback for devnet test tokens with no external price source:
-    // use the last on-chain authority price, or default to 1.0
+    // No external price available — do NOT fall back to on-chain authorityPriceE6.
+    // Using the on-chain price as a fallback creates a feedback loop: if the
+    // on-chain price is corrupted (e.g. $13.3 quadrillion), the keeper would
+    // re-push the corrupted value indefinitely. Instead, skip the push and let
+    // the oracle-keeper.ts script (which fetches from Binance/CoinGecko/Jupiter)
+    // be the authoritative price source for devnet markets.
     if (!priceEntry) {
-      const onChainPrice = marketConfig.authorityPriceE6;
-      if (onChainPrice > 0n) {
-        priceEntry = { priceE6: onChainPrice, source: "on-chain", timestamp: Date.now() };
-        logger.info("Using on-chain price", { mint, onChainPrice: onChainPrice.toString() });
-      } else {
-        logger.warn("No price source available", { mint });
-        return false; // Don't push a guessed price
-      }
+      logger.warn("No price source available — skipping push (on-chain fallback disabled)", {
+        mint,
+        slabAddress,
+        onChainPrice: marketConfig.authorityPriceE6.toString(),
+      });
+      return false;
     }
 
     try {

@@ -489,6 +489,28 @@ describe('OracleService', () => {
     });
   });
 
+  describe('on-chain fallback disabled', () => {
+    it('should NOT use on-chain authorityPriceE6 when external sources fail', async () => {
+      // Simulate all external sources returning null
+      vi.mocked(fetch).mockResolvedValue({
+        json: async () => ({ pairs: [] }), // DexScreener returns no pairs
+      } as any);
+
+      const mockMarketConfig: any = {
+        collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
+        oracleAuthority: new PublicKey('11111111111111111111111111111111'),
+        // On-chain price is absurdly high (the bug scenario: $13.3 quadrillion)
+        authorityPriceE6: 13_300_000_000_000_000_000_000n,
+      };
+
+      const slab = 'SLAB_NO_ONCHAIN_FALLBACK';
+
+      // pushPrice should return false (skip) instead of pushing the corrupted on-chain value
+      const result = await oracleService.pushPrice(slab, mockMarketConfig);
+      expect(result).toBe(false);
+    });
+  });
+
   describe('getCurrentPrice', () => {
     it('should return latest price from history', async () => {
       const mockResponse = {
