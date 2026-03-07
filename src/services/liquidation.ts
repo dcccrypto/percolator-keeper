@@ -95,17 +95,54 @@ export class LiquidationService {
     this.intervalMs = intervalMs;
   }
 
+  // Markets to skip during liquidation scanning (comma-separated slab addresses in env)
+  private static readonly BLOCKED_MARKET_ADDRESSES: ReadonlySet<string> = new Set(
+    (process.env.BLOCKED_MARKET_ADDRESSES ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+
+  // Sentinel lastCrankSlot value used in corrupt/uninitialized test markets
+  private static readonly SENTINEL_CRANK_SLOT = 100_000_000n;
+
   /**
    * Scan a single market for undercollateralized accounts.
    */
   async scanMarket(market: DiscoveredMarket): Promise<LiquidationCandidate[]> {
     const slabAddress = market.slabAddress.toBase58();
 
+    // Skip explicitly blocklisted markets (e.g., wrong oracle_authority — issue #837)
+    if (LiquidationService.BLOCKED_MARKET_ADDRESSES.has(slabAddress)) {
+      logger.debug("Skipping blocklisted market", { slabAddress });
+      return [];
+    }
+
     try {
       const data = await fetchSlabWithRetry(market.slabAddress);
       const engine = parseEngine(data);
       const params = parseParams(data);
       const cfg = parseConfig(data);
+
+      // Guard: skip markets that were never properly InitMarket'd.
+      // maintenanceMarginBps === 0n is the canonical signal — a valid market always
+      // has a non-zero maintenance margin set during initialization.
+      // These corrupt/test markets (e.g. lastCrankSlot=100_000_000 sentinel) trigger
+      // custom program error 0x4 (InvalidArgument) on every crank attempt. (issue #838)
+      if (params.maintenanceMarginBps === 0n) {
+        logger.debug("Skipping uninitialised market (maintenanceMarginBps=0)", { slabAddress });
+        return [];
+      }
+
+      // Additional sentinel check: lastCrankSlot of exactly 100_000_000 is test data,
+      // not a real devnet slot, and indicates the market state was never cranked normally.
+      if (engine.lastCrankSlot === LiquidationService.SENTINEL_CRANK_SLOT) {
+        logger.warn("Skipping market with sentinel lastCrankSlot (corrupt state)", {
+          slabAddress,
+          lastCrankSlot: engine.lastCrankSlot.toString(),
+        });
+        return [];
+      }
       const layout = detectLayout(data.length);
       if (!layout) return [];
 

@@ -397,6 +397,101 @@ describe('LiquidationService', () => {
 
       expect(candidates).toHaveLength(1);
     });
+
+    it('should skip markets with maintenanceMarginBps=0 (uninitialized market — issue #838)', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'A35wGP21WCnpQuiHS3Ec3V8g22ikfmTfM2GHuq15uyfv' },
+        programId: { toBase58: () => 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+        },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({
+        totalOpenInterest: 100_000_000n,
+        lastCrankSlot: 999n, // not the sentinel
+        numUsedAccounts: 1,
+        vault: 0n,
+      } as any);
+      // maintenanceMarginBps === 0n → uninitialized, should be skipped
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 0n } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockNonZeroKey(),
+        authorityPriceE6: 1_000_000n,
+        lastEffectivePriceE6: 1_000_000n,
+        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+      } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+      expect(candidates).toHaveLength(0);
+      // fetchSlab should be called but parseUsedIndices should NOT
+      expect(core.parseUsedIndices).not.toHaveBeenCalled();
+    });
+
+    it('should skip markets with sentinel lastCrankSlot=100_000_000 (corrupt test data — issue #838)', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => '8dJs5dSz9rUcP7f9NMaMEyvBgK3F7dbsPP3G9Sx7Gcwx' },
+        programId: { toBase58: () => 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+        },
+      };
+
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({
+        totalOpenInterest: 100_000_000n,
+        lastCrankSlot: 100_000_000n, // sentinel value
+        numUsedAccounts: 1,
+        vault: 0n,
+      } as any);
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+      expect(candidates).toHaveLength(0);
+    });
+
+    it('should skip markets in BLOCKED_MARKET_ADDRESSES env var (issue #837)', async () => {
+      const blockedAddr = 'HjBePQZnoZVftg9B52gyeuHGjBvt2f8FNCVP4FeoP3YT';
+      const origEnv = process.env.BLOCKED_MARKET_ADDRESSES;
+      process.env.BLOCKED_MARKET_ADDRESSES = blockedAddr;
+
+      // Re-import to pick up new env — we test via direct Set injection instead
+      // (static field is already initialised; test the guard by checking fetchSlab not called)
+      // Because the static Set is evaluated at module load time, we verify the logic
+      // by temporarily overriding the Set on the class.
+      const originalSet = (LiquidationService as any).BLOCKED_MARKET_ADDRESSES;
+      (LiquidationService as any).BLOCKED_MARKET_ADDRESSES = new Set([blockedAddr]);
+
+      const mockMarket = {
+        slabAddress: { toBase58: () => blockedAddr },
+        programId: { toBase58: () => 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+        },
+      };
+
+      try {
+        const candidates = await liquidationService.scanMarket(mockMarket as any);
+        expect(candidates).toHaveLength(0);
+        // fetchSlab should NOT be called — blocklist check is before any RPC call
+        expect(core.fetchSlab).not.toHaveBeenCalled();
+      } finally {
+        (LiquidationService as any).BLOCKED_MARKET_ADDRESSES = originalSet;
+        if (origEnv === undefined) {
+          delete process.env.BLOCKED_MARKET_ADDRESSES;
+        } else {
+          process.env.BLOCKED_MARKET_ADDRESSES = origEnv;
+        }
+      }
+    });
   });
 
   describe('liquidate', () => {
