@@ -4,6 +4,7 @@ import { config, createLogger, initSentry, captureException, sendInfoAlert, crea
 import { OracleService } from "./services/oracle.js";
 import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
+import { DevnetPriceResolver } from "./services/devnet-price-resolver.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -19,7 +20,9 @@ if (!config.crankKeypair) {
 
 logger.info("Keeper service starting");
 
+const devnetResolver = new DevnetPriceResolver();
 const oracleService = new OracleService();
+oracleService.setDevnetResolver(devnetResolver);
 const crankService = new CrankService(oracleService);
 const liquidationService = new LiquidationService(oracleService);
 
@@ -111,6 +114,10 @@ healthServer.listen(healthPort, () => {
 });
 
 async function start() {
+  // Start devnet resolver first so oracle fallbacks are warm before first crank
+  await devnetResolver.start();
+  logger.info("DevnetPriceResolver started");
+
   const markets = await crankService.discover();
   logger.info("Markets discovered", { count: markets.length });
   crankService.start();
@@ -155,6 +162,10 @@ async function shutdown(signal: string): Promise<void> {
     // Stop liquidation service (clears timers)
     logger.info("Stopping liquidation service");
     liquidationService.stop();
+
+    // Stop devnet resolver refresh timer
+    logger.info("Stopping devnet price resolver");
+    devnetResolver.stop();
     
     // Note: Solana connection doesn't need explicit cleanup
     // Oracle service has no persistent state to clean up
