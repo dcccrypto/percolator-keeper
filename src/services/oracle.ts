@@ -7,6 +7,7 @@ import {
   type MarketConfig,
 } from "@percolator/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, eventBus, createLogger } from "@percolator/shared";
+import type { DevnetPriceResolver } from "./devnet-price-resolver.js";
 
 const logger = createLogger("keeper:oracle");
 
@@ -50,6 +51,13 @@ export class OracleService {
   private readonly maxTrackedMarkets = 500;
   // BM2: Deduplicate concurrent requests for the same mint
   private inFlightRequests = new Map<string, Promise<bigint | null>>();
+  // Optional devnet fallback resolver (set via setDevnetResolver after construction)
+  private devnetResolver: DevnetPriceResolver | null = null;
+
+  /** Attach a DevnetPriceResolver for mainnet_ca + static price fallbacks. */
+  setDevnetResolver(resolver: DevnetPriceResolver): void {
+    this.devnetResolver = resolver;
+  }
 
   /** Fetch price from DexScreener (with rate-limit cache) */
   async fetchDexScreenerPrice(mint: string): Promise<bigint | null> {
@@ -191,21 +199,84 @@ export class OracleService {
     }
 
     if (priceE6 === null) {
-      const history = this.priceHistory.get(slabAddress);
-      if (history && history.length > 0) {
-        const last = history[history.length - 1];
-        // Reject stale cached prices (>60s) to prevent bad liquidations
-        if (Date.now() - last.timestamp > CACHED_PRICE_MAX_AGE_MS) {
-          logger.warn("Cached price is stale", {
-            mint,
-            ageSeconds: Math.round((Date.now() - last.timestamp) / 1000),
-            maxAgeSeconds: CACHED_PRICE_MAX_AGE_MS / 1000
-          });
-          return null;
+      // ── Devnet fallback Layer 1: mainnet_ca reverse-lookup ───────────────
+      // Many devnet tokens are mirrors of mainnet tokens. DexScreener/Jupiter
+      // require the mainnet CA for price lookups — retry with it if available.
+      if (this.devnetResolver) {
+        const mainnetCa = this.devnetResolver.getMainnetCa(mint);
+        if (mainnetCa && mainnetCa !== mint) {
+          const [dex2, jup2] = await Promise.all([
+            this.fetchDexScreenerPrice(mainnetCa),
+            this.fetchJupiterPrice(mainnetCa),
+          ]);
+          // Cross-validate the mainnet-CA results using the same threshold
+          if (dex2 !== null && jup2 !== null && dex2 > 0n && jup2 > 0n) {
+            const larger2 = dex2 > jup2 ? dex2 : jup2;
+            const smaller2 = dex2 > jup2 ? jup2 : dex2;
+            const div2 = Number((larger2 - smaller2) * 100n / smaller2);
+            if (div2 <= MAX_CROSS_SOURCE_DEVIATION_PCT) {
+              priceE6 = dex2;
+              source = "dexscreener-mainnet-ca";
+            } else {
+              logger.warn("mainnet_ca cross-source divergence", {
+                mint,
+                mainnetCa,
+                divergencePct: div2,
+              });
+            }
+          } else if (dex2 !== null) {
+            priceE6 = dex2;
+            source = "dexscreener-mainnet-ca";
+          } else if (jup2 !== null) {
+            priceE6 = jup2;
+            source = "jupiter-mainnet-ca";
+          }
+
+          if (priceE6 !== null) {
+            logger.debug("Price resolved via mainnet_ca fallback", {
+              devnetMint: mint,
+              mainnetCa,
+              priceE6: priceE6.toString(),
+              source,
+            });
+          }
         }
-        return { ...last, source: "cached" };
       }
-      return null;
+
+      // ── Devnet fallback Layer 2: static price override ───────────────────
+      // Pure devnet-only tokens (no mainnet CA) can have a static price seeded
+      // by DevOps in the devnet_price_overrides Supabase table.
+      if (priceE6 === null && this.devnetResolver) {
+        const staticPrice = this.devnetResolver.getStaticPrice(mint);
+        if (staticPrice !== null) {
+          logger.debug("Price resolved via devnet static override", {
+            mint,
+            priceE6: staticPrice.toString(),
+          });
+          const entry: PriceEntry = { priceE6: staticPrice, source: "devnet-override", timestamp: Date.now() };
+          this.recordPrice(slabAddress, entry);
+          return entry;
+        }
+      }
+
+      // ── Cached price fallback ─────────────────────────────────────────────
+      if (priceE6 === null) {
+        const history = this.priceHistory.get(slabAddress);
+        if (history && history.length > 0) {
+          const last = history[history.length - 1];
+          // Reject stale cached prices (>60s) to prevent bad liquidations
+          if (Date.now() - last.timestamp > CACHED_PRICE_MAX_AGE_MS) {
+            logger.warn("Cached price is stale", {
+              mint,
+              ageSeconds: Math.round((Date.now() - last.timestamp) / 1000),
+              maxAgeSeconds: CACHED_PRICE_MAX_AGE_MS / 1000
+            });
+            return null;
+          }
+          return { ...last, source: "cached" };
+        }
+        return null;
+      }
     }
 
     // R2-S4: Historical deviation check — reject if >30% change from last known price
