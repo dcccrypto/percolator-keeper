@@ -892,9 +892,11 @@ describe('CrankService', () => {
     it('calls discoverMarkets with connection and program id', async () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([]);
       await crankService.discover();
+      // PERC-8235: third arg is options object { sequential: true, ... }
       expect(core.discoverMarkets).toHaveBeenCalledWith(
         expect.anything(),
         expect.anything(),
+        expect.objectContaining({ sequential: true }),
       );
     });
 
