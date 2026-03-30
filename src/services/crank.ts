@@ -254,6 +254,17 @@ export class CrankService {
           state.mainnetCA = dbMeta.mainnetCA;
         }
         state.missingDiscoveryCount = 0;
+        // P1 FIX: Reset consecutiveFailures on rediscovery so markets can recover.
+        // Previously, a market that hit MAX_CONSECUTIVE_FAILURES was dead until keeper restart.
+        // Now it gets a fresh chance every discovery cycle (default 5min).
+        if (state.consecutiveFailures > 0) {
+          logger.debug("Resetting consecutive failures on rediscovery", {
+            slabAddress: key,
+            previousFailures: state.consecutiveFailures,
+          });
+          state.consecutiveFailures = 0;
+          state.isActive = true;
+        }
         // GH#1508: Reset foreignOracleSkipped on re-discovery — oracle authority may have changed.
         // crankMarket() will re-check and re-set it if the keeper is still not the authority.
         if (state.foreignOracleSkipped) {
@@ -516,9 +527,24 @@ export class CrankService {
       state.failureCount++;
       state.consecutiveFailures++;
 
+      const errMsg = err instanceof Error ? err.message : String(err);
+
+      // P1 FIX: Detect InsufficientDexLiquidity (error 0x25 = 37) specifically.
+      // This is a permanent program-level rejection — the DEX pool doesn't meet the
+      // MIN_DEX_QUOTE_LIQUIDITY threshold. Log clearly so operators know the fix is
+      // to either change the pool or redeploy the program with a lower threshold.
+      if (errMsg.includes("Custom\":37") || errMsg.includes("custom program error: 0x25")) {
+        logger.error("InsufficientDexLiquidity — DEX pool does not meet program minimum liquidity threshold. " +
+          "Fix: use a pool with more liquidity, or redeploy the program with a lower MIN_DEX_QUOTE_LIQUIDITY.", {
+          slabAddress,
+          dexPoolAddress: state.dexPoolAddress ?? "none",
+          programId: market.programId.toBase58(),
+          consecutiveFailures: state.consecutiveFailures + 1,
+        });
+      }
+
       // Detect NotInitialized (error 0x4) — permanently skip these markets
       // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery
-      const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes("custom program error: 0x4")) {
         state.permanentlySkipped = true;
         state.permanentlySkippedAt = Date.now();
@@ -649,6 +675,15 @@ export class CrankService {
     }
 
     if (state.consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
+      // P0 FIX: Log on first skip so operators know WHY a market stopped cranking.
+      // Previously this was completely silent — the market would die with no trace in logs.
+      if (state.consecutiveFailures === MAX_CONSECUTIVE_FAILURES + 1) {
+        logger.warn("Market exceeded max consecutive failures — pausing cranks until next rediscovery", {
+          slabAddress,
+          consecutiveFailures: state.consecutiveFailures,
+          lastError: "Check previous crank error logs for root cause",
+        });
+      }
       skippedFailures++;
       continue;
     }
@@ -702,6 +737,19 @@ export class CrankService {
         logger.error("Batch error detail", { slabAddress: slab, error: error.message });
       }
     }
+
+    // P0 FIX: Always log cycle result with skip breakdown. Previously only logged
+    // when failed > 0, causing skipped-only cycles to produce zero log output.
+    logger.info("Crank cycle complete", {
+      success, failed, skipped,
+      toCrank: toCrank.length,
+      ...(skippedFailures > 0 && { skippedFailures }),
+      ...(skippedForeignOracle > 0 && { skippedForeignOracle }),
+      ...(skippedHyperpNoPrice > 0 && { skippedHyperpNoPrice }),
+      ...(skippedPermanent > 0 && { skippedPermanent }),
+      ...(skippedStalePaused > 0 && { skippedStalePaused }),
+      ...(skippedNotDue > 0 && { skippedNotDue }),
+    });
 
     this.lastCycleResult = { success, failed, skipped };
     return { success, failed, skipped };
@@ -818,9 +866,10 @@ export class CrankService {
         }
         if (this.markets.size > 0) {
           const result = await this.crankAll();
-          if (result.failed > 0) {
-            logger.info("Crank cycle complete", { success: result.success, failed: result.failed, skipped: result.skipped });
-          }
+          // Always log cycle result so operators can see the keeper is alive
+        if (result.failed > 0 || result.success > 0) {
+          logger.info("Crank cycle complete", { success: result.success, failed: result.failed, skipped: result.skipped });
+        }
         }
       } catch (err) {
         logger.error("Crank cycle failed", { error: err });
