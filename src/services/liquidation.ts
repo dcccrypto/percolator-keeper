@@ -508,6 +508,16 @@ export class LiquidationService {
     let candidateCount = 0;
     let liquidated = 0;
 
+    // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
+    // Markets re-add themselves on next parse failure, so this is safe.
+    if (this.permanentlySkipped.size > 0 && this.scanCount % 10 === 0) {
+      logger.debug("Clearing permanentlySkipped set for retry", {
+        count: this.permanentlySkipped.size,
+        markets: Array.from(this.permanentlySkipped).slice(0, 5),
+      });
+      this.permanentlySkipped.clear();
+    }
+
     // Process markets in batches to avoid RPC rate-limit bursts.
     // Batch size of 10 keeps us well within Helius free-tier (100 req/10s).
     const BATCH_SIZE = 10;

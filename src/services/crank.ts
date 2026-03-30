@@ -114,6 +114,8 @@ export class CrankService {
   private _isRunning = false;
   private _cycling = false;
   private _stalePauseCheck?: (slabAddress: string) => boolean;
+  // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
+  private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
 
   constructor(oracleService: OracleService, intervalMs?: number) {
     this.oracleService = oracleService;
@@ -332,17 +334,6 @@ export class CrankService {
     return !this.isAdminOracle(market) && isZeroFeed;
   }
 
-  /**
-   * Pyth-pinned mode: oracle_authority == [0;32] AND index_feed_id != [0;32].
-   */
-  // TODO: isPythPinned is currently unused — retained for future Pyth-pinned-specific crank logic.
-  // If no Pyth-specific handling is added, consider removing to keep the class surface lean.
-  private isPythPinned(market: DiscoveredMarket): boolean {
-    const feedBytes = market.config.indexFeedId.toBytes();
-    const isZeroFeed = feedBytes.every((b: number) => b === 0);
-    return !this.isAdminOracle(market) && !isZeroFeed;
-  }
-
   /** Check if a market is due for cranking based on activity */
   private isDue(state: MarketCrankState): boolean {
     const interval = state.isActive ? this.intervalMs : this.inactiveIntervalMs;
@@ -360,7 +351,7 @@ export class CrankService {
 
     try {
       const connection = getConnection();
-      const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+      const keypair = this._keypair;
       const programId = market.programId;
 
       // ── HYPERP mode: permissionless on-chain oracle ──────────────────────
@@ -506,14 +497,7 @@ export class CrankService {
       const sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
 
       // BC1: Track signature to prevent replay attacks
-      const now = Date.now();
-      this.recentSignatures.set(sig, now);
-      // Clean up signatures older than TTL
-      for (const [oldSig, timestamp] of this.recentSignatures.entries()) {
-        if (now - timestamp > this.signatureTTLMs) {
-          this.recentSignatures.delete(oldSig);
-        }
-      }
+      this.recentSignatures.set(sig, Date.now());
 
       state.lastCrankTime = Date.now();
       state.successCount++;
@@ -608,7 +592,7 @@ export class CrankService {
   // state.foreignOracleSkipped.  After discover() resets the flag, crankMarket() would
   // return false (and set failed++) instead of skipped.  Checking here means those markets
   // are categorised as skipped before they even enter the crank queue.
-  const keeperKey = loadKeypair(process.env.CRANK_KEYPAIR!).publicKey;
+  const keeperKey = this._keypair.publicKey;
 
   const toCrank: string[] = [];
 
@@ -736,6 +720,12 @@ export class CrankService {
       for (const [slab, error] of batchResult.errors) {
         logger.error("Batch error detail", { slabAddress: slab, error: error.message });
       }
+    }
+
+    // P2 FIX: Clean up stale signatures every cycle (was only on success path)
+    const now = Date.now();
+    for (const [oldSig, ts] of this.recentSignatures.entries()) {
+      if (now - ts > this.signatureTTLMs) this.recentSignatures.delete(oldSig);
     }
 
     // P0 FIX: Always log cycle result with skip breakdown. Previously only logged
