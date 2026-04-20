@@ -18,6 +18,7 @@ import {
 } from "@percolatorct/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
+import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -407,7 +408,19 @@ export class LiquidationService {
       //   - skipPreflight=true (saves ~20-50ms)
       //   - Multi-RPC parallel broadcast (+20-40% landing rate)
       //   - Simulation-based tight CU limit (better queue position)
-      const sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3);
+      const __t0 = Date.now();
+      recordAttempt();
+      let sig: string;
+      try {
+        sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3);
+        const __tip = process.env.USE_HELIUS_SENDER === "true"
+          ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
+          : 0;
+        recordLanded(Date.now() - __t0, __tip);
+      } catch (err) {
+        recordFailed();
+        throw err;
+      }
 
       // BC1: Track signature to prevent replay attacks
       const now = Date.now();

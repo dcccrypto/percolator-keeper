@@ -9,6 +9,7 @@ import { AdlService } from "./services/adl.js";
 import { MonitorService } from "./services/monitor.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
+import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -439,6 +440,8 @@ res.writeHead(401, secureJsonHeaders);
       },
       // 6.1 + 6.2 + 6.3: conservation invariants, crank cycle count, ADL staleness
       invariants: monitorService.getStatus(),
+      // Task 1.8: Sender land-rate + tip-spend metrics for Phase 1 rollout observability
+      senderMetrics: snapshotSenderMetrics(),
     };
     
     const statusCode = status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200

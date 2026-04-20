@@ -18,6 +18,7 @@ import {
 } from "@percolatorct/sdk";
 import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetryKeeper, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
+import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -568,7 +569,19 @@ export class CrankService {
         ]);
         instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
 
-        const sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
+        const __t0 = Date.now();
+        recordAttempt();
+        let sig: string;
+        try {
+          sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
+          const __tip = process.env.USE_HELIUS_SENDER === "true"
+            ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
+            : 0;
+          recordLanded(Date.now() - __t0, __tip);
+        } catch (err) {
+          recordFailed();
+          throw err;
+        }
         state.lastCrankTime = Date.now();
         state.successCount++;
         state.consecutiveFailures = 0;
@@ -607,7 +620,19 @@ export class CrankService {
       instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
 
       // PERC-204: Use keeper-optimized send (skipPreflight + multi-RPC + tight CU)
-      const sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
+      const __t0 = Date.now();
+      recordAttempt();
+      let sig: string;
+      try {
+        sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
+        const __tip = process.env.USE_HELIUS_SENDER === "true"
+          ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
+          : 0;
+        recordLanded(Date.now() - __t0, __tip);
+      } catch (err) {
+        recordFailed();
+        throw err;
+      }
 
       // BC1: Track signature to prevent replay attacks
       this.recentSignatures.set(sig, Date.now());

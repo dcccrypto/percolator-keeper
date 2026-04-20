@@ -53,6 +53,7 @@ import {
   sendCriticalAlert,
 } from "@percolatorct/shared";
 import type { MarketCrankState } from "./crank-types.js";
+import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 
 const logger = createLogger("keeper:adl");
 
@@ -460,7 +461,19 @@ export class AdlService {
         ]);
         const ix = buildIx({ programId, keys: adlKeys, data: adlData });
 
-        const sig = await sendWithRetryKeeper(connection, [ix], [keypair]);
+        const __t0 = Date.now();
+        recordAttempt();
+        let sig: string;
+        try {
+          sig = await sendWithRetryKeeper(connection, [ix], [keypair]);
+          const __tip = process.env.USE_HELIUS_SENDER === "true"
+            ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
+            : 0;
+          recordLanded(Date.now() - __t0, __tip);
+        } catch (err) {
+          recordFailed();
+          throw err;
+        }
 
         logger.info("ADL tx sent", {
           slabAddress,
