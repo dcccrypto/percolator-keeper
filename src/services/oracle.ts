@@ -54,7 +54,7 @@ export class OracleService {
   private priceHistory = new Map<string, PriceEntry[]>();
   private lastPushTime = new Map<string, number>();
   private _nonAuthorityLogged = new Set<string>();
-  private readonly rateLimitMs = 5_000;
+  private readonly rateLimitMs = parseInt(process.env.ORACLE_RATE_LIMIT_MS ?? "5000", 10);
   private readonly maxHistory = 100;
   private readonly maxTrackedMarkets = 500;
   // BM2: Deduplicate concurrent requests for the same mint
