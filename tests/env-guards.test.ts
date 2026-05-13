@@ -95,4 +95,77 @@ describe("validateKeeperEnvGuards", () => {
 
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
   });
+
+  // K-3 (HIGH): ADL_ENABLED must be explicit on mainnet so an operator who
+  // forgets the var cannot silently ship a keeper with the insurance-fund
+  // safety mechanism disabled.
+  it("throws when NETWORK=mainnet and ADL_ENABLED is unset", () => {
+    const env = {
+      NETWORK: "mainnet",
+      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).toThrow(
+      "ADL_ENABLED must be explicitly set"
+    );
+  });
+
+  it("throws when NETWORK=mainnet and ADL_ENABLED is a non-boolean value", () => {
+    const env = {
+      NETWORK: "mainnet",
+      ADL_ENABLED: "1",
+      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).toThrow(
+      "ADL_ENABLED must be explicitly set"
+    );
+  });
+
+  it("does not throw when NETWORK=mainnet and ADL_ENABLED=true", () => {
+    const env = {
+      NETWORK: "mainnet",
+      ADL_ENABLED: "true",
+      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  it("does not throw when NETWORK=mainnet and ADL_ENABLED=false", () => {
+    const env = {
+      NETWORK: "mainnet",
+      ADL_ENABLED: "false",
+      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  it("normalizes ADL_ENABLED case and whitespace on mainnet", () => {
+    const env = {
+      NETWORK: "mainnet",
+      ADL_ENABLED: "  True  ",
+      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  it("does not require ADL_ENABLED on devnet", () => {
+    const env = {
+      NETWORK: "devnet",
+      SOLANA_RPC_URL: "https://api.devnet.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  it("does not require ADL_ENABLED when NETWORK is unset", () => {
+    const env = {
+      SOLANA_RPC_URL: "https://api.devnet.solana.com",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
 });

@@ -63,7 +63,7 @@ docker run --env-file .env percolator-keeper
 | `SENTRY_DSN` | ❌ | Sentry error tracking DSN |
 | `KEEPER_HEALTH_PORT` | ❌ | Health check port (default: 8081) |
 | `KEEPER_REGISTER_SECRET` | ❌ | Shared secret for `/register` endpoint |
-| `ADL_ENABLED` | ❌ | Set to `true` to enable ADL service |
+| `ADL_ENABLED` | ✅ on mainnet | Must be `true` or `false` when `NETWORK=mainnet` (no default — guards against silent disable of the insurance-fund safety mechanism). Optional on devnet/testnet, defaults to disabled. |
 
 ## License
 

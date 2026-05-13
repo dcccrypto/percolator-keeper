@@ -44,12 +44,22 @@ const crankService = new CrankService(oracleService);
 const liquidationService = new LiquidationService(oracleService);
 const monitorService = new MonitorService();
 
-// ADL service — gated by ADL_ENABLED=true env var until on-chain instruction
-// (PERC-8273 T8) is live and T10 devnet upgrade is done (PERC-8275).
-const adlEnabled = process.env.ADL_ENABLED === "true";
+// ADL service — gated by ADL_ENABLED env var. On mainnet the value must be
+// set explicitly to "true" or "false" (enforced by validateKeeperEnvGuards
+// K-3). On devnet/testnet a missing var defaults to disabled for back-compat
+// with the original T8/T10 rollout flow (see PERC-8273 / PERC-8275).
+const adlEnabled = process.env.ADL_ENABLED?.trim().toLowerCase() === "true";
 const adlService = adlEnabled ? new AdlService() : null;
 if (adlEnabled) {
   logger.info("ADL service enabled (ADL_ENABLED=true)");
+} else if (isMainnet()) {
+  // Mainnet + explicit ADL_ENABLED=false: operator deliberately disabled the
+  // insurance-fund safety mechanism. Page ops loudly so this is never silent.
+  logger.warn("ADL service DISABLED on mainnet — insurance fund will not trigger ExecuteAdl");
+  sendCriticalAlert("Keeper booted on mainnet with ADL_ENABLED=false", [
+    { name: "Effect", value: "Insurance-fund shortfalls will NOT trigger ExecuteAdl", inline: false },
+    { name: "Remediation", value: "Set ADL_ENABLED=true unless this was intentional", inline: false },
+  ]).catch(() => {});
 } else {
   logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
 }

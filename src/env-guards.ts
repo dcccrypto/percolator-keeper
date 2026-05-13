@@ -53,4 +53,23 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
       );
     }
   }
+
+  // K-3 (HIGH): ADL_ENABLED must be set explicitly on mainnet.
+  // Auto-Deleveraging protects the protocol when the insurance fund cannot
+  // cover losses. The legacy default-off behaviour means an operator who
+  // forgets to set the var on a mainnet Railway deploy ships a keeper that
+  // will never send ExecuteAdl, leaving the protocol unprotected. Require
+  // an explicit "true" or "false" on mainnet; devnet keeps the legacy
+  // permissive default so local/CI workflows are unaffected.
+  if (env.NETWORK?.trim().toLowerCase() === "mainnet") {
+    const adl = env.ADL_ENABLED?.trim().toLowerCase();
+    if (adl !== "true" && adl !== "false") {
+      throw new Error(
+        "SECURITY: ADL_ENABLED must be explicitly set to \"true\" or \"false\" " +
+        `when NETWORK=mainnet (got ${JSON.stringify(env.ADL_ENABLED)}). ` +
+        "Set ADL_ENABLED=true to enable Auto-Deleveraging (recommended on mainnet), " +
+        "or ADL_ENABLED=false to acknowledge the insurance-fund risk explicitly."
+      );
+    }
+  }
 }
