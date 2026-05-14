@@ -310,6 +310,60 @@ describe("AdlService", () => {
     });
   });
 
+  describe("scanMarket — setOnAdlTx callback", () => {
+    beforeEach(() => {
+      service = new AdlService();
+      vi.mocked(sdk.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(sdk.parseEngine).mockReturnValue(makeEngine({ pnlPosTot: 2_000_000n }) as any);
+      vi.mocked(sdk.parseConfig).mockReturnValue(makeConfig({ maxPnlCap: 500_000n }) as any);
+    });
+
+    it("fires the callback with slabAddress for each landed ADL tx", async () => {
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 1, pnl: 900_000n, capital: 1_000_000n, positionSize: 100n },
+          { idx: 2, pnl: 600_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+      const onAdlTx = vi.fn();
+      service.setOnAdlTx(onAdlTx);
+
+      const result = await service.scanMarket(slabAddress, makeMarket() as any);
+
+      expect(result).toBe(2);
+      expect(onAdlTx).toHaveBeenCalledTimes(2);
+      expect(onAdlTx).toHaveBeenNthCalledWith(1, slabAddress);
+      expect(onAdlTx).toHaveBeenNthCalledWith(2, slabAddress);
+    });
+
+    it("does not fire the callback when the tx fails", async () => {
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 1, pnl: 900_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValueOnce(new Error("tx failed"));
+      const onAdlTx = vi.fn();
+      service.setOnAdlTx(onAdlTx);
+
+      const result = await service.scanMarket(slabAddress, makeMarket() as any);
+
+      expect(result).toBe(0);
+      expect(onAdlTx).not.toHaveBeenCalled();
+    });
+
+    it("does not throw when no callback is registered (back-compat)", async () => {
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 1, pnl: 900_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+
+      const result = await service.scanMarket(slabAddress, makeMarket() as any);
+      expect(result).toBe(1);
+    });
+  });
+
   describe("watchdog timer — cycling guard", () => {
     beforeEach(() => {
       vi.useFakeTimers();

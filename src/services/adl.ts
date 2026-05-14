@@ -295,10 +295,19 @@ export class AdlService {
   // Cache keypair at construction — avoids re-parsing from env on every scanMarket() call
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
   private _cycleStartedAt = 0;
+  // Optional observer fired after each successfully landed ExecuteAdl tx.
+  // Mirrors CrankService._onCrankCycle so MonitorService can be notified
+  // without AdlService taking a direct dependency on it.
+  private _onAdlTx?: (slabAddress: string) => void;
 
   /** Inject the crank service's market map so ADL can iterate tracked markets. */
   setMarketSource(fn: () => Map<string, MarketCrankState>): void {
     this._getMarkets = fn;
+  }
+
+  /** Register a callback fired after each landed ExecuteAdl tx. */
+  setOnAdlTx(fn: (slabAddress: string) => void): void {
+    this._onAdlTx = fn;
   }
 
   get isRunning(): boolean {
@@ -483,6 +492,7 @@ export class AdlService {
         });
 
         sent++;
+        this._onAdlTx?.(slabAddress);
         // Optimistic: reduce remaining excess by the position's PnL.
         // On next cycle we re-fetch fresh state anyway.
         remainingExcess =

@@ -167,6 +167,9 @@ crankService.setStalePauseCheck(isMarketStalePaused);
 
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
+if (adlService) {
+  adlService.setOnAdlTx((slab) => monitorService.notifyAdlTx(slab));
+}
 
 // Subscribe to crank events to track health
 crankService.getMarkets().forEach((_, slabAddress) => {
