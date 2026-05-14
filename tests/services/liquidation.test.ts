@@ -476,10 +476,78 @@ describe('LiquidationService', () => {
     });
   });
 
+  describe('liquidate — oracle drift guard', () => {
+    function setupDriftMocks(freshPriceE6: bigint) {
+      vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(core.parseEngine).mockReturnValue({} as any);
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        oracleAuthority: mockNonZeroKey(),
+        indexFeedId: mockZeroKey(),
+        authorityPriceE6: freshPriceE6,
+        lastEffectivePriceE6: freshPriceE6,
+        authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+      } as any);
+      vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
+      vi.mocked(core.parseAccount).mockReturnValue({
+        kind: 0,
+        owner: { toBase58: () => 'User6111111111111111111111111111111111111' },
+        positionSize: 10_000_000_000n,
+        capital: 1_000_000n,
+        entryPrice: 1_000_000n,
+        pnl: 0n,
+      } as any);
+    }
+
+    function mockMarket() {
+      return {
+        slabAddress: { toBase58: () => 'MarketDrift1111111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+    }
+
+    it('aborts when oracle drift exceeds the default 150 bps limit', async () => {
+      // Scan-time price: 1.000000 USDC; fresh price: 1.020000 (+200 bps, > 150 bps default)
+      setupDriftMocks(1_020_000n);
+
+      const result = await liquidationService.liquidate(mockMarket() as any, 0, 1_000_000n);
+
+      expect(result).toBeNull();
+      expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+    });
+
+    it('proceeds when oracle drift is within the limit', async () => {
+      // Scan-time price: 1.000000 USDC; fresh price: 1.010000 (+100 bps, < 150 bps default)
+      setupDriftMocks(1_010_000n);
+
+      const result = await liquidationService.liquidate(mockMarket() as any, 0, 1_000_000n);
+
+      expect(result).not.toBeNull();
+      expect(shared.sendWithRetryKeeper).toHaveBeenCalled();
+    });
+
+    it('skips the drift guard when scanPriceE6 is 0 (back-compat default)', async () => {
+      // Even with a huge fresh price, the guard is bypassed when no scan price is provided
+      setupDriftMocks(5_000_000n);
+
+      const result = await liquidationService.liquidate(mockMarket() as any, 0);
+
+      expect(result).not.toBeNull();
+      expect(shared.sendWithRetryKeeper).toHaveBeenCalled();
+    });
+  });
+
   describe('start and stop', () => {
     it('should start and stop timer', () => {
       const markets = new Map();
-      
+
       liquidationService.start(() => markets);
       expect(liquidationService.getStatus().running).toBe(true);
 

@@ -78,6 +78,18 @@ async function fetchSlabWithRetry(
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
 
+// Oracle-drift guard: abort liquidation if the oracle price has drifted more
+// than this between scan-time candidacy and pre-submit re-verification.
+// The on-chain LiquidateAtOracle instruction is 3 bytes (tag + u16 targetIdx —
+// see @percolatorct/sdk encodeLiquidateAtOracle) and cannot carry a [min,max]
+// bound, so keeper-side drift detection is the only available mitigation.
+// Default 150 bps (1.5%) — wider than typical intra-minute moves on SOL/BTC/ETH
+// but tight enough to cap keeper-wallet exposure on a 60s scan interval.
+// Set to 0 to disable the guard.
+const MAX_LIQUIDATION_DRIFT_BPS = BigInt(
+  parseInt(process.env.LIQUIDATION_MAX_ORACLE_DRIFT_BPS ?? "150", 10),
+);
+
 /**
  * Oracle mode for a market.
  * - 'pyth-pinned': oracle_authority == [0;32] && index_feed_id != [0;32]
@@ -145,6 +157,10 @@ interface LiquidationCandidate {
   pnl: bigint;
   marginRatio: number;  // as percentage
   maintenanceMarginBps: bigint;
+  // Oracle price (E6) at the moment candidacy was decided. Used by liquidate()
+  // to detect oracle drift between scan and submit and abort if it exceeds
+  // MAX_LIQUIDATION_DRIFT_BPS.
+  scanPriceE6: bigint;
 }
 
 export class LiquidationService {
@@ -263,6 +279,7 @@ export class LiquidationService {
               pnl: markPnl,
               marginRatio: equity <= 0n ? 0 : -1,
               maintenanceMarginBps,
+              scanPriceE6: price,
             });
             continue;
           }
@@ -280,6 +297,7 @@ export class LiquidationService {
               pnl: markPnl,
               marginRatio: Number(marginRatioBps) / 100,
               maintenanceMarginBps,
+              scanPriceE6: price,
             });
           }
         } catch {
@@ -325,6 +343,7 @@ export class LiquidationService {
   async liquidate(
     market: DiscoveredMarket,
     accountIdx: number,
+    scanPriceE6: bigint = 0n,
   ): Promise<string | null> {
     const slabAddress = market.slabAddress;
 
@@ -385,6 +404,35 @@ export class LiquidationService {
         // (fixes bug where admin-oracle staleness fallback was missing here)
         const freshMode = detectOracleMode(freshCfg);
         const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
+
+        // Oracle-drift guard: the on-chain LiquidateAtOracle instruction cannot
+        // carry a price bound (encodeLiquidateAtOracle is 3 bytes — tag + u16
+        // targetIdx). If the oracle has moved more than MAX_LIQUIDATION_DRIFT_BPS
+        // since candidacy was decided in scanMarket(), the on-chain execution
+        // price may differ enough to flip the liquidation's P&L. Abort rather
+        // than absorb that drift on the keeper wallet.
+        if (
+          MAX_LIQUIDATION_DRIFT_BPS > 0n &&
+          scanPriceE6 > 0n &&
+          freshPrice > 0n
+        ) {
+          const delta = freshPrice > scanPriceE6
+            ? freshPrice - scanPriceE6
+            : scanPriceE6 - freshPrice;
+          const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
+          if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+            logger.warn("Aborting liquidation: oracle drift exceeds limit", {
+              accountIndex: accountIdx,
+              slabAddress: slabAddress.toBase58(),
+              scanPriceE6: scanPriceE6.toString(),
+              freshPriceE6: freshPrice.toString(),
+              driftBps: driftBps.toString(),
+              limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+            });
+            return null;
+          }
+        }
+
         if (freshPrice > 0n) {
           const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
           if (notional > 0n) {
@@ -540,7 +588,11 @@ export class LiquidationService {
 
         // Liquidations are sequential (each is a transaction)
         for (const candidate of candidates) {
-          const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx);
+          const sig = await this.liquidate(
+            filteredBatch[j]!.market,
+            candidate.accountIdx,
+            candidate.scanPriceE6,
+          );
           if (sig) liquidated++;
         }
       }
