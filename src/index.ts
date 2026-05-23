@@ -9,6 +9,7 @@ import { AdlService } from "./services/adl.js";
 import { MonitorService } from "./services/monitor.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
+import { assertMainnetProgramId } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 
 // Monitoring — alerts to Discord on threshold breaches
@@ -33,6 +34,7 @@ validateKeeperEnvGuards();
 // If NETWORK=mainnet, the keeper runs against mainnet program (requires FORCE_MAINNET=1).
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
 // and price lookups use mainnet mints directly (no mainnetCA override needed).
+assertMainnetProgramId({ isMainnet: isMainnet(), programId: config.programId });
 if (isMainnet()) {
   logger.info("Running in MAINNET mode", { programId: config.programId });
 }
