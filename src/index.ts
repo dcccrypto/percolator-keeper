@@ -10,6 +10,8 @@ import { MonitorService } from "./services/monitor.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
+import { captureAndExit } from "./lib/exit-handlers.js";
+import { StartupTracker } from "./lib/startup-tracker.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -54,9 +56,10 @@ if (adlEnabled) {
   logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
 }
 
-// Health state tracking
-let lastSuccessfulCrankTime = 0;
-let lastOracleUpdateTime = 0;
+// A5: gate /health on real readiness — Railway otherwise marks the container
+// healthy the moment the HTTP server binds, well before start() finishes
+// discovering markets and wiring services.
+const startupTracker = new StartupTracker();
 
 // Stale oracle pause guard — markets paused due to stale oracle data
 const stalePausedMarkets = new Set<string>();
@@ -86,7 +89,9 @@ const solBalanceCheckInterval = setInterval(async () => {
         logger.warn("Keeper SOL balance below threshold", {
           solBalance: solBalance.toFixed(4),
           thresholdSol: SOL_BALANCE_WARN_THRESHOLD,
-          walletAddress: keypair.publicKey.toBase58(),
+          // A8: truncate to match the Discord field below — full pubkey in logs is
+          // noise and exposes the keeper wallet identity to anyone with log access.
+          walletAddress: keypair.publicKey.toBase58().slice(0, 16) + "...",
         });
         sendWarningAlert("Keeper wallet SOL balance low", [
           { name: "Balance", value: `${solBalance.toFixed(4)} SOL`, inline: true },
@@ -168,18 +173,12 @@ crankService.setStalePauseCheck(isMarketStalePaused);
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 
-// Subscribe to crank events to track health
-crankService.getMarkets().forEach((_, slabAddress) => {
-  const checkCrankHealth = () => {
-    const markets = crankService.getMarkets();
-    for (const [_, state] of markets) {
-      if (state.lastCrankTime > lastSuccessfulCrankTime) {
-        lastSuccessfulCrankTime = state.lastCrankTime;
-      }
-    }
-  };
-  setInterval(checkCrankHealth, 10_000); // Check every 10s
-});
+// A4: deleted the per-market setInterval loop that used to live here. It was
+// unreachable: crankService.getMarkets() is called at module load time, before
+// discover() has populated the map, so the forEach iterated an empty Map and
+// registered zero intervals. The variables it wrote (lastSuccessfulCrankTime,
+// lastOracleUpdateTime) were never read — /health computes most-recent crank
+// time on every request from the live crank state.
 
 // Health endpoint
 const startupTime = Date.now();
@@ -340,6 +339,18 @@ res.writeHead(401, secureJsonHeaders);
   }
 
   if (req.url === "/health" && req.method === "GET") {
+    // A5: hard 503 until start() resolved. Railway otherwise marks the
+    // container healthy as soon as healthServer.listen() returns — long
+    // before discover() + service.start() have wired anything up.
+    if (!startupTracker.isReady()) {
+      res.writeHead(503, secureJsonHeaders);
+      res.end(JSON.stringify({
+        status: startupTracker.isFailed() ? "failed" : "starting",
+        failureReason: startupTracker.failureReason,
+      }));
+      return;
+    }
+
     const markets = crankService.getMarkets();
     const marketsTracked = markets.size;
     
@@ -554,11 +565,26 @@ async function start() {
   ]).catch(() => {}); // Don't crash if alert fails
 }
 
-start().catch((err) => {
-  logger.error("Failed to start keeper", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
-  // Don't exit — keep the process alive for healthcheck + retry
-  logger.info("Keeper will stay alive for healthcheck despite startup error");
-});
+// A5: explicit success → ready, failure → captureAndExit. Previously a
+// start() rejection only logged and left the process up, which let Railway
+// keep marking the container healthy while no actual work was happening.
+start()
+  .then(() => {
+    startupTracker.markReady();
+    logger.info("Keeper start() resolved — health endpoint now reports ready");
+  })
+  .catch((err) => {
+    startupTracker.markFailed(err instanceof Error ? err.message : String(err));
+    captureAndExit("Failed to start keeper — exiting", err, {
+      capture: captureException,
+      logger,
+      exit: process.exit,
+      setTimer: (cb, ms) => {
+        const t = setTimeout(cb, ms);
+        t.unref();
+      },
+    });
+  });
 
 const SHUTDOWN_TIMEOUT_MS = 15_000;
 
@@ -620,20 +646,26 @@ async function shutdown(signal: string): Promise<void> {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-// Safety net: catch any unhandled rejections or exceptions so Railway doesn't kill
-// the process mid-cycle. Log the error, but keep the keeper alive for healthcheck
-// and retry on the next interval. Without these handlers, Node.js 15+ exits on
-// unhandled rejections by default, causing the crash-loop seen in Railway logs.
-process.on("unhandledRejection", (reason, promise) => {
-  logger.error("Unhandled promise rejection — keeping process alive", {
-    reason: reason instanceof Error ? reason.message : String(reason),
-    stack: reason instanceof Error ? reason.stack : undefined,
-  });
+// A6: crash on unhandled rejections / exceptions. Previously we logged and kept
+// the process alive — but the keeper signs against live funds, and silent
+// recovery from an unhandled error risks operating with corrupt in-process
+// state (half-written maps, dangling promises holding resources). Better to
+// capture to Sentry, wait briefly for flush, then exit so Railway restarts a
+// clean process.
+const crashDeps = {
+  capture: captureException,
+  logger,
+  exit: process.exit,
+  setTimer: (cb: () => void, ms: number) => {
+    const t = setTimeout(cb, ms);
+    t.unref();
+  },
+};
+
+process.on("unhandledRejection", (reason) => {
+  captureAndExit("Unhandled promise rejection — exiting", reason, crashDeps);
 });
 
 process.on("uncaughtException", (err) => {
-  logger.error("Uncaught exception — keeping process alive", {
-    error: err.message,
-    stack: err.stack,
-  });
+  captureAndExit("Uncaught exception — exiting", err, crashDeps);
 });
