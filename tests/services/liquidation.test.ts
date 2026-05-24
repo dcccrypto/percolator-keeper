@@ -121,10 +121,19 @@ vi.mock('@percolatorct/shared', () => ({
   }),
 }));
 
+vi.mock('../../src/lib/keeper-send.js', async () => {
+  const { KeeperBudget } = await vi.importActual<typeof import('../../src/lib/budget.js')>('../../src/lib/budget.js');
+  return {
+    keeperSend: vi.fn(async () => ({ signature: 'mock-keeper-signature', estimatedCost: 5000 })),
+    sharedBudget: new KeeperBudget(),
+  };
+});
+
 import { PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
 import { LiquidationService } from '../../src/services/liquidation.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
+import * as keeperSendModule from '../../src/lib/keeper-send.js';
 
 // Zero key (all zeros) - used for Pyth-pinned oracleAuthority and Hyperp indexFeedId
 const ZERO_KEY = (() => {
@@ -502,8 +511,8 @@ describe('LiquidationService', () => {
         header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
       };
 
-      // Simulate 0x4 error from sendWithRetryKeeper
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValueOnce(
+      // Simulate 0x4 error from keeperSend
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValueOnce(
         new Error('Transaction simulation failed: custom program error: 0x4'),
       );
       vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
@@ -553,7 +562,7 @@ describe('LiquidationService', () => {
         header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
       };
 
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValueOnce(
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValueOnce(
         new Error('custom program error: 0x4'),
       );
       vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
@@ -581,7 +590,7 @@ describe('LiquidationService', () => {
       expect(svc.getStatus().permanentlySkippedCount).toBe(1);
 
       // Now run scanAndLiquidateAll — the corrupt market should be skipped entirely
-      vi.mocked(shared.sendWithRetryKeeper).mockClear();
+      vi.mocked(keeperSendModule.keeperSend).mockClear();
       vi.mocked(core.fetchSlab).mockClear();
       const markets = new Map([
         [corruptAddr, { market: mockMarket as any }],
@@ -590,7 +599,7 @@ describe('LiquidationService', () => {
 
       // scanMarket should NOT have been called (filtered before batch)
       // so no send should have been attempted
-      expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+      expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
       expect(result.scanned).toBe(0);
     });
 

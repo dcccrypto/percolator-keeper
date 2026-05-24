@@ -18,9 +18,10 @@ import {
   type DiscoveredMarket,
   type DexType,
 } from "@percolatorct/sdk";
-import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetryKeeper, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
+import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -643,7 +644,12 @@ export class CrankService {
         recordAttempt();
         let sig: string;
         try {
-          sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3, KEEPER_SEND_OPTS);
+          const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
+          if (!sendResult) {
+            recordFailed();
+            return false;
+          }
+          sig = sendResult.signature;
           const __tip = process.env.USE_HELIUS_SENDER === "true"
             ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
             : 0;
@@ -694,7 +700,12 @@ export class CrankService {
       recordAttempt();
       let sig: string;
       try {
-        sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3, KEEPER_SEND_OPTS);
+        const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
+        if (!sendResult) {
+          recordFailed();
+          return false;
+        }
+        sig = sendResult.signature;
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;
