@@ -10,6 +10,8 @@ import { MonitorService } from "./services/monitor.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
+import { getRedisClient } from "./lib/redis-client.js";
+import { LeaderLock, makeIdentity } from "./lib/leader.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -52,6 +54,22 @@ if (adlEnabled) {
   logger.info("ADL service enabled (ADL_ENABLED=true)");
 } else {
   logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
+}
+
+// HA leader lock — null when HA_ENABLED is not set or KEEPER_REDIS_URL is absent
+const haEnabled = process.env.HA_ENABLED === "true";
+const redisClient = haEnabled ? getRedisClient() : null;
+const leaderLock: LeaderLock | null =
+  haEnabled && redisClient !== null
+    ? new LeaderLock(redisClient, makeIdentity(), {
+        ttlMs: Number(process.env.KEEPER_LEADER_LOCK_TTL_MS ?? 30_000),
+        renewMs: Number(process.env.KEEPER_LEADER_LOCK_RENEW_MS ?? 10_000),
+        pollMs: Number(process.env.KEEPER_STANDBY_POLL_MS ?? 5_000),
+      })
+    : null;
+
+if (haEnabled && redisClient === null) {
+  logger.warn("HA_ENABLED=true but KEEPER_REDIS_URL is unset — running as standalone leader");
 }
 
 // Health state tracking
@@ -414,6 +432,7 @@ res.writeHead(401, secureJsonHeaders);
 
     const healthData = {
       status,
+      role: leaderLock ? leaderLock.role() : "leader",
       lastCrankTime: mostRecentCrank,
       lastOracleUpdate: mostRecentOracle,
       marketsTracked,
@@ -444,7 +463,9 @@ res.writeHead(401, secureJsonHeaders);
       senderMetrics: snapshotSenderMetrics(),
     };
     
-    const statusCode = status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
+    const currentRole = leaderLock ? leaderLock.role() : "leader";
+    // Standby nodes are healthy by definition — services intentionally not running
+    const statusCode = currentRole === "standby" ? 200 : status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
     res.writeHead(statusCode, secureJsonHeaders);
     res.end(JSON.stringify(healthData));
   } else {
@@ -533,24 +554,56 @@ async function start() {
     logger.info("No markets found — keeper will idle and retry discovery each cycle. This is normal for fresh mainnet deployments.");
   }
 
-  crankService.start();
-  logger.info("Crank service started");
-  liquidationService.start(() => crankService.getMarkets());
-  logger.info("Liquidation scanner started");
-  monitorService.start(() => crankService.getMarkets());
-  logger.info("MonitorService started (invariant + ADL staleness checks)");
+  function startAllServices(): void {
+    crankService.start();
+    logger.info("Crank service started");
+    liquidationService.start(() => crankService.getMarkets());
+    logger.info("Liquidation scanner started");
+    monitorService.start(() => crankService.getMarkets());
+    logger.info("MonitorService started (invariant + ADL staleness checks)");
 
-  // ADL service — starts only when ADL_ENABLED=true and markets are discovered.
-  // Depends on on-chain ExecuteAdl (tag 50) being live (T8/PERC-8273).
-  if (adlService) {
-    adlService.start(() => crankService.getMarkets());
-    logger.info("ADL service started");
+    if (adlService) {
+      adlService.start(() => crankService.getMarkets());
+      logger.info("ADL service started");
+    }
   }
-  
+
+  function stopAllServices(): void {
+    if (adlService) {
+      adlService.stop();
+      logger.info("ADL service stopped (HA demote)");
+    }
+    crankService.stop();
+    logger.info("Crank service stopped (HA demote)");
+    liquidationService.stop();
+    logger.info("Liquidation service stopped (HA demote)");
+    monitorService.stop();
+    logger.info("MonitorService stopped (HA demote)");
+  }
+
+  if (leaderLock) {
+    const network = process.env.NETWORK ?? "devnet";
+    leaderLock.start({
+      network,
+      onPromote: () => {
+        logger.info("HA: promoted to leader — starting services", { network });
+        startAllServices();
+      },
+      onDemote: (reason) => {
+        logger.warn("HA: demoted from leader — stopping services", { network, reason });
+        stopAllServices();
+      },
+    });
+    logger.info("HA leader election active", { network, haEnabled: true });
+  } else {
+    startAllServices();
+  }
+
   // Send startup alert
   await sendInfoAlert("Keeper service started", [
     { name: "Markets Tracked", value: markets.length.toString(), inline: true },
     { name: "Health Endpoint", value: `http://localhost:${healthPort}/health`, inline: true },
+    { name: "HA Mode", value: leaderLock ? "enabled" : "standalone", inline: true },
   ]).catch(() => {}); // Don't crash if alert fails
 }
 
@@ -582,6 +635,12 @@ async function shutdown(signal: string): Promise<void> {
     clearInterval(liqStaleCheckInterval);
     clearInterval(solBalanceCheckInterval);
     monitorService.stop();
+
+    // Release leader lock so a standby can immediately take over
+    if (leaderLock) {
+      logger.info("Releasing leader lock");
+      await leaderLock.stop();
+    }
 
     // Close health server
     logger.info("Closing health server");
