@@ -19,6 +19,7 @@ import {
 import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import type { AccountLoader } from "../lib/account-loader.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -168,10 +169,17 @@ export class LiquidationService {
   private readonly permanentlySkipped = new Set<string>();
   // Cache keypair at construction — avoids re-parsing from env on every liquidate() call
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+  /** LaserStream account loader — injected for event-driven portfolio scanning. */
+  private readonly _accountLoader?: AccountLoader;
+  /** Per-account debounce timers: slab pubkey → setTimeout handle. */
+  private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly _DEBOUNCE_MS = 1_000;
+  private _unsubLoader?: () => void;
 
-  constructor(oracleService: OracleService, intervalMs = 60_000) {
+  constructor(oracleService: OracleService, intervalMs = 60_000, accountLoader?: AccountLoader) {
     this.oracleService = oracleService;
     this.intervalMs = intervalMs;
+    this._accountLoader = accountLoader;
   }
 
   /**
@@ -581,10 +589,10 @@ export class LiquidationService {
         const result = await this.scanAndLiquidateAll(marketsSnapshot);
         this.consecutiveFailures = 0; // Reset on success
         if (result.candidates > 0) {
-          logger.info("Liquidation scan complete", { 
-            scanned: result.scanned, 
-            candidates: result.candidates, 
-            liquidated: result.liquidated 
+          logger.info("Liquidation scan complete", {
+            scanned: result.scanned,
+            candidates: result.candidates,
+            liquidated: result.liquidated
           });
         }
       } catch (err) {
@@ -607,9 +615,59 @@ export class LiquidationService {
       }
     };
     this.timer = setInterval(runCycle, this.intervalMs);
+
+    // Event-driven path: when KEEPER_USE_LASERSTREAM=true and an accountLoader
+    // is injected, subscribe to account updates and debounce scans per slab.
+    // The polling path above remains active as a safety net (slow path).
+    if (
+      process.env.KEEPER_USE_LASERSTREAM === "true" &&
+      this._accountLoader
+    ) {
+      this._unsubLoader = this._accountLoader.onAccount((update) => {
+        const markets = getMarkets();
+        if (!markets.has(update.pubkey)) return;
+        const market = markets.get(update.pubkey)!;
+        const slabKey = market.market.slabAddress.toBase58();
+        const existing = this._debounceTimers.get(slabKey);
+        if (existing) clearTimeout(existing);
+        this._debounceTimers.set(
+          slabKey,
+          setTimeout(() => {
+            this._debounceTimers.delete(slabKey);
+            // Single-market scan — fire-and-forget; errors logged inside scanMarket.
+            this.scanMarket(market.market).then(async (candidates) => {
+              for (const c of candidates) {
+                const sig = await this.liquidate(market.market, c.accountIdx);
+                if (sig) {
+                  logger.info("Event-driven liquidation complete", {
+                    slabAddress: slabKey,
+                    accountIdx: c.accountIdx,
+                    signature: sig,
+                  });
+                }
+              }
+            }).catch((err: unknown) => {
+              logger.warn("Event-driven scan/liquidate failed", {
+                slabAddress: slabKey,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }, this._DEBOUNCE_MS),
+        );
+      });
+      logger.info("Liquidation service: event-driven mode active", {
+        debounceMs: this._DEBOUNCE_MS,
+      });
+    }
   }
 
   stop(): void {
+    if (this._unsubLoader) {
+      this._unsubLoader();
+      this._unsubLoader = undefined;
+    }
+    for (const t of this._debounceTimers.values()) clearTimeout(t);
+    this._debounceTimers.clear();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
