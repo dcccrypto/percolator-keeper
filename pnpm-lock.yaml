@@ -12,7 +12,7 @@ importers:
   .:
     dependencies:
       '@percolatorct/sdk':
-        specifier: ^2.0.9
+        specifier: 2.0.9
         version: 2.0.9(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@6.0.6)
       '@percolatorct/shared':
         specifier: 1.0.0-beta.8
