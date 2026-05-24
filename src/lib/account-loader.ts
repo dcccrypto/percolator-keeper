@@ -1,3 +1,4 @@
+import { PublicKey } from "@solana/web3.js";
 import { createLogger } from "@percolatorct/shared";
 import { AccountCache } from "./account-cache.js";
 import { ReconnectBackoff } from "./stream-reconnect.js";
@@ -113,8 +114,12 @@ export class LaserStreamAdapter implements StreamAdapter {
           const ownerBytes = info.owner;
           if (!pubkeyBytes || !ownerBytes) return;
 
-          const pubkey = Buffer.from(pubkeyBytes).toString("base64");
-          const owner = Buffer.from(ownerBytes).toString("base64");
+          // Encode as base58 so cache keys match the canonical Solana pubkey
+          // representation used everywhere else in the keeper (PublicKey#toBase58
+          // in CrankService, LiquidationService, market maps, /status responses).
+          // Without this the fast-path cache lookups in discover()/scan won't hit.
+          const pubkey = new PublicKey(pubkeyBytes).toBase58();
+          const owner = new PublicKey(ownerBytes).toBase58();
 
           onAccountUpdate({
             pubkey,
