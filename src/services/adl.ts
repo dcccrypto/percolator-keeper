@@ -54,6 +54,7 @@ import {
 } from "@percolatorct/shared";
 import type { MarketCrankState } from "./crank-types.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import { txSentTotal, solSpentLamportsTotal, txLandTimeSeconds } from "../lib/metrics.js";
 
 const logger = createLogger("keeper:adl");
 
@@ -469,9 +470,14 @@ export class AdlService {
           const __tip = process.env.USE_HELIUS_SENDER === "true"
             ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
             : 0;
-          recordLanded(Date.now() - __t0, __tip);
+          const __elapsed = Date.now() - __t0;
+          recordLanded(__elapsed, __tip);
+          txSentTotal.inc({ result: "success", type: "liquidation" });
+          txLandTimeSeconds.observe({ type: "liquidation", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
+          if (__tip > 0) solSpentLamportsTotal.inc({ type: "liquidation" }, __tip);
         } catch (err) {
           recordFailed();
+          txSentTotal.inc({ result: "fail", type: "liquidation" });
           throw err;
         }
 

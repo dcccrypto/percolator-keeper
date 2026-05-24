@@ -25,6 +25,7 @@ import {
   sendCriticalAlert,
   sendWarningAlert,
 } from "@percolatorct/shared";
+import { cycleDurationSeconds } from "../lib/metrics.js";
 import type { MarketCrankState } from "./crank-types.js";
 
 const logger = createLogger("keeper:monitor");
@@ -107,12 +108,15 @@ export class MonitorService {
     });
 
     this._timer = setInterval(async () => {
+      const _t0 = Date.now();
       try {
         await this._runChecks();
       } catch (err) {
         logger.error("MonitorService check cycle failed", {
           error: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        cycleDurationSeconds.observe({ service: "monitor" }, (Date.now() - _t0) / 1000);
       }
     }, INVARIANT_CHECK_INTERVAL_MS);
 

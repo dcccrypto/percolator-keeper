@@ -10,6 +10,8 @@ import { MonitorService } from "./services/monitor.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
+import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
+import * as metricsServer from "./lib/metrics-server.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -78,6 +80,7 @@ const solBalanceCheckInterval = setInterval(async () => {
     const lamports = await conn.getBalance(keypair.publicKey);
     _keeperSolBalanceLamports = lamports;
     const solBalance = lamports / 1e9;
+    walletBalanceSol.set(solBalance);
 
     if (solBalance < SOL_BALANCE_WARN_THRESHOLD) {
       // Rate-limit alerts to once per 5 minutes to avoid Discord spam
@@ -172,6 +175,7 @@ crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 crankService.getMarkets().forEach((_, slabAddress) => {
   const checkCrankHealth = () => {
     const markets = crankService.getMarkets();
+    activeMarketsCount.set(markets.size);
     for (const [_, state] of markets) {
       if (state.lastCrankTime > lastSuccessfulCrankTime) {
         lastSuccessfulCrankTime = state.lastCrankTime;
@@ -533,6 +537,7 @@ async function start() {
     logger.info("No markets found — keeper will idle and retry discovery each cycle. This is normal for fresh mainnet deployments.");
   }
 
+  activeMarketsCount.set(markets.length);
   crankService.start();
   logger.info("Crank service started");
   liquidationService.start(() => crankService.getMarkets());
@@ -547,6 +552,9 @@ async function start() {
     logger.info("ADL service started");
   }
   
+  registerDefaultMetrics();
+  metricsServer.start();
+
   // Send startup alert
   await sendInfoAlert("Keeper service started", [
     { name: "Markets Tracked", value: markets.length.toString(), inline: true },
@@ -582,6 +590,10 @@ async function shutdown(signal: string): Promise<void> {
     clearInterval(liqStaleCheckInterval);
     clearInterval(solBalanceCheckInterval);
     monitorService.stop();
+
+    // Stop metrics server
+    logger.info("Closing metrics server");
+    await metricsServer.stop();
 
     // Close health server
     logger.info("Closing health server");

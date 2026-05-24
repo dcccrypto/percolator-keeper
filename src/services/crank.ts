@@ -21,6 +21,12 @@ import {
 import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetryKeeper, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import {
+  txSentTotal,
+  solSpentLamportsTotal,
+  cycleDurationSeconds,
+  txLandTimeSeconds,
+} from "../lib/metrics.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -647,7 +653,11 @@ export class CrankService {
           const __tip = process.env.USE_HELIUS_SENDER === "true"
             ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
             : 0;
-          recordLanded(Date.now() - __t0, __tip);
+          const __elapsed = Date.now() - __t0;
+          recordLanded(__elapsed, __tip);
+          txSentTotal.inc({ result: "success", type: "crank" });
+          txLandTimeSeconds.observe({ type: "crank", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
+          if (__tip > 0) solSpentLamportsTotal.inc({ type: "crank" }, __tip);
         } catch (err) {
           recordFailed();
           throw err;
@@ -698,7 +708,11 @@ export class CrankService {
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;
-        recordLanded(Date.now() - __t0, __tip);
+        const __elapsed = Date.now() - __t0;
+        recordLanded(__elapsed, __tip);
+        txSentTotal.inc({ result: "success", type: "crank" });
+        txLandTimeSeconds.observe({ type: "crank", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
+        if (__tip > 0) solSpentLamportsTotal.inc({ type: "crank" }, __tip);
       } catch (err) {
         recordFailed();
         throw err;
@@ -718,6 +732,7 @@ export class CrankService {
     } catch (err) {
       state.failureCount++;
       state.consecutiveFailures++;
+      txSentTotal.inc({ result: "fail", type: "crank" });
 
       const errMsg = err instanceof Error ? err.message : String(err);
 
@@ -782,6 +797,7 @@ export class CrankService {
   }
 
   async crankAll(): Promise<{ success: number; failed: number; skipped: number }> {
+  const _crankAllStart = Date.now();
   let success = 0;
   let failed = 0;
 
@@ -807,6 +823,7 @@ export class CrankService {
   for (const [slabAddress, state] of this.markets) {
     if (state.permanentlySkipped) {
       skippedPermanent++;
+      txSentTotal.inc({ result: "drop", type: "crank" });
       continue;
     }
     // GH#1251: Live authority check — covers both the steady-state case (flag already set)
@@ -949,6 +966,7 @@ export class CrankService {
       ...(skippedNotDue > 0 && { skippedNotDue }),
     });
 
+    cycleDurationSeconds.observe({ service: "crank" }, (Date.now() - _crankAllStart) / 1000);
     this.lastCycleResult = { success, failed, skipped };
     return { success, failed, skipped };
   }

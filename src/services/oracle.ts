@@ -3,6 +3,7 @@ import {
   type MarketConfig,
 } from "@percolatorct/sdk";
 import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolatorct/shared";
+import { oraclePushCountTotal, oracleStalenessSeconds } from "../lib/metrics.js";
 
 const logger = createLogger("keeper:oracle");
 
@@ -302,6 +303,7 @@ export class OracleService {
 
     const entry: PriceEntry = { priceE6, source, timestamp: Date.now() };
     this.recordPrice(slabAddress, entry);
+    oraclePushCountTotal.inc({ mint, source });
     // M-4: Record that an external source produced a valid price. This resets the
     // fallback clock so the on-chain fallback cap counts from the last real fetch.
     this.lastExternalPriceMs.set(slabAddress, entry.timestamp);
@@ -366,8 +368,12 @@ export class OracleService {
     const stale: string[] = [];
     for (const [slabAddress] of this.priceHistory) {
       const lastPush = this.lastPushTime.get(slabAddress) ?? 0;
-      if (lastPush === 0 || now - lastPush > thresholdMs) {
+      const stalenessMs = lastPush === 0 ? Infinity : now - lastPush;
+      if (lastPush === 0 || stalenessMs > thresholdMs) {
         stale.push(slabAddress);
+      }
+      if (isFinite(stalenessMs)) {
+        oracleStalenessSeconds.set({ mint: slabAddress }, stalenessMs / 1000);
       }
     }
     return stale;

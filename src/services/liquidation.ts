@@ -19,6 +19,12 @@ import {
 import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import {
+  txSentTotal,
+  solSpentLamportsTotal,
+  cycleDurationSeconds,
+  txLandTimeSeconds,
+} from "../lib/metrics.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -416,9 +422,14 @@ export class LiquidationService {
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;
-        recordLanded(Date.now() - __t0, __tip);
+        const __elapsed = Date.now() - __t0;
+        recordLanded(__elapsed, __tip);
+        txSentTotal.inc({ result: "success", type: "liquidation" });
+        txLandTimeSeconds.observe({ type: "liquidation", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
+        if (__tip > 0) solSpentLamportsTotal.inc({ type: "liquidation" }, __tip);
       } catch (err) {
         recordFailed();
+        txSentTotal.inc({ result: "fail", type: "liquidation" });
         throw err;
       }
 
@@ -492,6 +503,7 @@ export class LiquidationService {
     candidates: number;
     liquidated: number;
   }> {
+    const _scanStart = Date.now();
     let scanned = 0;
     let candidateCount = 0;
     let liquidated = 0;
@@ -551,6 +563,7 @@ export class LiquidationService {
       }
     }
 
+    cycleDurationSeconds.observe({ service: "liquidation" }, (Date.now() - _scanStart) / 1000);
     this.scanCount++;
     this.lastScanTime = Date.now();
     return { scanned, candidates: candidateCount, liquidated };
