@@ -19,6 +19,7 @@ import {
 import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import { AlertAggregator } from "../lib/alert-aggregator.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -168,6 +169,26 @@ export class LiquidationService {
   private readonly permanentlySkipped = new Set<string>();
   // Cache keypair at construction — avoids re-parsing from env on every liquidate() call
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+  // B4: per-cycle dedup so the same owner is never targeted twice in the same
+  // scan cycle. A user underwater in multiple markets used to get N parallel
+  // liquidates fired; now we attempt one per cycle and let the next cycle pick
+  // up any residual undercollateralization.
+  private _cycleSeenOwners = new Set<string>();
+  // B5: collapse per-liquidation Discord alerts into a single summary alert per
+  // market within a 5 s window — prevents cascade-driven channel flooding.
+  private readonly _liquidationAlertAggregator = new AlertAggregator(
+    async (key, count) => {
+      const market = key.startsWith("liq:") ? key.slice(4) : key;
+      await sendWarningAlert(
+        count === 1 ? "Liquidation executed" : `${count} liquidations executed in market`,
+        [
+          { name: "Market", value: market.slice(0, 16), inline: true },
+          { name: "Count", value: count.toString(), inline: true },
+        ],
+      ).catch(() => {});
+    },
+    { bufferMs: 5_000 },
+  );
 
   constructor(oracleService: OracleService, intervalMs = 60_000) {
     this.oracleService = oracleService;
@@ -252,7 +273,13 @@ export class LiquidationService {
           const markPnl = account.pnl;
           const equity = account.capital + markPnl;
 
-          // H4: If equity <= 0, definitely liquidatable (skip ratio calc)
+          // B3: If equity <= 0 the account is definitely liquidatable — short-circuit
+          // before the marginRatioBps computation. The bigint divide truncates toward
+          // zero, so `equity * BPS_MULTIPLIER / notional` can round to 0n for tiny
+          // positive equity, which is fine for the liquidatable comparison (the
+          // candidate is collected and the on-chain program reads the canonical
+          // values during execution). Dropped the unreachable `-1` branch — that
+          // ternary always evaluated to 0 inside the `equity <= 0n` arm.
           if (equity <= 0n) {
             candidates.push({
               slabAddress,
@@ -261,12 +288,14 @@ export class LiquidationService {
               positionSize: account.positionSize,
               capital: account.capital,
               pnl: markPnl,
-              marginRatio: equity <= 0n ? 0 : -1,
+              marginRatio: 0,
               maintenanceMarginBps,
             });
             continue;
           }
 
+          // multiply by BPS_MULTIPLIER before dividing — keep all precision the
+          // bigint allows before the final truncating divide.
           const marginRatioBps = equity * BPS_MULTIPLIER / notional;
 
           // If margin ratio < maintenance margin, this account is liquidatable
@@ -438,14 +467,10 @@ export class LiquidationService {
         signature: sig,
       });
       logger.info("Account liquidated", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), signature: sig });
-      
-      // Send Discord alert for liquidation execution — fire-and-forget; never let Discord errors crash the liquidation loop
-      sendWarningAlert("Liquidation executed", [
-        { name: "Market", value: slabAddress.toBase58().slice(0, 8), inline: true },
-        { name: "Account Index", value: accountIdx.toString(), inline: true },
-        { name: "Signature", value: sig.slice(0, 12), inline: true },
-      ])?.catch(() => {});
-      
+
+      // B5: aggregate per-liquidation Discord alerts into a 5 s summary per market.
+      this._liquidationAlertAggregator.add(`liq:${slabAddress.toBase58()}`);
+
       return sig;
     } catch (err) {
       const errMsg = getErrorMessage(err);
@@ -495,6 +520,10 @@ export class LiquidationService {
     let scanned = 0;
     let candidateCount = 0;
     let liquidated = 0;
+    // B4: fresh per-cycle dedup set — owners targeted in earlier cycles can
+    // be re-targeted next cycle (the previous liquidate may have only chipped
+    // away part of their exposure).
+    this._cycleSeenOwners.clear();
 
     // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
     // Markets re-add themselves on next parse failure, so this is safe.
@@ -538,8 +567,17 @@ export class LiquidationService {
         const candidates = result.value;
         candidateCount += candidates.length;
 
-        // Liquidations are sequential (each is a transaction)
+        // Liquidations are sequential (each is a transaction).
+        // B4: skip owners already targeted earlier in this scan cycle.
         for (const candidate of candidates) {
+          if (this._cycleSeenOwners.has(candidate.owner)) {
+            logger.debug("Skipping owner already targeted this cycle", {
+              owner: candidate.owner.slice(0, 8),
+              slabAddress: candidate.slabAddress.slice(0, 8),
+            });
+            continue;
+          }
+          this._cycleSeenOwners.add(candidate.owner);
           const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx);
           if (sig) liquidated++;
         }
@@ -613,6 +651,9 @@ export class LiquidationService {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+      // B5: flush any pending aggregated alerts so a SIGTERM during a cascade
+      // doesn't drop the summary.
+      void this._liquidationAlertAggregator.flush();
       logger.info("Liquidation service stopped");
     }
   }

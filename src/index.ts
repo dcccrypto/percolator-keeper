@@ -103,6 +103,13 @@ const solBalanceCheckInterval = setInterval(async () => {
 }, 60_000);
 solBalanceCheckInterval.unref();
 
+// B7: per-market cooldown so we don't fire a Discord critical every 60 s while
+// an oracle is stuck. The old aggregate alert reset only when the stale set
+// emptied, which never happened during a multi-hour DEX outage — channel got
+// nuked. Track last-alert per slab and re-fire only after STALE_ALERT_COOLDOWN_MS.
+const STALE_ALERT_COOLDOWN_MS = Number(process.env.KEEPER_STALE_ALERT_COOLDOWN_MS ?? 5 * 60_000);
+const lastStaleAlertByMarket = new Map<string, number>();
+
 const staleCheckInterval = setInterval(() => {
   // Skip stale checks during startup grace period (GH#29 — false CRITICAL floods on deploy)
   if (Date.now() - _keeperStartTime < STARTUP_GRACE_MS) return;
@@ -127,10 +134,26 @@ const staleCheckInterval = setInterval(() => {
     }
   }
 
-  // Send alert for 5-min stale markets (includes paused ones)
-  if (alertStale.length > 0) {
+  // Recovered markets should drop their cooldown entry so a fresh staleness
+  // event re-alerts immediately rather than waiting for the cooldown window.
+  const alertSet = new Set(alertStale);
+  for (const market of Array.from(lastStaleAlertByMarket.keys())) {
+    if (!alertSet.has(market)) lastStaleAlertByMarket.delete(market);
+  }
+
+  // B7: per-market cooldown — gather the subset whose cooldown has elapsed.
+  const now = Date.now();
+  const toAlert: string[] = [];
+  for (const market of alertStale) {
+    const last = lastStaleAlertByMarket.get(market) ?? 0;
+    if (now - last >= STALE_ALERT_COOLDOWN_MS) {
+      lastStaleAlertByMarket.set(market, now);
+      toAlert.push(market);
+    }
+  }
+  if (toAlert.length > 0) {
     sendCriticalAlert("Oracle stale for markets", [
-      { name: "Stale Markets", value: alertStale.join(", "), inline: false },
+      { name: "Stale Markets", value: toAlert.join(", "), inline: false },
       { name: "Paused (>10min)", value: stalePausedMarkets.size.toString(), inline: true },
     ]).catch(() => {});
   }
@@ -453,9 +476,10 @@ res.writeHead(401, secureJsonHeaders);
   }
 });
 
-healthServer.listen(healthPort, () => {
-  logger.info("Health endpoint started", { port: healthPort });
-});
+// B13: do NOT bind the health port at module load. start() calls .listen()
+// after services are wired so Railway treats the missing port as unhealthy
+// during boot — without this, Railway flips to "healthy" the moment the
+// server binds (well before the keeper can actually crank anything).
 
 /**
  * Escalating retry delays for startup market discovery.
@@ -533,7 +557,7 @@ async function start() {
     logger.info("No markets found — keeper will idle and retry discovery each cycle. This is normal for fresh mainnet deployments.");
   }
 
-  crankService.start();
+  await crankService.start();
   logger.info("Crank service started");
   liquidationService.start(() => crankService.getMarkets());
   logger.info("Liquidation scanner started");
@@ -546,7 +570,19 @@ async function start() {
     adlService.start(() => crankService.getMarkets());
     logger.info("ADL service started");
   }
-  
+
+  // B13: bind the health port only after every service is wired up. Wrapped in
+  // a Promise so start() awaits the bind callback before resolving — otherwise
+  // a concurrent /health probe could land between this call and start() resolving.
+  await new Promise<void>((resolve, reject) => {
+    healthServer.once("error", reject);
+    healthServer.listen(healthPort, () => {
+      healthServer.off("error", reject);
+      logger.info("Health endpoint started", { port: healthPort });
+      resolve();
+    });
+  });
+
   // Send startup alert
   await sendInfoAlert("Keeper service started", [
     { name: "Markets Tracked", value: markets.length.toString(), inline: true },

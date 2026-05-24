@@ -990,21 +990,19 @@ describe('CrankService', () => {
   describe('start and stop', () => {
     it('should start timer and perform initial discovery', async () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([]);
-      
-      crankService.start();
-      
+
+      // B11: start() is now async — await it so we can verify initial discovery synchronously
+      await crankService.start();
+
       expect(crankService.isRunning).toBe(true);
-      
-      // Wait for initial discovery
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
       expect(core.discoverMarkets).toHaveBeenCalled();
     });
 
-    it('should stop timer', () => {
-      crankService.start();
+    it('should stop timer', async () => {
+      vi.mocked(core.discoverMarkets).mockResolvedValue([]);
+      await crankService.start();
       expect(crankService.isRunning).toBe(true);
-      
+
       crankService.stop();
       expect(crankService.isRunning).toBe(false);
     });

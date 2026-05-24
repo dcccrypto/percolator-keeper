@@ -353,6 +353,12 @@ export class AdlService {
    * Returns number of ExecuteAdl transactions sent (0 if ADL not needed).
    */
   async scanMarket(slabAddress: string, market: DiscoveredMarket): Promise<number> {
+    // B17: stamp lastScanTime on every scan so /status reports activity even
+    // when the trigger conditions are false. Without this the field stays at 0
+    // and looks like the ADL service has never run — operators can't tell
+    // "ADL is off" from "ADL is hung".
+    this._getOrCreateState(slabAddress).lastScanTime = Date.now();
+
     const connection = getConnection();
     const keypair = this._keypair;
     const programId = market.programId;
