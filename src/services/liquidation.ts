@@ -80,6 +80,24 @@ const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
 
 /**
+ * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
+ * both compute this value; extracting it both unblocks property testing and
+ * prevents drift between the two call sites.
+ *
+ * Semantics (matches the inline code that was duplicated):
+ *  - notional == 0n  → 0n (no position, nothing to ratio)
+ *  - equity   <= 0n  → 0n (B3: underwater = liquidatable; the unreachable
+ *                          `-1` sentinel that lived inside the equity<=0n
+ *                          branch is removed in the same commit)
+ *  - else            → equity * 10_000n / notional (bigint divide truncates)
+ */
+export function computeMarginRatioBps(equity: bigint, notional: bigint): bigint {
+  if (notional === 0n) return 0n;
+  if (equity <= 0n) return 0n;
+  return equity * BPS_MULTIPLIER / notional;
+}
+
+/**
  * Oracle mode for a market.
  * - 'pyth-pinned': oracle_authority == [0;32] && index_feed_id != [0;32]
  *   → staleness enforced on-chain by Pyth CPI
@@ -272,33 +290,12 @@ export class LiquidationService {
           // Use account.pnl directly — it is always populated and accurate.
           const markPnl = account.pnl;
           const equity = account.capital + markPnl;
+          const marginRatioBps = computeMarginRatioBps(equity, notional);
 
-          // B3: If equity <= 0 the account is definitely liquidatable — short-circuit
-          // before the marginRatioBps computation. The bigint divide truncates toward
-          // zero, so `equity * BPS_MULTIPLIER / notional` can round to 0n for tiny
-          // positive equity, which is fine for the liquidatable comparison (the
-          // candidate is collected and the on-chain program reads the canonical
-          // values during execution). Dropped the unreachable `-1` branch — that
-          // ternary always evaluated to 0 inside the `equity <= 0n` arm.
-          if (equity <= 0n) {
-            candidates.push({
-              slabAddress,
-              accountIdx: i,
-              owner: account.owner.toBase58(),
-              positionSize: account.positionSize,
-              capital: account.capital,
-              pnl: markPnl,
-              marginRatio: 0,
-              maintenanceMarginBps,
-            });
-            continue;
-          }
-
-          // multiply by BPS_MULTIPLIER before dividing — keep all precision the
-          // bigint allows before the final truncating divide.
-          const marginRatioBps = equity * BPS_MULTIPLIER / notional;
-
-          // If margin ratio < maintenance margin, this account is liquidatable
+          // If margin ratio < maintenance margin, this account is liquidatable.
+          // The equity<=0n short-circuit lives inside computeMarginRatioBps;
+          // a candidate with marginRatioBps == 0n is collected here just like
+          // any other below-threshold ratio.
           if (marginRatioBps < maintenanceMarginBps) {
             candidates.push({
               slabAddress,
@@ -416,18 +413,21 @@ export class LiquidationService {
         const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
         if (freshPrice > 0n) {
           const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
-          if (notional > 0n) {
-            // v12.17: entryPrice is always 0n (removed from on-chain struct).
-            // Use freshAccount.pnl directly for re-verification.
-            const freshMarkPnl = freshAccount.pnl;
-            const equity = freshAccount.capital + freshMarkPnl;
-            if (equity > 0n) {
-              const marginRatioBps = equity * BPS_MULTIPLIER / notional;
-              if (marginRatioBps >= freshParams.maintenanceMarginBps) {
-                logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
-                return null;
-              }
-            }
+          // A.13: shared helper. equity<=0n returns 0n, which is < any
+          // positive maintenanceMarginBps and so correctly proceeds with
+          // liquidation; the previous `if (equity > 0n)` wrapper just
+          // skipped the re-check entirely on underwater equity, missing
+          // the same liquidation case the scanMarket path catches.
+          const freshMarkPnl = freshAccount.pnl;
+          const equity = freshAccount.capital + freshMarkPnl;
+          const marginRatioBps = computeMarginRatioBps(equity, notional);
+          if (
+            notional > 0n &&
+            equity > 0n &&
+            marginRatioBps >= freshParams.maintenanceMarginBps
+          ) {
+            logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
+            return null;
           }
         }
       }

@@ -109,7 +109,10 @@ interface MarketCrankState {
  *  resolves so there is no read-modify-write race even under unusual
  *  microtask interleavings.
  */
-async function processBatched<T>(
+// A.15: exported so the per-item counter correctness can be property-tested
+// directly. Module-private would force testing via crankAll() with discovery
+// + filtering wrapper overhead that would mask off-by-ones.
+export async function processBatched<T>(
   items: T[],
   batchSize: number,
   delayMs: number,
