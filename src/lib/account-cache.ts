@@ -53,11 +53,39 @@ export class AccountCache {
       this.misses++;
       return null;
     }
+    // A.2: a backward-going currentSlot (reorg) must invalidate.
+    // The legacy `currentSlot - entry.slot > ttlSlots` check treats a
+    // negative subtraction as fresh forever, serving stale state indefinitely.
+    if (currentSlot < entry.slot) {
+      this.misses++;
+      return null;
+    }
     if (currentSlot - entry.slot > this.ttlSlots) {
       this.misses++;
       return null;
     }
     this.hits++;
+    return entry;
+  }
+
+  /**
+   * A.1: secondary owner-verification on read. The stream filter requests
+   * accounts with `owner: [programId]`, but the cache stores raw bytes from
+   * each wire message — a malformed or adversarial update at a known pubkey
+   * would otherwise be served to SDK parsers that don't recheck ownership.
+   */
+  getOwnerVerified(
+    pubkey: string,
+    currentSlot: number,
+    expectedOwner: string,
+  ): AccountEntry | null {
+    const entry = this.get(pubkey, currentSlot);
+    if (!entry) return null;
+    if (entry.owner !== expectedOwner) {
+      this.hits--;
+      this.misses++;
+      return null;
+    }
     return entry;
   }
 

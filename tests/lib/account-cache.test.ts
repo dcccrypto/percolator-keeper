@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fc from "fast-check";
 import { AccountCache } from "../../src/lib/account-cache.js";
 
 function makeEntry(byte: number): Uint8Array {
@@ -134,6 +135,111 @@ describe("AccountCache", () => {
       tiny.set("d", makeEntry(4), "o", 100);
       expect(tiny.size()).toBe(3);
       expect(tiny.stats().evictions).toBeGreaterThan(0);
+    });
+  });
+
+  // A.2 (HIGH): slot rollback must invalidate, not serve stale forever.
+  // Why: on a reorg, currentSlot can go backwards. `currentSlot - entry.slot`
+  // is then negative and the legacy `> ttlSlots` check treated it as fresh.
+  describe("slot rollback (A.2)", () => {
+    it("returns null when currentSlot < entry.slot", () => {
+      cache.set("pk1", makeEntry(1), "o", 200);
+      expect(cache.get("pk1", 100)).toBeNull();
+    });
+
+    it("returns entry when currentSlot == entry.slot (zero age = fresh)", () => {
+      cache.set("pk1", makeEntry(1), "o", 200);
+      const entry = cache.get("pk1", 200);
+      expect(entry).not.toBeNull();
+      expect(entry!.slot).toBe(200);
+    });
+
+    it("counts a rollback as a miss in stats", () => {
+      cache.set("pk1", makeEntry(1), "o", 200);
+      cache.get("pk1", 100);
+      expect(cache.stats().misses).toBe(1);
+      expect(cache.stats().hits).toBe(0);
+    });
+
+    it("property: for any (setSlot, getSlot) with getSlot < setSlot, result is null", () => {
+      fc.assert(
+        fc.property(
+          fc.integer({ min: 1, max: 1_000_000 }),
+          fc.integer({ min: 1, max: 1_000_000 }),
+          (setSlot, delta) => {
+            const c = new AccountCache();
+            c.set("pk", makeEntry(1), "o", setSlot + delta);
+            return c.get("pk", setSlot) === null;
+          },
+        ),
+        { numRuns: 500 },
+      );
+    });
+  });
+
+  // A.1 (CRITICAL): owner verification on cache reads.
+  // Why: LaserStream messages drive cache state. A corrupted or adversarial
+  // stream message at a slab pubkey could otherwise inject arbitrary bytes
+  // into market state, since the parsers trust the cached `data` and never
+  // re-verify ownership against the program ID.
+  describe("getOwnerVerified (A.1)", () => {
+    it("returns entry when owner matches", () => {
+      cache.set("pk1", makeEntry(1), "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv", 100);
+      const entry = cache.getOwnerVerified(
+        "pk1",
+        110,
+        "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+      );
+      expect(entry).not.toBeNull();
+      expect(entry!.owner).toBe("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+    });
+
+    it("returns null when owner does not match", () => {
+      cache.set("pk1", makeEntry(1), "AttackerProgram1111111111111111111111111111", 100);
+      expect(
+        cache.getOwnerVerified(
+          "pk1",
+          110,
+          "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+        ),
+      ).toBeNull();
+    });
+
+    it("returns null when pubkey not cached", () => {
+      expect(cache.getOwnerVerified("missing", 100, "any-owner")).toBeNull();
+    });
+
+    it("returns null on TTL exceeded even if owner matches", () => {
+      cache.set("pk1", makeEntry(1), "owner-X", 100);
+      expect(cache.getOwnerVerified("pk1", 200, "owner-X")).toBeNull();
+    });
+
+    it("returns null on slot rollback even if owner matches", () => {
+      cache.set("pk1", makeEntry(1), "owner-X", 200);
+      expect(cache.getOwnerVerified("pk1", 100, "owner-X")).toBeNull();
+    });
+
+    it("owner mismatch counts as a miss in stats", () => {
+      cache.set("pk1", makeEntry(1), "wrong-owner", 100);
+      cache.getOwnerVerified("pk1", 110, "expected-owner");
+      expect(cache.stats().misses).toBe(1);
+      expect(cache.stats().hits).toBe(0);
+    });
+
+    it("property: random owner mismatches always return null", () => {
+      fc.assert(
+        fc.property(
+          fc.string({ minLength: 1, maxLength: 64 }),
+          fc.string({ minLength: 1, maxLength: 64 }),
+          (cachedOwner, expectedOwner) => {
+            fc.pre(cachedOwner !== expectedOwner);
+            const c = new AccountCache();
+            c.set("pk", makeEntry(1), cachedOwner, 100);
+            return c.getOwnerVerified("pk", 100, expectedOwner) === null;
+          },
+        ),
+        { numRuns: 500 },
+      );
     });
   });
 });

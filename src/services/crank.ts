@@ -211,10 +211,14 @@ export class CrankService {
         const cache = this._accountLoader.getCache();
         const stats = this._accountLoader.getStats();
         const currentSlot = stats.lastSlot;
+        // A.1: owner-verify every cache read against the loader's program ID
+        // so a corrupted stream message at a slab pubkey can't inject bytes
+        // into market state via the SDK parsers.
+        const expectedOwner = this._accountLoader.getProgramId();
         let cacheHits = 0;
         for (const [, state] of this.markets) {
           const key = state.market.slabAddress.toBase58();
-          const entry = cache.get(key, currentSlot);
+          const entry = cache.getOwnerVerified(key, currentSlot, expectedOwner);
           if (entry) {
             // Re-parse the slab from cached bytes so the market state reflects
             // the latest on-chain data without an RPC call.

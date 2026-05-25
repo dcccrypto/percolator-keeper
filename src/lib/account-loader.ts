@@ -225,6 +225,11 @@ export class AccountLoader {
     return this.cache;
   }
 
+  /** A.1: expose the loader's program ID so callers can owner-verify cache reads. */
+  getProgramId(): string {
+    return this.opts.programId;
+  }
+
   getStats(): LoaderStats {
     return {
       connected: this.connected,

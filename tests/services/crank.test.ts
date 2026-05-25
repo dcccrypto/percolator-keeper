@@ -1107,4 +1107,82 @@ describe('CrankService', () => {
       expect(callCount).toBe(2);
     });
   });
+
+  // A.1 (CRITICAL): a stream message at a known slab pubkey whose `owner`
+  // doesn't match the program ID must not be consumed by the fast path.
+  describe('A.1: owner-verified LaserStream fast-path', () => {
+    const EXPECTED_PROGRAM_ID = 'ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv';
+    const GOOD_SLAB = 'GoodSlab11111111111111111111111111111111111';
+    const BAD_SLAB = 'BadSlab1111111111111111111111111111111111111';
+
+    let restoreEnv: () => void;
+
+    beforeEach(() => {
+      const prev = process.env.KEEPER_USE_LASERSTREAM;
+      process.env.KEEPER_USE_LASERSTREAM = 'true';
+      restoreEnv = () => {
+        if (prev === undefined) delete process.env.KEEPER_USE_LASERSTREAM;
+        else process.env.KEEPER_USE_LASERSTREAM = prev;
+      };
+    });
+
+    afterEach(() => {
+      restoreEnv();
+    });
+
+    it('calls cache.getOwnerVerified with the loader program ID (not cache.get)', async () => {
+      const { AccountCache } = await import('../../src/lib/account-cache.js');
+      const realCache = new AccountCache();
+      realCache.set(GOOD_SLAB, new Uint8Array([1]), EXPECTED_PROGRAM_ID, 100);
+      realCache.set(BAD_SLAB, new Uint8Array([2]), 'AttackerProgram', 100);
+
+      const getOwnerVerifiedSpy = vi.spyOn(realCache, 'getOwnerVerified');
+
+      const fakeLoader = {
+        getCache: () => realCache,
+        getProgramId: () => EXPECTED_PROGRAM_ID,
+        getStats: () => ({
+          connected: true,
+          lastSlot: 110,
+          eventsReceived: 0,
+          eventsDropped: 0,
+          reconnectCount: 0,
+        }),
+      } as any;
+
+      const service = new CrankService(mockOracleService, undefined, fakeLoader);
+
+      // Seed both markets directly into the service's internal map.
+      const mkMarket = (slab: string) => ({
+        slabAddress: { toBase58: () => slab, equals: () => false },
+        programId: { toBase58: () => EXPECTED_PROGRAM_ID },
+        config: {
+          collateralMint: { toBase58: () => 'Mint' + slab.slice(0, 4) },
+          oracleAuthority: { toBase58: () => 'Auth' + slab.slice(0, 4), equals: () => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin' + slab.slice(0, 4) } },
+      });
+      const internal: any = service;
+      internal.markets.set(GOOD_SLAB, { market: mkMarket(GOOD_SLAB), missedDiscoveryCount: 0 });
+      internal.markets.set(BAD_SLAB, { market: mkMarket(BAD_SLAB), missedDiscoveryCount: 0 });
+      // Stay in the fast-path window so we don't trigger full rediscover.
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      // Both slabs should have been owner-verified with the expected program ID.
+      expect(getOwnerVerifiedSpy).toHaveBeenCalledWith(GOOD_SLAB, 110, EXPECTED_PROGRAM_ID);
+      expect(getOwnerVerifiedSpy).toHaveBeenCalledWith(BAD_SLAB, 110, EXPECTED_PROGRAM_ID);
+
+      // Owner mismatch on BAD_SLAB returned null → the malicious cache entry
+      // never reached the SDK parsers. Hits == 1 (good slab only).
+      const stats = realCache.stats();
+      expect(stats.hits).toBe(1);
+      expect(stats.misses).toBeGreaterThanOrEqual(1);
+
+      service.stop();
+    });
+  });
 });
