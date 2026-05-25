@@ -2,14 +2,15 @@ import { createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("keeper:priority-fee");
 
-export type PriorityFeeTier = "crank" | "liquidation" | "oracle";
+export type PriorityFeeTier = "crank" | "liquidation" | "oracle" | "adl";
 
 const FALLBACK_MICROLAMPORTS = 1_000;
 const DEFAULT_CACHE_MS = 5_000;
 
-/** Default percentiles per tier (overridable via env). */
+/** Default percentiles per tier (overridable via env). ADL is liquidation-priority. */
 const DEFAULT_PERCENTILES: Record<PriorityFeeTier, number> = {
   liquidation: 75,
+  adl: 75,
   crank: 50,
   oracle: 25,
 };
@@ -41,6 +42,7 @@ function hashKeys(keys: string[]): string {
 function resolvePercentile(tier: PriorityFeeTier): number {
   const envMap: Record<PriorityFeeTier, string> = {
     liquidation: "KEEPER_PRIORITY_FEE_PERCENTILE_LIQUIDATION",
+    adl: "KEEPER_PRIORITY_FEE_PERCENTILE_ADL",
     crank: "KEEPER_PRIORITY_FEE_PERCENTILE_CRANK",
     oracle: "KEEPER_PRIORITY_FEE_PERCENTILE_ORACLE",
   };

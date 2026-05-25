@@ -125,6 +125,27 @@ describe("BlockhashCache", () => {
     cache.stop();
   });
 
+  // A.11 (MED): the existing 3-caller coalesce test proves the lock works
+  // for trivial concurrency; the brief specified 1k. Catches regressions
+  // where someone "optimizes" away the in-flight promise share.
+  it.skipIf(!process.env.STRESS)(
+    "A.11 STRESS: 1000 concurrent getAsync() calls produce a single RPC fetch",
+    { timeout: 15_000 },
+    async () => {
+      const conn = makeConnection();
+      const cache = new BlockhashCache(conn, { refreshMs: 60_000, maxSlotsReuse: 60 });
+
+      const results = await Promise.all(
+        Array.from({ length: 1000 }, () => cache.getAsync()),
+      );
+
+      expect(conn.getLatestBlockhash).toHaveBeenCalledTimes(1);
+      // Every caller saw the same blockhash.
+      const uniq = new Set(results.map((r) => r.blockhash));
+      expect(uniq.size).toBe(1);
+    },
+  );
+
   it("reads KEEPER_BLOCKHASH_CACHE_MS and KEEPER_BLOCKHASH_MAX_SLOTS_REUSE from env", () => {
     const origCache = process.env.KEEPER_BLOCKHASH_CACHE_MS;
     const origSlots = process.env.KEEPER_BLOCKHASH_MAX_SLOTS_REUSE;

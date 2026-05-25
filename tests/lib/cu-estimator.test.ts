@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import fc from "fast-check";
 
 vi.mock("@percolatorct/shared", () => ({
   createLogger: vi.fn(() => ({
@@ -120,5 +121,57 @@ describe("CuEstimator", () => {
         sigVerify: false,
       }),
     );
+  });
+
+  // A.12: properties protect the CU-margin math. If the estimator ever returns
+  // a value below `consumed`, the CU limit on-chain would be too tight and
+  // the tx would land with InsufficientComputeUnits.
+  describe("A.12: property tests", () => {
+    it("property: result >= consumed for any consumed > 0 and margin >= 1.0", () => {
+      fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 1_400_000 }),
+          fc.double({ min: 1.0, max: 3.0, noNaN: true }),
+          async (consumed, margin) => {
+            const conn = makeConnection(consumed);
+            const estimator = new CuEstimator({ margin, fallback: 1_400_000 });
+            const result = await estimator.estimate(conn, [makeDummyIx()], [Keypair.generate()]);
+            return result >= consumed;
+          },
+        ),
+        { numRuns: 200 },
+      );
+    });
+
+    it("property: for consumed == 0, always returns the configured fallback", () => {
+      fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 1_400_000 }),
+          fc.double({ min: 1.0, max: 3.0, noNaN: true }),
+          async (fallback, margin) => {
+            const conn = makeConnection(0);
+            const estimator = new CuEstimator({ margin, fallback });
+            const result = await estimator.estimate(conn, [makeDummyIx()], [Keypair.generate()]);
+            return result === fallback;
+          },
+        ),
+        { numRuns: 200 },
+      );
+    });
+
+    it("property: result >= 1 for any consumed >= 1 (no zero/negative)", () => {
+      fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 1_400_000 }),
+          async (consumed) => {
+            const conn = makeConnection(consumed);
+            const estimator = new CuEstimator({ margin: 1.1, fallback: 1_400_000 });
+            const result = await estimator.estimate(conn, [makeDummyIx()], [Keypair.generate()]);
+            return result >= 1;
+          },
+        ),
+        { numRuns: 200 },
+      );
+    });
   });
 });

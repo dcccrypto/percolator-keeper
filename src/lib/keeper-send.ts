@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
 import { sendWithRetryKeeper, createLogger } from "@percolatorct/shared";
 import type { KeeperSendOptions } from "@percolatorct/shared";
@@ -9,13 +10,29 @@ import { CuEstimator } from "./cu-estimator.js";
 
 const logger = createLogger("keeper:send");
 
-const BASE_FEE_LAMPORTS = 5_000;
+export const BASE_FEE_LAMPORTS = 5_000;
 
 const TIER_MAP: Record<TxType, PriorityFeeTier> = {
   crank: "crank",
   liquidation: "liquidation",
   oracle: "oracle",
+  adl: "adl",
 };
+
+/**
+ * Pure lamport-cost formula, factored out so property tests can exercise it
+ * without the fetch/simulate stubs around the public keeperSend API.
+ *
+ * Cost = base + ceil(microLamports * cu / 1_000_000) + jitoTip.
+ */
+export function estimateLamportCost(
+  microLamports: number,
+  cu: number,
+  jitoTip: number,
+): number {
+  const priorityFee = Math.ceil((microLamports * cu) / 1_000_000);
+  return BASE_FEE_LAMPORTS + priorityFee + jitoTip;
+}
 
 // Lazy singletons — instantiated on first use so mocks applied in test setup take effect.
 let _priorityFeeEstimator: PriorityFeeEstimator | null = null;
@@ -59,12 +76,11 @@ async function estimateCost(
     getCuEstimator().estimate(connection, instructions, signers),
   ]);
 
-  const priorityFee = Math.ceil((microLamports * cu) / 1_000_000);
   const jitoTip = process.env.USE_HELIUS_SENDER === "true"
     ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
     : 0;
 
-  return BASE_FEE_LAMPORTS + priorityFee + jitoTip;
+  return estimateLamportCost(microLamports, cu, jitoTip);
 }
 
 export interface KeeperSendResult {
@@ -96,6 +112,35 @@ export async function keeperSend(
       stats: budget.getStats(),
     });
     return null;
+  }
+
+  // A.10 (HIGH): DRY_RUN intercepts before the real send. The shadow-keeper
+  // harness compares would-have-fired decisions against the live keeper's
+  // tx history; that comparison needs the full ix payload + accounts +
+  // estimated cost recorded against the same budget so runaway-fire is also
+  // detectable in dry runs. Logged at info so the harness can ingest it.
+  if (process.env.DRY_RUN === "true") {
+    const signature = `dry_run_${randomUUID()}`;
+    const accountKeys = instructions.flatMap((ix) =>
+      ix.keys.map((k) => k.pubkey.toBase58()),
+    );
+    logger.info("DRY_RUN: intercepted send", {
+      txType,
+      signature,
+      estimatedCost,
+      instructions: instructions.map((ix) => ({
+        programId: ix.programId.toBase58(),
+        accountKeys: ix.keys.map((k) => ({
+          pubkey: k.pubkey.toBase58(),
+          isSigner: k.isSigner,
+          isWritable: k.isWritable,
+        })),
+        dataBase64: Buffer.from(ix.data).toString("base64"),
+      })),
+      uniqueAccounts: Array.from(new Set(accountKeys)),
+    });
+    budget.recordTx(estimatedCost, txType, "success");
+    return { signature, estimatedCost };
   }
 
   const opts: KeeperSendOptions = {

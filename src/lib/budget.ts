@@ -20,7 +20,7 @@ import { createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("keeper:budget");
 
-export type TxType = "crank" | "liquidation" | "oracle";
+export type TxType = "crank" | "liquidation" | "oracle" | "adl";
 export type TxResult = "success" | "fail" | "drop";
 
 export interface KeeperBudgetConfig {

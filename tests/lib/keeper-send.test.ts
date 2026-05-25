@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("@percolatorct/shared", () => ({
   createLogger: vi.fn(() => ({
@@ -145,5 +145,77 @@ describe("keeperSend", () => {
     const callArgs = vi.mocked(shared.sendWithRetryKeeper).mock.calls[0];
     // opts is the 5th arg — skipPreflight should remain false (devnet)
     expect(callArgs![4]).toEqual(expect.objectContaining({ skipPreflight: false }));
+  });
+
+  // A.10 (HIGH): DRY_RUN must intercept the actual sendTransaction. Without
+  // this, shadow-keeper deployments would still hit mainnet RPC and could
+  // accidentally land real transactions through retry/network blips.
+  describe("A.10: DRY_RUN intercept", () => {
+    let originalDryRun: string | undefined;
+    beforeEach(() => {
+      originalDryRun = process.env.DRY_RUN;
+      process.env.DRY_RUN = "true";
+    });
+    afterEach(() => {
+      if (originalDryRun === undefined) delete process.env.DRY_RUN;
+      else process.env.DRY_RUN = originalDryRun;
+    });
+
+    it("returns a synthetic dry_run_ signature instead of calling the sender", async () => {
+      const result = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+      expect(result).not.toBeNull();
+      expect(result!.signature).toMatch(/^dry_run_[0-9a-f-]{36}$/);
+      expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+    });
+
+    it("records the would-have-spent estimate to the budget", async () => {
+      const before = budget.getStats();
+      const result = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+      const after = budget.getStats();
+      expect(after.cycleTxCount).toBe(before.cycleTxCount + 1);
+      expect(after.cycleSpend).toBe(before.cycleSpend + result!.estimatedCost);
+    });
+
+    it("returns null when budget is halted, even in DRY_RUN", async () => {
+      budget.haltManually("dry-run halt test");
+      const result = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+      expect(result).toBeNull();
+      expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+    });
+
+    it("each call returns a unique synthetic signature", async () => {
+      const sigs = await Promise.all([
+        keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget),
+        keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget),
+        keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget),
+      ]);
+      const uniq = new Set(sigs.map((r) => r!.signature));
+      expect(uniq.size).toBe(3);
+    });
+
+    it.skipIf(!process.env.STRESS)(
+      "STRESS: 1000 concurrent DRY_RUN sends — zero real RPC traffic, all unique sigs",
+      { timeout: 30_000 },
+      async () => {
+        // A wider budget so the 1k sends don't hit cycle caps.
+        const wideBudget = new (await import("../../src/lib/budget.js")).KeeperBudget({
+          maxSolPerCycle: Number.MAX_SAFE_INTEGER,
+          maxSolPerHour: Number.MAX_SAFE_INTEGER,
+          maxSolPerDay: Number.MAX_SAFE_INTEGER,
+          maxTxPerCycle: 10_000,
+          txSuccessRateThreshold: 0,
+          txSuccessRateMinSamples: 1_000_000,
+        });
+        const N = 1000;
+        const sigs = await Promise.all(
+          Array.from({ length: N }, () =>
+            keeperSend(connection, [makeDummyIx()], [keypair], "crank", wideBudget),
+          ),
+        );
+        const uniq = new Set(sigs.map((r) => r!.signature));
+        expect(uniq.size).toBe(N);
+        expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+      },
+    );
   });
 });
