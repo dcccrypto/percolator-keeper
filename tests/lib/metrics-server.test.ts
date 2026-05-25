@@ -114,4 +114,18 @@ describe("metrics-server", () => {
     const result = await getMetrics();
     expect(result.status).toBe(200);
   });
+
+  // A.8 (HIGH): metrics expose wallet balance, halt state, HA role.
+  // Default listen(port) binds 0.0.0.0 — public on any deploy with an open
+  // firewall. Lock to loopback; operators must use a sidecar/proxy if they
+  // need remote scrape access.
+  it("A.8: binds to 127.0.0.1 only (loopback)", async () => {
+    serverMod = await startServer();
+    serverMod.start();
+    await waitMs(80);
+
+    const addr = (serverMod as any).address();
+    expect(addr).not.toBeNull();
+    expect(addr.address).toBe("127.0.0.1");
+  });
 });

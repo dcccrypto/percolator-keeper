@@ -36,13 +36,25 @@ export function start(): void {
     }
   });
 
-  server.listen(port, () => {
-    logger.info("Metrics server started", { port });
+  // A.8 (HIGH): bind to loopback only. /metrics exposes wallet balance, halt
+  // state, and HA role; the legacy 2-arg listen(port, cb) defaulted to
+  // 0.0.0.0 — publicly visible on any deploy without an explicit firewall
+  // rule. Operators that need remote scraping must use a sidecar/proxy
+  // (e.g. Prometheus pull via SSH tunnel or an auth-protected sidecar).
+  server.listen(port, "127.0.0.1", () => {
+    logger.info("Metrics server started", { port, host: "127.0.0.1" });
   });
 
   server.on("error", (err) => {
     logger.error("Metrics server error", { error: err.message });
   });
+}
+
+/** A.8: diagnostic for tests to confirm bind address. */
+export function address(): import("node:net").AddressInfo | null {
+  if (!server) return null;
+  const a = server.address();
+  return typeof a === "string" ? null : a;
 }
 
 export function stop(): Promise<void> {
