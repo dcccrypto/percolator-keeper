@@ -161,8 +161,36 @@ describe("validateKeeperEnvGuards", () => {
         SOLANA_RPC_URL: "https://mainnet.helius-rpc.com/?api-key=xxx",
         SOLANA_RPC_WS_URL: "wss://mainnet.helius-rpc.com/?api-key=xxx",
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        RPC_URL: "https://mainnet.helius-rpc.com/?api-key=xxx",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    // A.7 (HIGH): RPC_URL is the var actually read by @percolatorct/shared and
+    // src/lib/priority-fee.ts. Without this guard, a RPC_URL=http://localhost
+    // on mainnet would be accepted while SOLANA_RPC_URL is guarded.
+    it.each([
+      ["localhost", "https://localhost/"],
+      ["127.0.0.1", "https://127.0.0.1/"],
+      ["0.0.0.0", "https://0.0.0.0/"],
+    ])("A.7: rejects RPC_URL pointing at %s on mainnet", (host, url) => {
+      const env = {
+        NETWORK: "mainnet",
+        RPC_URL: url,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /RPC_URL points at .* but NETWORK=mainnet/,
+      );
+    });
+
+    it("A.7: rejects RPC_URL on port 8899 on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        RPC_URL: "https://some-host.example.com:8899/",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /RPC_URL uses port 8899 \(Solana test validator\) but NETWORK=mainnet/,
+      );
     });
 
     it("throws on URL that fails to parse", () => {
@@ -178,6 +206,16 @@ describe("validateKeeperEnvGuards", () => {
   it("allows localhost when NETWORK is not mainnet (devnet/local dev)", () => {
     const env = {
       SOLANA_RPC_URL: "http://localhost:8899",
+      ALLOW_INSECURE_RPC: "true",
+    } as NodeJS.ProcessEnv;
+    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  // A.7: RPC_URL is unguarded outside mainnet — local dev should still work.
+  it("A.7: allows RPC_URL=http://localhost:8899 when NETWORK=devnet", () => {
+    const env = {
+      NETWORK: "devnet",
+      RPC_URL: "http://localhost:8899",
       ALLOW_INSECURE_RPC: "true",
     } as NodeJS.ProcessEnv;
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();

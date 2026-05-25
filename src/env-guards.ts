@@ -86,5 +86,9 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
     rejectLocalRpcUrl("SOLANA_RPC_URL", env.SOLANA_RPC_URL?.trim());
     rejectLocalRpcUrl("SOLANA_RPC_WS_URL", env.SOLANA_RPC_WS_URL?.trim());
     rejectLocalRpcUrl("FALLBACK_RPC_URL", env.FALLBACK_RPC_URL?.trim());
+    // A.7: @percolatorct/shared and src/lib/priority-fee.ts read RPC_URL
+    // (not SOLANA_RPC_URL). Without this guard a RPC_URL=http://localhost
+    // on mainnet would be accepted while the other vars are caught.
+    rejectLocalRpcUrl("RPC_URL", env.RPC_URL?.trim());
   }
 }
