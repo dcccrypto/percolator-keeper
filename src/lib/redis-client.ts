@@ -17,15 +17,18 @@ export function getRedisClient(): RedisLike | null {
     return null;
   }
 
-  const token = process.env.KEEPER_REDIS_TOKEN;
-
-  let redis: Redis;
-  if (token) {
-    redis = new Redis({ url, token });
-  } else {
-    redis = new Redis({ url, token: "" });
+  // A.4 (HIGH): legacy code fell back to `token: ""` when KEEPER_REDIS_TOKEN
+  // was unset, which let the keeper connect to Upstash with no auth — an
+  // access-control gap. Refuse to construct the client without a real token.
+  const token = process.env.KEEPER_REDIS_TOKEN?.trim();
+  if (!token) {
+    throw new Error(
+      "KEEPER_REDIS_URL is set but KEEPER_REDIS_TOKEN is missing or empty. " +
+        "Set KEEPER_REDIS_TOKEN to the Upstash REST token, or unset KEEPER_REDIS_URL to disable HA.",
+    );
   }
 
+  const redis = new Redis({ url, token });
   _client = redis as unknown as RedisLike;
   return _client;
 }

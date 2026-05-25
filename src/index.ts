@@ -582,7 +582,10 @@ async function start() {
   }
 
   if (leaderLock) {
-    const network = process.env.NETWORK ?? "devnet";
+    // A.3: env-guards asserts NETWORK is set to mainnet|devnet whenever
+    // HA_ENABLED=true, so the previous `?? "devnet"` fallback is gone —
+    // a missing NETWORK would silently share a lock with the wrong cluster.
+    const network = process.env.NETWORK!;
     leaderLock.start({
       network,
       onPromote: () => {

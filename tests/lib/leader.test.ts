@@ -408,6 +408,60 @@ describe("LeaderLock chaos (STRESS=true)", { skip: process.env.STRESS !== "true"
     await standbyPartitioned.stop();
   });
 
+  // A.6: SIGKILL / ungraceful death path — leader dies without calling stop(),
+  // so the Redis lock is NOT explicitly DEL'd; standby must wait until the
+  // TTL elapses for Redis to expire it, then promote on the next poll cycle.
+  // The existing "failover < 35s" test simulates graceful kill; this one
+  // simulates the real-world process-killed-by-OOM case.
+  it("A.6: failover within ttlMs+pollMs when leader dies ungracefully (SIGKILL)", async () => {
+    const { redis, store } = makeMockRedis();
+    const TTL = 30_000;
+    const POLL = 5_000;
+    const KEY = "keeper:leader:devnet";
+
+    const leader = new LeaderLock(redis, "leader-id", {
+      ttlMs: TTL,
+      renewMs: 10_000,
+      pollMs: POLL,
+    });
+    const standby = new LeaderLock(redis, "standby-id", {
+      ttlMs: TTL,
+      renewMs: 10_000,
+      pollMs: POLL,
+    });
+
+    const standbyPromote = vi.fn();
+    leader.start({ network: "devnet", onPromote: vi.fn(), onDemote: vi.fn() });
+    await vi.advanceTimersByTimeAsync(100);
+    standby.start({ network: "devnet", onPromote: standbyPromote, onDemote: vi.fn() });
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(leader.role()).toBe("leader");
+    expect(standby.role()).toBe("standby");
+    expect(store.has(KEY)).toBe(true);
+
+    // Ungraceful death: kill the leader's timers without releasing the lock.
+    // The lock entry stays in Redis until its TTL expires server-side.
+    (leader as { _clearTimers(): void })._clearTimers();
+    const deathTime = Date.now();
+
+    // Mock store does not auto-expire on `ex`, so simulate the TTL by deleting
+    // the key at the moment Redis would have expired it.
+    await vi.advanceTimersByTimeAsync(TTL);
+    store.delete(KEY);
+
+    // Standby's next poll happens within pollMs; allow that window plus a
+    // small tick for async settlement.
+    await vi.advanceTimersByTimeAsync(POLL + 500);
+
+    expect(standby.role()).toBe("leader");
+    expect(standbyPromote).toHaveBeenCalledOnce();
+    const elapsedMs = Date.now() - deathTime;
+    expect(elapsedMs).toBeLessThanOrEqual(TTL + POLL + 1_000);
+
+    await standby.stop();
+  });
+
   it("split-brain: two instances starting concurrently, only one wins", async () => {
     const { redis } = makeMockRedis();
 

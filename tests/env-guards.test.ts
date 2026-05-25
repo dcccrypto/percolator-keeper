@@ -95,4 +95,58 @@ describe("validateKeeperEnvGuards", () => {
 
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
   });
+
+  // A.3 (HIGH): HA_ENABLED=true pins the Redis lock key to NETWORK. With
+  // NETWORK unset the legacy code fell back to "devnet" — a mainnet keeper
+  // would silently share a lock with devnet, allowing split-brain.
+  describe("A.3: HA_ENABLED requires NETWORK", () => {
+    it("throws when HA_ENABLED=true and NETWORK is unset", () => {
+      const env = { HA_ENABLED: "true" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*requires.*NETWORK/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true and NETWORK is empty string", () => {
+      const env = { HA_ENABLED: "true", NETWORK: "" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /HA_ENABLED.*requires.*NETWORK/i,
+      );
+    });
+
+    it("throws when HA_ENABLED=true and NETWORK is an unsupported value", () => {
+      const env = { HA_ENABLED: "true", NETWORK: "testnet" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /NETWORK.*mainnet.*devnet/i,
+      );
+    });
+
+    it("accepts HA_ENABLED=true + NETWORK=mainnet", () => {
+      const env = {
+        HA_ENABLED: "true",
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("accepts HA_ENABLED=true + NETWORK=devnet", () => {
+      const env = { HA_ENABLED: "true", NETWORK: "devnet" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("accepts HA_ENABLED unset regardless of NETWORK state", () => {
+      expect(() =>
+        validateKeeperEnvGuards({} as NodeJS.ProcessEnv),
+      ).not.toThrow();
+      expect(() =>
+        validateKeeperEnvGuards({ NETWORK: "testnet" } as NodeJS.ProcessEnv),
+      ).not.toThrow();
+    });
+
+    it("accepts HA_ENABLED=false (not 'true') regardless of NETWORK state", () => {
+      const env = { HA_ENABLED: "false" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+  });
 });

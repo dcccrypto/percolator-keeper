@@ -44,4 +44,28 @@ describe("getRedisClient", () => {
     process.env.KEEPER_REDIS_URL = "https://fake-host.upstash.io";
     expect(getRedisClient()).toBeNull();
   });
+
+  // A.4 (HIGH): refuse to construct the client when the URL is set without a
+  // non-empty token. The legacy fallback `new Redis({ url, token: "" })`
+  // permitted token-less access to Upstash — an access-control gap.
+  it("A.4: throws when KEEPER_REDIS_URL is set but KEEPER_REDIS_TOKEN is unset", async () => {
+    process.env.KEEPER_REDIS_URL = "https://fake-host.upstash.io";
+    delete process.env.KEEPER_REDIS_TOKEN;
+    const { getRedisClient } = await import("../../src/lib/redis-client.js");
+    expect(() => getRedisClient()).toThrow(/KEEPER_REDIS_TOKEN/);
+  });
+
+  it("A.4: throws when KEEPER_REDIS_URL is set but KEEPER_REDIS_TOKEN is empty string", async () => {
+    process.env.KEEPER_REDIS_URL = "https://fake-host.upstash.io";
+    process.env.KEEPER_REDIS_TOKEN = "";
+    const { getRedisClient } = await import("../../src/lib/redis-client.js");
+    expect(() => getRedisClient()).toThrow(/KEEPER_REDIS_TOKEN/);
+  });
+
+  it("A.4: throws when KEEPER_REDIS_TOKEN is only whitespace", async () => {
+    process.env.KEEPER_REDIS_URL = "https://fake-host.upstash.io";
+    process.env.KEEPER_REDIS_TOKEN = "   ";
+    const { getRedisClient } = await import("../../src/lib/redis-client.js");
+    expect(() => getRedisClient()).toThrow(/KEEPER_REDIS_TOKEN/);
+  });
 });

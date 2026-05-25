@@ -25,6 +25,25 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   // http:// and ws:// transmit signed transactions and account data unencrypted,
   // enabling MITM attacks on the network path.
   const allowInsecure = env.ALLOW_INSECURE_RPC === "true";
+  // A.3 (HIGH): HA leader election pins the Redis lock key to NETWORK. Legacy
+  // index.ts fell back to `?? "devnet"` when NETWORK was unset, which meant a
+  // mainnet keeper without NETWORK would silently share a lock with devnet
+  // and could split-brain. Validate that NETWORK is set to a supported value
+  // whenever HA is on.
+  if (env.HA_ENABLED === "true") {
+    const network = env.NETWORK?.trim();
+    if (!network) {
+      throw new Error(
+        "HA_ENABLED=true requires NETWORK to be set. Set NETWORK=mainnet or NETWORK=devnet.",
+      );
+    }
+    if (network !== "mainnet" && network !== "devnet") {
+      throw new Error(
+        `HA_ENABLED=true: NETWORK must be 'mainnet' or 'devnet' (got '${network.slice(0, 20)}').`,
+      );
+    }
+  }
+
   if (!allowInsecure) {
     const rpcUrl = env.SOLANA_RPC_URL?.trim();
     if (rpcUrl && !rpcUrl.startsWith("https://")) {
