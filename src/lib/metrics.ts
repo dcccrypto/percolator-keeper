@@ -121,6 +121,48 @@ export const simulateCuUsed = new Histogram({
   registers: [registry],
 });
 
+// ── RPC pool metrics (Workstream G) ──────────────────────────────────────
+
+export const rpcRequestTotal = new Counter({
+  name: "keeper_rpc_request_total",
+  help: "Total RPC requests routed by the pool, partitioned by provider, method, and result",
+  labelNames: ["provider", "method", "result"] as const,
+  registers: [registry],
+});
+
+export const rpcLatencyP50 = new Gauge({
+  name: "keeper_rpc_latency_ms",
+  help: "Rolling P50/P99 latency in ms for each RPC provider, updated on every health-check tick",
+  labelNames: ["provider", "percentile"] as const,
+  registers: [registry],
+});
+
+// P99 exported separately for direct set calls — the gauge name uses a label
+// dimension "percentile" shared with rpcLatencyP50. Both resolve to the same
+// registered gauge; callers set the "p50" / "p99" label value.
+export const rpcLatencyP99 = rpcLatencyP50;
+
+export const rpcProviderHealthy = new Gauge({
+  name: "keeper_rpc_provider_healthy",
+  help: "1 if the RPC provider is healthy, 0 if unhealthy",
+  labelNames: ["provider"] as const,
+  registers: [registry],
+});
+
+export const rpcFailoverTotal = new Counter({
+  name: "keeper_rpc_failover_total",
+  help: "Total RPC failover events, partitioned by from-provider, to-provider, and reason",
+  labelNames: ["from", "to", "reason"] as const,
+  registers: [registry],
+});
+
+export const rpcSlotLag = new Gauge({
+  name: "keeper_rpc_slot_lag",
+  help: "Slot lag for each provider vs the other provider (positive = behind, negative = ahead)",
+  labelNames: ["provider"] as const,
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }
