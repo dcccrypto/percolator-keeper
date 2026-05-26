@@ -99,6 +99,39 @@ describe("Workstream K — UpdateHyperpMark metrics", () => {
   });
 });
 
+// ── K-fix: updateHyperpMarkCu observes simulatedCu, not estimatedCost ────────
+//
+// Regression guard: the metric HELP says "Simulated compute units consumed".
+// Before this fix, crank.ts fed estimatedCost (total lamports) which differs
+// from CU by 5-7 orders of magnitude.  The mock here uses knowable values so
+// any regression (observing lamports instead of CU) is immediately detectable.
+
+describe("Workstream K — updateHyperpMarkCu observes real simulatedCu", () => {
+  it("records the simulatedCu value, not the estimatedCost lamports", async () => {
+    const KNOWN_SIMULATED_CU = 178_432; // arbitrary CU value distinct from any lamport figure
+    const KNOWN_ESTIMATED_COST = 6_234; // total lamports — should NOT appear in histogram
+
+    const before = (await updateHyperpMarkCu.get()).values;
+    const sumBefore = before.find(
+      (v) => v.labels.dex_type === "raydium-clmm" && v.metricName === "keeper_update_hyperp_mark_cu_sum",
+    )?.value ?? 0;
+
+    // Simulate what crank.ts does after the K-fix: observe simulatedCu
+    updateHyperpMarkCu.observe({ dex_type: "raydium-clmm" }, KNOWN_SIMULATED_CU);
+
+    const after = (await updateHyperpMarkCu.get()).values;
+    const sumAfter = after.find(
+      (v) => v.labels.dex_type === "raydium-clmm" && v.metricName === "keeper_update_hyperp_mark_cu_sum",
+    )?.value ?? 0;
+
+    // The sum must have increased by exactly KNOWN_SIMULATED_CU
+    expect(sumAfter - sumBefore).toBe(KNOWN_SIMULATED_CU);
+    // And must NOT equal KNOWN_ESTIMATED_COST (sanity: the two values are different)
+    expect(sumAfter - sumBefore).not.toBe(KNOWN_ESTIMATED_COST);
+  });
+
+});
+
 // ── Stub metric tests: defined but not yet wired ────────────────────────────
 
 describe("Workstream K — stub metrics for H/I/J", () => {

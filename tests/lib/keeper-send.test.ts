@@ -63,6 +63,9 @@ describe("keeperSend", () => {
     expect(result).not.toBeNull();
     expect(result!.signature).toBe("mock-signature");
     expect(typeof result!.estimatedCost).toBe("number");
+    expect(typeof result!.simulatedCu).toBe("number");
+    // simulatedCu must match the CuEstimator mock value (200_000)
+    expect(result!.simulatedCu).toBe(200_000);
   });
 
   it("calls sendWithRetryKeeper from shared", async () => {
@@ -165,6 +168,7 @@ describe("keeperSend", () => {
       const result = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
       expect(result).not.toBeNull();
       expect(result!.signature).toMatch(/^dry_run_[0-9a-f-]{36}$/);
+      expect(result!.simulatedCu).toBe(200_000);
       expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
     });
 

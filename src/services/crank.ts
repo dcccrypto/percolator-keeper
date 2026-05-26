@@ -796,12 +796,8 @@ export class CrankService {
           // Emit CU histogram when the instruction list includes UpdateHyperpMark
           // (instructions.length > 1 means the pool address was resolved and the
           // instruction was actually appended; length === 1 is crank-only / no-pool path).
-          if (sendResult.estimatedCost > 0 && instructions.length > 1) {
-            // estimatedCost is total lamports; no per-instruction CU is available here
-            // without a separate simulation. We record the send cost in the histogram
-            // as a proxy until Workstream D wires per-instruction CU simulation.
-            // The histogram label is dex_type so per-DEX trends are still visible.
-            updateHyperpMarkCu.observe({ dex_type: __dexType }, sendResult.estimatedCost);
+          if (sendResult.simulatedCu > 0 && instructions.length > 1) {
+            updateHyperpMarkCu.observe({ dex_type: __dexType }, sendResult.simulatedCu);
           }
         } catch (err) {
           recordFailed();

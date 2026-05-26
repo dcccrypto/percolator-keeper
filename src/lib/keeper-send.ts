@@ -57,21 +57,27 @@ function isMainnetSender(): boolean {
   );
 }
 
+interface EstimateCostResult {
+  estimatedCost: number;
+  simulatedCu: number;
+}
+
 /**
  * Estimate total lamport cost of a transaction.
  * priority_fee_microlamports * CU / 1_000_000 + base_fee + jito_tip.
+ * Also returns the raw simulated CU so callers can record it separately.
  */
 async function estimateCost(
   connection: Connection,
   instructions: TransactionInstruction[],
   signers: Keypair[],
   txType: TxType,
-): Promise<number> {
+): Promise<EstimateCostResult> {
   const accountKeys = instructions
     .flatMap((ix) => ix.keys.map((k) => k.pubkey.toBase58()))
     .filter((v, i, a) => a.indexOf(v) === i);
 
-  const [microLamports, cu] = await Promise.all([
+  const [microLamports, simulatedCu] = await Promise.all([
     getPriorityFeeEstimator().estimate(accountKeys, TIER_MAP[txType]),
     getCuEstimator().estimate(connection, instructions, signers),
   ]);
@@ -80,12 +86,13 @@ async function estimateCost(
     ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
     : 0;
 
-  return estimateLamportCost(microLamports, cu, jitoTip);
+  return { estimatedCost: estimateLamportCost(microLamports, simulatedCu, jitoTip), simulatedCu };
 }
 
 export interface KeeperSendResult {
   signature: string;
   estimatedCost: number;
+  simulatedCu: number;
 }
 
 /**
@@ -103,7 +110,7 @@ export async function keeperSend(
   maxRetries = 3,
   keeperOpts?: KeeperSendOptions,
 ): Promise<KeeperSendResult | null> {
-  const estimatedCost = await estimateCost(connection, instructions, signers, txType);
+  const { estimatedCost, simulatedCu } = await estimateCost(connection, instructions, signers, txType);
 
   if (!budget.canSpend(estimatedCost, txType)) {
     logger.warn("Budget gate: refusing send — budget exhausted or halted", {
@@ -128,6 +135,7 @@ export async function keeperSend(
       txType,
       signature,
       estimatedCost,
+      simulatedCu,
       instructions: instructions.map((ix) => ({
         programId: ix.programId.toBase58(),
         accountKeys: ix.keys.map((k) => ({
@@ -140,7 +148,7 @@ export async function keeperSend(
       uniqueAccounts: Array.from(new Set(accountKeys)),
     });
     budget.recordTx(estimatedCost, txType, "success");
-    return { signature, estimatedCost };
+    return { signature, estimatedCost, simulatedCu };
   }
 
   const opts: KeeperSendOptions = {
@@ -154,7 +162,7 @@ export async function keeperSend(
   try {
     signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
     result = "success";
-    return { signature, estimatedCost };
+    return { signature, estimatedCost, simulatedCu };
   } catch (err) {
     result = "fail";
     throw err;
