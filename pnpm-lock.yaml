@@ -26,10 +26,19 @@ importers:
       dotenv:
         specifier: ^16.4.7
         version: 16.6.1
+      helius-laserstream:
+        specifier: ^0.3.2
+        version: 0.3.2
+      lru-cache:
+        specifier: ^11.5.0
+        version: 11.5.0
     devDependencies:
       '@types/node':
         specifier: ^25.2.2
         version: 25.5.0
+      fast-check:
+        specifier: ^4.8.0
+        version: 4.8.0
       tsx:
         specifier: ^4.19.2
         version: 4.21.0
@@ -459,6 +468,36 @@ packages:
     resolution: {integrity: sha512-r9JfchJF1Ae6yAxcaLu/V1TGqBhAuSDe3mRNOssBfx1rMzfZ4fdNvrgUBwyb/TNTGXFxlH9AZix5P257x07nrg==}
     peerDependencies:
       '@opentelemetry/api': ^1.8
+
+  '@protobufjs/aspromise@1.1.2':
+    resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
+
+  '@protobufjs/base64@1.1.2':
+    resolution: {integrity: sha512-AZkcAA5vnN/v4PDqKyMR5lx7hZttPDgClv83E//FMNhR2TMcLUhfRUBHCmSl0oi9zMgDDqRUJkSxO3wm85+XLg==}
+
+  '@protobufjs/codegen@2.0.5':
+    resolution: {integrity: sha512-zgXFLzW3Ap33e6d0Wlj4MGIm6Ce8O89n/apUaGNB/jx+hw+ruWEp7EwGUshdLKVRCxZW12fp9r40E1mQrf/34g==}
+
+  '@protobufjs/eventemitter@1.1.1':
+    resolution: {integrity: sha512-vW1GmwMZNnL+gMRaovlh9yZX74kc+TTU3FObkkurpMaRtBfLP3ldjS9KQWlwZgraRE0+dheEEoAxdzcJQ8eXZg==}
+
+  '@protobufjs/fetch@1.1.1':
+    resolution: {integrity: sha512-GpptLrs57adMSuHi3VNj0mAF8dwh36LMaYF6XyJ6JMWlVsc+t42tm1HSEDmOs3A8fC9yyeisgLhsTVQokOZ0zw==}
+
+  '@protobufjs/float@1.0.2':
+    resolution: {integrity: sha512-Ddb+kVXlXst9d+R9PfTIxh1EdNkgoRe5tOX6t01f1lYWOvJnSPDBlG241QLzcyPdoNTsblLUdujGSE4RzrTZGQ==}
+
+  '@protobufjs/inquire@1.1.2':
+    resolution: {integrity: sha512-pa0vFRuws4wkvaXKK1uXZMAwAX4/t8ANaJo45iw/oQHNQ9q5xUzwgFmVJGXiga2BeN+zpX7Vf9vmsiIa2J+MUw==}
+
+  '@protobufjs/path@1.1.2':
+    resolution: {integrity: sha512-6JOcJ5Tm08dOHAbdR3GrvP+yUUfkjG5ePsHYczMFLq3ZmMkAD98cDgcT2iA1lJ9NVwFd4tH/iSSoe44YWkltEA==}
+
+  '@protobufjs/pool@1.1.0':
+    resolution: {integrity: sha512-0kELaGSIDBKvcgS4zkjz1PeddatrjYcmMWOlAuAPwAeccUrPHdUqo/J6LiymHHEiJT5NrF1UVwxY14f+fy4WQw==}
+
+  '@protobufjs/utf8@1.1.1':
+    resolution: {integrity: sha512-oOAWABowe8EAbMyWKM0tYDKi8Yaox52D+HWZhAIJqQXbqe0xI/GV7FhLWqlEKreMkfDjshR5FKgi3mnle0h6Eg==}
 
   '@rolldown/binding-android-arm64@1.0.0-rc.15':
     resolution: {integrity: sha512-YYe6aWruPZDtHNpwu7+qAHEMbQ/yRl6atqb/AhznLTnD3UY99Q1jE7ihLSahNWkF4EqRPVC4SiR4O0UkLK02tA==}
@@ -933,6 +972,10 @@ packages:
     resolution: {integrity: sha512-GipyPsXO1anza0AOZdy69Im7hGFCNB7Y/NGjDlZGJ3GJJLtwNSb2vrzYrTYJRrRloVx7pl+bhUaTB8yiccPvFQ==}
     engines: {node: '> 0.1.90'}
 
+  fast-check@4.8.0:
+    resolution: {integrity: sha512-GOJ158CUMnN6cSahsv4+ExARvIDuzzinFjkp0E9WtiBa5zcVeLozVkWaE4IzFcc+Y48Wp1EDlUZsXRyAztQcSg==}
+    engines: {node: '>=12.17.0'}
+
   fast-stable-stringify@1.0.0:
     resolution: {integrity: sha512-wpYMUmFu5f00Sm0cj2pfivpmawLZ0NKdviQ4w9zJeR8JVtOpOxHmLaJuj0vxvGqMJQWyP/COUkF75/57OKyRag==}
 
@@ -961,6 +1004,42 @@ packages:
 
   get-tsconfig@4.13.7:
     resolution: {integrity: sha512-7tN6rFgBlMgpBML5j8typ92BKFi2sFQvIdpAqLA2beia5avZDrMs0FLZiM5etShWq5irVyGcGMEA1jcDaK7A/Q==}
+
+  helius-laserstream-darwin-arm64@0.3.1:
+    resolution: {integrity: sha512-rK7URH+2AhpCTTEB8TIwIW94Bdtt4gqVRzSvPZ5CuqeyyKy5A4ils+d0lSUZIYFT/WtmXnt+NCo8S4jWVx3oAQ==}
+    cpu: [arm64]
+    os: [darwin]
+
+  helius-laserstream-darwin-x64@0.3.1:
+    resolution: {integrity: sha512-xpzqghlRHu/kXHM/7vhjlVhxe/q/zwz4W2GvdrcdOilzHefpBtchD+XusIIMpfQDQXgKXvq5v1Nd1NbIfb1EgA==}
+    cpu: [x64]
+    os: [darwin]
+
+  helius-laserstream-linux-arm64-gnu@0.3.1:
+    resolution: {integrity: sha512-LBwQM5dnUrXlUQij0GrHxvXZZCb9LnTsmcYp6AUUAyr85WZBCFVaNRB4pyyDewS2DvSqj9Kd6OIZ71fyVBEkRA==}
+    cpu: [arm64]
+    os: [linux]
+
+  helius-laserstream-linux-arm64-musl@0.3.1:
+    resolution: {integrity: sha512-dKJq61O19k+V0ErtT9rjPFnZ8sA+L/d1qw+3qu9QkhzVlJY5Gg4m186Q+gH4/EFdJibDZITUaF3e004lYDfvrQ==}
+    cpu: [arm64]
+    os: [linux]
+
+  helius-laserstream-linux-x64-gnu@0.3.1:
+    resolution: {integrity: sha512-PhBAZJo2MOPFFR3iHaBTVL1nAY0DAUSKVDbqhc9t1hnNaA/+fcoren6JO1pKAilxGaFsI+9XEmtMYSHxixvQFw==}
+    cpu: [x64]
+    os: [linux]
+
+  helius-laserstream-linux-x64-musl@0.3.1:
+    resolution: {integrity: sha512-0s5EZ5epcudgnNU22xAEoeLELP0A+w0GeHVJp7IfvTdYkWdc/IWZCGAWoEQ5ErAH8kJxALyRXLwXYZculd/rag==}
+    cpu: [x64]
+    os: [linux]
+
+  helius-laserstream@0.3.2:
+    resolution: {integrity: sha512-r9zU8VGYfLJ74wLq1tmuMQ3WsLod2CsVrNXFJ3UKvpijgjr2hgZJpBB6UQq52MrdCxg+Lhivlc3A8RAZ+AN72Q==}
+    engines: {node: '>=16.0.0'}
+    cpu: [x64, arm64]
+    os: [darwin, linux]
 
   humanize-ms@1.2.1:
     resolution: {integrity: sha512-Fl70vYtsAFb/C06PTS9dZBo7ihau+Tu/DNCk/OyHhea07S+aeMWpFFkUaXRa8fI+ScZbEI8dfSxwY7gxZ9SAVQ==}
@@ -991,6 +1070,9 @@ packages:
 
   json-stringify-safe@5.0.1:
     resolution: {integrity: sha512-ZClg6AaYvamvYEE82d3Iyd3vSSIjQ+odgjaTzRuO3s7toCdFKczob2i0zCh7JE8kWn17yvAWhUVxvqGwUalsRA==}
+
+  laserstream-core-proto-js@9.0.2:
+    resolution: {integrity: sha512-TuZaQgjxXB7DnJdFi+ZuDZbXSFGPYjNwnNt5LQtuPkpGVLoTcZeoMYrXbhgoVkQEqNIZpTdWpEqaaE8R+vxJJw==}
 
   lightningcss-android-arm64@1.32.0:
     resolution: {integrity: sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg==}
@@ -1066,6 +1148,16 @@ packages:
     resolution: {integrity: sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ==}
     engines: {node: '>= 12.0.0'}
 
+  long@5.3.2:
+    resolution: {integrity: sha512-mNAgZ1GmyNhD7AuqnTG3/VQ26o760+ZYBPKjPvugO8+nLbYfX6TVpJPseBvopbdY+qpZ/lKUnmEc1LeZYS3QAA==}
+
+  lru-cache@11.5.0:
+    resolution: {integrity: sha512-5YgH9UJd7wVb9hIouI2adWpgqrrICkt070Dnj8EUY1+B4B2P9eRLPAkAAo6NICA7CEhOIeBHl46u9zSNpNu7zA==}
+    engines: {node: 20 || >=22}
+
+  lz4js@0.2.0:
+    resolution: {integrity: sha512-gY2Ia9Lm7Ep8qMiuGRhvUq0Q7qUereeldZPP1PMEJxPtEWHJLqw9pgX68oHajBH0nzJK4MaZEA/YNV3jT8u8Bg==}
+
   magic-string@0.30.21:
     resolution: {integrity: sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ==}
 
@@ -1140,6 +1232,13 @@ packages:
   postgres-interval@1.2.0:
     resolution: {integrity: sha512-9ZhXKM/rw350N1ovuWHbGxnGh/SNJ4cnxHiM0rxE4VN41wsg8P8zWn9hv/buK00RP4WvlOyr/RBDiptyxVbkZQ==}
     engines: {node: '>=0.10.0'}
+
+  protobufjs@7.6.1:
+    resolution: {integrity: sha512-4K0myLaWL5EteuSAro91EGFgcfVgxb64Jx+7oDAY6GOkXD4M69yuSEljNcInGVCA5sOPxmZ/EqDLj2x0Q0+Ygg==}
+    engines: {node: '>=12.0.0'}
+
+  pure-rand@8.4.0:
+    resolution: {integrity: sha512-IoM8YF/jY0hiugFo/wOWqfmarlE6J0wc6fDK1PhftMk7MGhVZl88sZimmqBBFomLOCSmcCCpsfj7wXASCpvK9A==}
 
   require-in-the-middle@8.0.1:
     resolution: {integrity: sha512-QT7FVMXfWOYFbeRBF6nu+I6tr2Tf3u0q8RIEjNob/heKY/nh7drD/k7eeMFmSQgnTtCzLDcCu/XEnpW2wk4xCQ==}
@@ -1790,6 +1889,28 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
+  '@protobufjs/aspromise@1.1.2': {}
+
+  '@protobufjs/base64@1.1.2': {}
+
+  '@protobufjs/codegen@2.0.5': {}
+
+  '@protobufjs/eventemitter@1.1.1': {}
+
+  '@protobufjs/fetch@1.1.1':
+    dependencies:
+      '@protobufjs/aspromise': 1.1.2
+
+  '@protobufjs/float@1.0.2': {}
+
+  '@protobufjs/inquire@1.1.2': {}
+
+  '@protobufjs/path@1.1.2': {}
+
+  '@protobufjs/pool@1.1.0': {}
+
+  '@protobufjs/utf8@1.1.1': {}
+
   '@rolldown/binding-android-arm64@1.0.0-rc.15':
     optional: true
 
@@ -2323,6 +2444,10 @@ snapshots:
 
   eyes@0.1.8: {}
 
+  fast-check@4.8.0:
+    dependencies:
+      pure-rand: 8.4.0
+
   fast-stable-stringify@1.0.0: {}
 
   fastestsmallesttextencoderdecoder@1.0.22: {}
@@ -2341,6 +2466,37 @@ snapshots:
   get-tsconfig@4.13.7:
     dependencies:
       resolve-pkg-maps: 1.0.0
+
+  helius-laserstream-darwin-arm64@0.3.1:
+    optional: true
+
+  helius-laserstream-darwin-x64@0.3.1:
+    optional: true
+
+  helius-laserstream-linux-arm64-gnu@0.3.1:
+    optional: true
+
+  helius-laserstream-linux-arm64-musl@0.3.1:
+    optional: true
+
+  helius-laserstream-linux-x64-gnu@0.3.1:
+    optional: true
+
+  helius-laserstream-linux-x64-musl@0.3.1:
+    optional: true
+
+  helius-laserstream@0.3.2:
+    dependencies:
+      laserstream-core-proto-js: 9.0.2
+      lz4js: 0.2.0
+      protobufjs: 7.6.1
+    optionalDependencies:
+      helius-laserstream-darwin-arm64: 0.3.1
+      helius-laserstream-darwin-x64: 0.3.1
+      helius-laserstream-linux-arm64-gnu: 0.3.1
+      helius-laserstream-linux-arm64-musl: 0.3.1
+      helius-laserstream-linux-x64-gnu: 0.3.1
+      helius-laserstream-linux-x64-musl: 0.3.1
 
   humanize-ms@1.2.1:
     dependencies:
@@ -2387,6 +2543,10 @@ snapshots:
       - utf-8-validate
 
   json-stringify-safe@5.0.1: {}
+
+  laserstream-core-proto-js@9.0.2:
+    dependencies:
+      protobufjs: 7.6.1
 
   lightningcss-android-arm64@1.32.0:
     optional: true
@@ -2436,6 +2596,12 @@ snapshots:
       lightningcss-linux-x64-musl: 1.32.0
       lightningcss-win32-arm64-msvc: 1.32.0
       lightningcss-win32-x64-msvc: 1.32.0
+
+  long@5.3.2: {}
+
+  lru-cache@11.5.0: {}
+
+  lz4js@0.2.0: {}
 
   magic-string@0.30.21:
     dependencies:
@@ -2493,6 +2659,23 @@ snapshots:
   postgres-interval@1.2.0:
     dependencies:
       xtend: 4.0.2
+
+  protobufjs@7.6.1:
+    dependencies:
+      '@protobufjs/aspromise': 1.1.2
+      '@protobufjs/base64': 1.1.2
+      '@protobufjs/codegen': 2.0.5
+      '@protobufjs/eventemitter': 1.1.1
+      '@protobufjs/fetch': 1.1.1
+      '@protobufjs/float': 1.0.2
+      '@protobufjs/inquire': 1.1.2
+      '@protobufjs/path': 1.1.2
+      '@protobufjs/pool': 1.1.0
+      '@protobufjs/utf8': 1.1.1
+      '@types/node': 25.5.0
+      long: 5.3.2
+
+  pure-rand@8.4.0: {}
 
   require-in-the-middle@8.0.1:
     dependencies:

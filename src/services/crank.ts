@@ -18,9 +18,11 @@ import {
   type DiscoveredMarket,
   type DexType,
 } from "@percolatorct/sdk";
-import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetryKeeper, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
+import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import type { AccountLoader } from "../lib/account-loader.js";
+import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -62,6 +64,12 @@ interface MarketCrankState {
   /** How many times this market has been skipped for 0x4 across rediscoveries */
   skipCount?: number;
   /**
+   * B1: latch so the "5 consecutive failures" Discord alert fires once per
+   * failure-streak instead of only on the exact-5 transition. Cleared on
+   * the next successful crank.
+   */
+  alertedAt5?: boolean;
+  /**
    * PERC-465: Mainnet CA override for price lookups.
    * On devnet Quick Launch markets, collateralMint is a devnet mirror mint with no DEX data.
    * This field stores the original mainnet CA so Jupiter/DexScreener lookups use the right address.
@@ -97,12 +105,20 @@ interface MarketCrankState {
 
 /** Process items in batches with delay between batches.
  *  Each item is wrapped in try/catch so one failure doesn't kill the batch.
- *  BM7: Enhanced error tracking per item. */
-async function processBatched<T>(
+ *
+ *  B2: each closure RETURNS its outcome (boolean ok | thrown) instead of
+ *  mutating outer counters. Sums are computed after every Promise.all
+ *  resolves so there is no read-modify-write race even under unusual
+ *  microtask interleavings.
+ */
+// A.15: exported so the per-item counter correctness can be property-tested
+// directly. Module-private would force testing via crankAll() with discovery
+// + filtering wrapper overhead that would mask off-by-ones.
+export async function processBatched<T>(
   items: T[],
   batchSize: number,
   delayMs: number,
-  fn: (item: T) => Promise<void>,
+  fn: (item: T) => Promise<boolean>,
 ): Promise<{ succeeded: number; failed: number; errors: Map<string, Error> }> {
   const errors = new Map<string, Error>();
   let succeeded = 0;
@@ -110,18 +126,31 @@ async function processBatched<T>(
 
   for (let i = 0; i < items.length; i += batchSize) {
     const batch = items.slice(i, i + batchSize);
-    await Promise.all(batch.map(async (item) => {
-      try {
-        await fn(item);
-        succeeded++;
-      } catch (err) {
+    type ItemOutcome =
+      | { kind: "ok" }
+      | { kind: "no" }
+      | { kind: "threw"; itemKey: string; error: Error };
+    const outcomes: ItemOutcome[] = await Promise.all(
+      batch.map(async (item): Promise<ItemOutcome> => {
+        try {
+          const ok = await fn(item);
+          return ok ? { kind: "ok" } : { kind: "no" };
+        } catch (err) {
+          const itemKey = String(item);
+          const errorObj = err instanceof Error ? err : new Error(String(err));
+          return { kind: "threw", itemKey, error: errorObj };
+        }
+      }),
+    );
+    for (const o of outcomes) {
+      if (o.kind === "ok") succeeded++;
+      else if (o.kind === "no") failed++;
+      else {
         failed++;
-        const itemKey = String(item);
-        const errorObj = err instanceof Error ? err : new Error(String(err));
-        errors.set(itemKey, errorObj);
-        logger.error("Batch item failed", { item: itemKey, error: errorObj.message });
+        errors.set(o.itemKey, o.error);
+        logger.error("Batch item failed", { item: o.itemKey, error: o.error.message });
       }
-    }));
+    }
     if (i + batchSize < items.length) {
       await new Promise((r) => setTimeout(r, delayMs));
     }
@@ -152,12 +181,21 @@ export class CrankService {
   private _totalCrankCycles = 0;
   // 6.2: Optional callback fired after each completed crank cycle
   private _onCrankCycle?: () => void;
+  /** LaserStream account loader — injected for event-driven account discovery. */
+  private readonly _accountLoader?: AccountLoader;
+  /** Timestamp of last full getProgramAccounts re-discover when streaming is active. */
+  private _lastFullRediscoverTime = 0;
+  private readonly _fullRediscoverIntervalMs: number;
 
-  constructor(oracleService: OracleService, intervalMs?: number) {
+  constructor(oracleService: OracleService, intervalMs?: number, accountLoader?: AccountLoader) {
     this.oracleService = oracleService;
     this.intervalMs = intervalMs ?? config.crankIntervalMs;
     this.inactiveIntervalMs = config.crankInactiveIntervalMs;
     this.discoveryIntervalMs = config.discoveryIntervalMs;
+    this._accountLoader = accountLoader;
+    this._fullRediscoverIntervalMs =
+      parseInt(process.env.KEEPER_FULL_REDISCOVER_INTERVAL_MS ?? "", 10) ||
+      30 * 60_000; // 30 min default
   }
 
   get isRunning(): boolean {
@@ -185,9 +223,64 @@ export class CrankService {
   }
 
   async discover(): Promise<DiscoveredMarket[]> {
+    // When the LaserStream loader is active and the feature flag is set,
+    // use the cache for the fast path. The slow-path full re-discover still
+    // runs every KEEPER_FULL_REDISCOVER_INTERVAL_MS (30 min default) so
+    // new markets are eventually picked up even under streaming.
+    if (
+      process.env.KEEPER_USE_LASERSTREAM === "true" &&
+      this._accountLoader
+    ) {
+      const now = Date.now();
+      const needsFullRediscover =
+        now - this._lastFullRediscoverTime >= this._fullRediscoverIntervalMs;
+      if (!needsFullRediscover) {
+        // Fast path: refresh account data for known markets from cache.
+        const cache = this._accountLoader.getCache();
+        const stats = this._accountLoader.getStats();
+        const currentSlot = stats.lastSlot;
+        // A.1: owner-verify every cache read against the loader's program ID
+        // so a corrupted stream message at a slab pubkey can't inject bytes
+        // into market state via the SDK parsers.
+        const expectedOwner = this._accountLoader.getProgramId();
+        let cacheHits = 0;
+        for (const [, state] of this.markets) {
+          const key = state.market.slabAddress.toBase58();
+          const entry = cache.getOwnerVerified(key, currentSlot, expectedOwner);
+          if (entry) {
+            // Re-parse the slab from cached bytes so the market state reflects
+            // the latest on-chain data without an RPC call.
+            try {
+              const { parseHeader, parseConfig, parseEngine, parseParams } = await import("@percolatorct/sdk");
+              const data = entry.data;
+              state.market.header = parseHeader(data);
+              state.market.config = parseConfig(data);
+              state.market.engine = parseEngine(data);
+              state.market.params = parseParams(data);
+              cacheHits++;
+            } catch {
+              // Ignore parse errors — market state stays at last known good.
+            }
+          }
+        }
+        this.lastDiscoveryTime = now;
+        logger.debug("LaserStream fast-path discover complete", {
+          knownMarkets: this.markets.size,
+          cacheHits,
+          nextFullRediscoverMs: this._lastFullRediscoverTime + this._fullRediscoverIntervalMs - now,
+        });
+        return Array.from(this.markets.values()).map((s) => s.market);
+      }
+      // Full rediscover time — fall through to standard getProgramAccounts path.
+      this._lastFullRediscoverTime = now;
+      logger.info("LaserStream: running periodic full re-discover", {
+        intervalMs: this._fullRediscoverIntervalMs,
+      });
+    }
+
     // PERC-HOTFIX: If MARKETS_FILTER is set, skip expensive getProgramAccounts discovery.
-    // Instead, fetch each slab account directly via getAccountInfo (1 RPC call per market
-    // instead of ~8 getProgramAccounts calls that trigger 429 rate limits on Helius).
+    // Instead, batch-fetch the slab accounts via getMultipleAccountsInfo on the fallback
+    // RPC — one roundtrip per 100 slabs vs N sequential calls on the primary RPC (B15).
     const marketsFilter = (process.env.MARKETS_FILTER ?? "").trim();
     const allFound: DiscoveredMarket[] = [];
     // Track which program IDs were successfully scanned. Used by the eviction
@@ -197,32 +290,64 @@ export class CrankService {
     if (marketsFilter) {
       const slabAddresses = marketsFilter.split(",").map(s => s.trim()).filter(Boolean);
       logger.info("Using MARKETS_FILTER — skipping getProgramAccounts discovery", { count: slabAddresses.length });
-      const conn = getConnection();
-      for (const addr of slabAddresses) {
+      // B14: parseHeader/parseConfig/parseEngine/parseParams are statically imported at the
+      // top of this file — drop the redundant dynamic import that used to run on every call.
+      // B15: batch via getMultipleAccountsInfo with a per-call timeout on the fallback RPC.
+      const conn = getFallbackConnection();
+      const pubkeys: Array<PublicKey | null> = slabAddresses.map((addr) => {
         try {
-          const pubkey = new PublicKey(addr);
-          const info = await conn.getAccountInfo(pubkey);
+          return new PublicKey(addr);
+        } catch {
+          logger.warn("MARKETS_FILTER: invalid base58 slab address", { slab: addr.slice(0, 8) });
+          return null;
+        }
+      });
+      const FETCH_BATCH = 100;
+      for (let i = 0; i < pubkeys.length; i += FETCH_BATCH) {
+        const batch = pubkeys.slice(i, i + FETCH_BATCH).filter((p): p is PublicKey => p !== null);
+        if (batch.length === 0) continue;
+        let infos: Array<Awaited<ReturnType<typeof conn.getAccountInfo>>>;
+        try {
+          infos = await withTimeout(
+            conn.getMultipleAccountsInfo(batch),
+            RPC_TIMEOUT_MS,
+            `getMultipleAccountsInfo(${batch.length})`,
+          );
+        } catch (err) {
+          logger.warn("MARKETS_FILTER: getMultipleAccountsInfo failed for batch", {
+            batchSize: batch.length,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+        for (let j = 0; j < batch.length; j++) {
+          const pubkey = batch[j]!;
+          const info = infos[j];
           if (!info?.data) {
-            logger.warn("MARKETS_FILTER: slab not found on-chain", { slab: addr.slice(0, 8) });
+            logger.warn("MARKETS_FILTER: slab not found on-chain", { slab: pubkey.toBase58().slice(0, 8) });
             continue;
           }
-          const data = new Uint8Array(info.data);
-          const { parseHeader, parseConfig, parseEngine, parseParams } = await import("@percolatorct/sdk");
-          const header = parseHeader(data);
-          const marketConfig = parseConfig(data);
-          const engine = parseEngine(data);
-          const params = parseParams(data);
-          allFound.push({
-            slabAddress: pubkey,
-            programId: info.owner,
-            header,
-            config: marketConfig,
-            engine,
-            params,
-          });
-          succeededProgramIds.add(info.owner.toBase58());
-        } catch (e) {
-          logger.warn("MARKETS_FILTER: failed to load slab", { slab: addr.slice(0, 8), error: e instanceof Error ? e.message : String(e) });
+          try {
+            const data = new Uint8Array(info.data);
+            const header = parseHeader(data);
+            const marketConfig = parseConfig(data);
+            const engine = parseEngine(data);
+            const params = parseParams(data);
+            allFound.push({
+              slabAddress: pubkey,
+              programId: info.owner,
+              header,
+              config: marketConfig,
+              engine,
+              params,
+            });
+            succeededProgramIds.add(info.owner.toBase58());
+          } catch (e) {
+            logger.warn("MARKETS_FILTER: failed to parse slab", {
+              slab: pubkey.toBase58().slice(0, 8),
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
         }
       }
       // Fall through to Supabase fetch + this.markets population below
@@ -643,7 +768,12 @@ export class CrankService {
         recordAttempt();
         let sig: string;
         try {
-          sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3, KEEPER_SEND_OPTS);
+          const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
+          if (!sendResult) {
+            recordFailed();
+            return false;
+          }
+          sig = sendResult.signature;
           const __tip = process.env.USE_HELIUS_SENDER === "true"
             ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
             : 0;
@@ -655,8 +785,12 @@ export class CrankService {
         state.lastCrankTime = Date.now();
         state.successCount++;
         state.consecutiveFailures = 0;
+        state.alertedAt5 = false; // B1: reset alert latch on success
         state.isActive = true;
-        if (state.failureCount > 0) state.failureCount = 0;
+        // B10: do NOT reset failureCount — it is the lifetime counter exposed
+        // by /status, used to compute the long-run error rate. Resetting it on
+        // every success made the rate read 0 forever; only the per-streak
+        // counter (consecutiveFailures) should reset.
         eventBus.publish("crank.success", slabAddress, { signature: sig });
         return true;
       }
@@ -694,7 +828,12 @@ export class CrankService {
       recordAttempt();
       let sig: string;
       try {
-        sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3, KEEPER_SEND_OPTS);
+        const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
+        if (!sendResult) {
+          recordFailed();
+          return false;
+        }
+        sig = sendResult.signature;
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;
@@ -710,8 +849,9 @@ export class CrankService {
       state.lastCrankTime = Date.now();
       state.successCount++;
       state.consecutiveFailures = 0;
+      state.alertedAt5 = false; // B1: reset alert latch on success
       state.isActive = true;
-      if (state.failureCount > 0) state.failureCount = 0;
+      // B10: see HYPERP branch above — preserve lifetime failureCount.
 
       eventBus.publish("crank.success", slabAddress, { signature: sig });
       return true;
@@ -765,8 +905,11 @@ export class CrankService {
         programId: market.programId.toBase58(),
       });
       
-      // Alert on 5+ consecutive failures — fire-and-forget; never let Discord errors crash the crank loop
-      if (state.consecutiveFailures === 5) {
+      // B1: alert when consecutive failures crosses 5 (changed from `=== 5`
+      // so a jump 4 → 6 still fires) and latch `alertedAt5` so we don't
+      // re-alert every cycle while still failing. Latch clears on next success.
+      if (state.consecutiveFailures >= 5 && !state.alertedAt5) {
+        state.alertedAt5 = true;
         sendCriticalAlert("Crank experiencing consecutive failures", [
           { name: "Market", value: slabAddress.slice(0, 12), inline: true },
           { name: "Consecutive Failures", value: state.consecutiveFailures.toString(), inline: true },
@@ -866,10 +1009,11 @@ export class CrankService {
       continue;
     }
 
-    if (state.consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
-      // P0 FIX: Log on first skip so operators know WHY a market stopped cranking.
-      // Previously this was completely silent — the market would die with no trace in logs.
-      if (state.consecutiveFailures === MAX_CONSECUTIVE_FAILURES + 1) {
+    // B1: gate is `>=`, not `>`. The off-by-one previously let MAX-th failure
+    // through (cranks at 10, skips at 11+). Now skips at MAX (10+).
+    if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      // Log on first skip so operators know WHY a market stopped cranking.
+      if (state.consecutiveFailures === MAX_CONSECUTIVE_FAILURES) {
         logger.warn("Market exceeded max consecutive failures — pausing cranks until next rediscovery", {
           slabAddress,
           consecutiveFailures: state.consecutiveFailures,
@@ -911,12 +1055,21 @@ export class CrankService {
     // The Solana network de-dupes by signature, so parallel submission is safe.
     const PARALLEL_CONCURRENCY = 10; // Cap concurrency to avoid rate limit storms
 
-    // Process in parallel batches (larger batches, no delay between)
-    const batchResult = await processBatched(toCrank, PARALLEL_CONCURRENCY, 500, async (slabAddress) => {
-      const ok = await this.crankMarket(slabAddress);
-      if (ok) success++;
-      else failed++;
-    });
+    // B16: drop inter-batch delay from 500 ms to 50 ms. At PARALLEL_CONCURRENCY=10
+    // and ~100 markets, the original 500 ms gap added ~4.5 s of pure wait per cycle
+    // and pushed land time past the next interval. The Solana network rate limits
+    // are handled per-RPC, not per-process, so this purely reclaims wasted time.
+    //
+    // B2: closure returns a plain boolean; processBatched sums succeeded/failed
+    // after Promise.all resolves. No outer counter mutation in the closure.
+    const batchResult = await processBatched(
+      toCrank,
+      PARALLEL_CONCURRENCY,
+      50,
+      (slabAddress) => this.crankMarket(slabAddress),
+    );
+    success = batchResult.succeeded;
+    failed = batchResult.failed;
 
     // BM7: Log detailed error summary if any failed
     if (batchResult.failed > 0) {
@@ -1038,23 +1191,25 @@ export class CrankService {
     }
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.timer) return;
     this._isRunning = true;
     logger.info("Crank service starting", { intervalMs: this.intervalMs, inactiveIntervalMs: this.inactiveIntervalMs });
 
-    // Only fire a startup discovery if no markets are already loaded.
-    // index.ts runs discover() before calling start(), so on normal startup markets.size > 0
-    // and we skip this to avoid a redundant burst of getProgramAccounts calls that trigger
-    // 429s on Helius. If start() is called standalone (tests, hot-restart edge case) with
-    // empty markets, we still discover as expected.
+    // B11: await initial discovery so the first crank cycle never races against
+    // the discover() call. index.ts already discovers before calling start() on
+    // normal boot (markets.size > 0), so this path is only hit by tests or
+    // hot-restart edge cases — but when it does run, the interval below must
+    // not start ticking until markets is populated.
     if (this.markets.size === 0) {
       logger.debug("start(): no pre-loaded markets — running initial discovery");
-      this.discover().then(markets => {
+      try {
+        const markets = await this.discover();
         logger.info("Initial discovery complete", { marketCount: markets.length });
-      }).catch(err => {
+      } catch (err) {
         logger.error("Initial discovery failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
-      });
+        // Continue — the periodic discovery in the interval will retry.
+      }
     } else {
       logger.debug("start(): markets pre-loaded by caller — skipping redundant startup discover", {
         marketCount: this.markets.size,
