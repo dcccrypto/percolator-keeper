@@ -25,7 +25,7 @@ import type {
   BlockhashWithExpiryBlockHeight,
   GetProgramAccountsFilter,
 } from "@solana/web3.js";
-import { createLogger } from "@percolatorct/shared";
+import { createLogger, sendWarningAlert } from "@percolatorct/shared";
 import { RpcProviderHealth } from "./rpc-health.js";
 import {
   rpcRequestTotal,
@@ -126,8 +126,8 @@ export class RpcPool {
     // Allow Node.js to exit even if the timer is still running.
     if (this._timer.unref) this._timer.unref();
     logger.warn("RPC pool started", {
-      helius: this._config.helius.url.slice(0, 40),
-      alchemy: this._config.alchemy.url.slice(0, 40),
+      helius: this._config.helius.url.replace(/\/v2\/.*/i, "/v2/<redacted>"),
+      alchemy: this._config.alchemy.url.replace(/\/v2\/.*/i, "/v2/<redacted>"),
       healthCheckIntervalMs: this._config.healthCheckIntervalMs,
     });
   }
@@ -147,9 +147,15 @@ export class RpcPool {
   pickProvider(method: string): ProviderName {
     if (!this._config.enabled) return "helius";
 
-    // getProgramAccounts is heavy; always Alchemy when the override is set.
+    // getProgramAccounts is heavy; prefer Alchemy when the override is set.
+    // If Alchemy is unhealthy, fall back to Helius (degraded but operational).
     if (method === "getProgramAccounts" && this._config.forceAlchemyGpa) {
-      return "alchemy";
+      if (this._alchemyHealth.isHealthy) {
+        return "alchemy";
+      }
+      // Alchemy unhealthy — bump observable counter and fall through to Helius.
+      rpcFailoverTotal.inc({ from: "alchemy", to: "helius", reason: "gpa_alchemy_unhealthy" });
+      return "helius";
     }
 
     const heliusOk = this._heliusHealth.isHealthy;
@@ -278,47 +284,7 @@ export class RpcPool {
       this._probeProvider("helius"),
       this._probeProvider("alchemy"),
     ]);
-
-    const heliusSlot = this._heliusHealth.lastSeenSlot;
-    const alchemySlot = this._alchemyHealth.lastSeenSlot;
-
-    // Evaluate health (passing the other provider's slot for lag computation).
-    const heliusBecameHealthy = this._heliusHealth.evaluate(alchemySlot);
-    const alchemyBecameHealthy = this._alchemyHealth.evaluate(heliusSlot);
-
-    // Update Prometheus health gauges.
-    rpcProviderHealthy.set({ provider: "helius" }, this._heliusHealth.isHealthy ? 1 : 0);
-    rpcProviderHealthy.set({ provider: "alchemy" }, this._alchemyHealth.isHealthy ? 1 : 0);
-
-    // Update latency gauges.
-    this._updateLatencyGauges("helius", this._heliusHealth);
-    this._updateLatencyGauges("alchemy", this._alchemyHealth);
-
-    // Update slot-lag gauges.
-    const heliusLag = this._heliusHealth.computeSlotLag(alchemySlot);
-    const alchemyLag = this._alchemyHealth.computeSlotLag(heliusSlot);
-    if (heliusLag !== null) rpcSlotLag.set({ provider: "helius" }, heliusLag);
-    if (alchemyLag !== null) rpcSlotLag.set({ provider: "alchemy" }, alchemyLag);
-
-    // Detect failover transitions.
-    const newActive = this.pickProvider("_tick");
-    if (newActive !== this._activeProvider) {
-      const reason = this._heliusHealth.isHealthy ? "helius-recovered" : "helius-unhealthy";
-      rpcFailoverTotal.inc({ from: this._activeProvider, to: newActive, reason });
-      this._failoverCount++;
-      logger.warn("RPC pool failover", {
-        from: this._activeProvider,
-        to: newActive,
-        reason,
-        heliusHealthy: this._heliusHealth.isHealthy,
-        alchemyHealthy: this._alchemyHealth.isHealthy,
-      });
-      this._activeProvider = newActive;
-    }
-
-    // Log recovery events (already logged inside evaluate(), but bump counter).
-    void heliusBecameHealthy;
-    void alchemyBecameHealthy;
+    this._evaluateAndTransition();
   }
 
   private async _probeProvider(provider: ProviderName): Promise<void> {
@@ -334,6 +300,76 @@ export class RpcPool {
     } catch {
       rpcRequestTotal.inc({ provider, method: "getSlot", result: "fail" });
       health.recordFailure();
+    }
+  }
+
+  /**
+   * Exposed for testing: inject scripted probe results and run the evaluate +
+   * transition logic (the part of _healthTick that follows _probeProvider).
+   * Bypasses real network calls so property tests can drive the state machine
+   * directly. Pass null for a provider slot to simulate a probe failure.
+   */
+  tickForTest(
+    heliusSlotResult: number | null,
+    alchemySlotResult: number | null,
+    latencyMs = 100,
+  ): void {
+    for (const [provider, slotResult] of [
+      ["helius", heliusSlotResult],
+      ["alchemy", alchemySlotResult],
+    ] as const) {
+      const health = provider === "helius" ? this._heliusHealth : this._alchemyHealth;
+      if (slotResult === null) {
+        health.recordFailure();
+        rpcRequestTotal.inc({ provider, method: "getSlot", result: "fail" });
+      } else {
+        health.recordSuccess(latencyMs);
+        health.recordSlot(slotResult);
+        rpcRequestTotal.inc({ provider, method: "getSlot", result: "ok" });
+      }
+    }
+    this._evaluateAndTransition();
+  }
+
+  /** Core evaluate + failover-detection logic extracted for both _healthTick and tickForTest. */
+  private _evaluateAndTransition(): void {
+    const heliusSlot = this._heliusHealth.lastSeenSlot;
+    const alchemySlot = this._alchemyHealth.lastSeenSlot;
+
+    this._heliusHealth.evaluate(alchemySlot);
+    this._alchemyHealth.evaluate(heliusSlot);
+
+    rpcProviderHealthy.set({ provider: "helius" }, this._heliusHealth.isHealthy ? 1 : 0);
+    rpcProviderHealthy.set({ provider: "alchemy" }, this._alchemyHealth.isHealthy ? 1 : 0);
+
+    this._updateLatencyGauges("helius", this._heliusHealth);
+    this._updateLatencyGauges("alchemy", this._alchemyHealth);
+
+    const heliusLag = this._heliusHealth.computeSlotLag(alchemySlot);
+    const alchemyLag = this._alchemyHealth.computeSlotLag(heliusSlot);
+    if (heliusLag !== null) rpcSlotLag.set({ provider: "helius" }, heliusLag);
+    if (alchemyLag !== null) rpcSlotLag.set({ provider: "alchemy" }, alchemyLag);
+
+    const newActive = this.pickProvider("_tick");
+    if (newActive !== this._activeProvider) {
+      const from = this._activeProvider;
+      const to = newActive;
+      const reason = this._heliusHealth.isHealthy ? "helius-recovered" : "helius-unhealthy";
+      rpcFailoverTotal.inc({ from, to, reason });
+      this._failoverCount++;
+      logger.warn("RPC pool failover", {
+        from,
+        to,
+        reason,
+        heliusHealthy: this._heliusHealth.isHealthy,
+        alchemyHealthy: this._alchemyHealth.isHealthy,
+      });
+      sendWarningAlert("RPC failover", [
+        { name: "From", value: from, inline: true },
+        { name: "To", value: to, inline: true },
+        { name: "Reason", value: reason, inline: true },
+      ])?.catch(() => {});
+      this._activeProvider = newActive;
     }
   }
 

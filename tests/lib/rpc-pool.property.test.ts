@@ -8,6 +8,7 @@ vi.mock("@percolatorct/shared", () => ({
     error: vi.fn(),
     debug: vi.fn(),
   })),
+  sendWarningAlert: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("../../src/lib/metrics.js", () => ({
@@ -127,26 +128,27 @@ describe("RpcPool — property tests", () => {
   );
 
   it(
-    "invariant: failover counter monotonically increases (never decreases)",
+    "invariant: failover counter monotonically increases (never decreases) — driven via tickForTest",
     () => {
+      // Use tickForTest (which drives the real _evaluateAndTransition state machine)
+      // rather than applyEvents so _failoverCount is actually exercised.
       fc.assert(
         fc.property(
           fc.array(
             fc.record({
-              helius: fc.array(healthEventArb, { minLength: 0, maxLength: 10 }),
-              alchemy: fc.array(healthEventArb, { minLength: 0, maxLength: 10 }),
+              heliusSlot: fc.option(fc.integer({ min: 1, max: 1_000_000 }), { nil: null }),
+              alchemySlot: fc.option(fc.integer({ min: 1, max: 1_000_000 }), { nil: null }),
+              latencyMs: fc.integer({ min: 1, max: 5_000 }),
             }),
-            { minLength: 1, maxLength: 20 },
+            { minLength: 1, maxLength: 30 },
           ),
           (rounds) => {
             const pool = new RpcPool(makeConn() as any, makeConn() as any, {
               config: makeConfig(),
             });
             let lastCount = pool.failoverCount;
-            for (const { helius, alchemy } of rounds) {
-              applyEvents(pool, helius, alchemy);
-              const prevProvider = pool.pickProvider("getAccountInfo");
-              void prevProvider;
+            for (const { heliusSlot, alchemySlot, latencyMs } of rounds) {
+              pool.tickForTest(heliusSlot, alchemySlot, latencyMs);
               const current = pool.failoverCount;
               expect(current).toBeGreaterThanOrEqual(lastCount);
               lastCount = current;

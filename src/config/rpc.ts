@@ -38,7 +38,7 @@ export interface RpcPoolConfig {
 }
 
 export function parseRpcPoolConfig(env: NodeJS.ProcessEnv = process.env): RpcPoolConfig {
-  const enabled = parseBoolEnv(env, "RPC_POOL_ENABLED", true);
+  const enabled = parseBoolEnv(env, "RPC_POOL_ENABLED", false);
 
   const heliusUrl = env.SOLANA_RPC_URL ?? env.RPC_URL ?? "";
 

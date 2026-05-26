@@ -7,6 +7,7 @@ vi.mock("@percolatorct/shared", () => ({
     error: vi.fn(),
     debug: vi.fn(),
   })),
+  sendWarningAlert: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("../../src/lib/metrics.js", () => ({
@@ -346,6 +347,93 @@ describe("RpcPool — lifecycle", () => {
     });
     pool.start(); // should not throw or spin up a timer
     pool.stop();
+  });
+});
+
+// ── GPA fallback on Alchemy unhealthy (Fix 3) ────────────────────────────────
+
+describe("RpcPool — GPA fallback when Alchemy unhealthy", () => {
+  it("getProgramAccounts falls back to Helius when forceAlchemyGpa=true but Alchemy is unhealthy", async () => {
+    const helius = makeConn();
+    const alchemy = makeConn();
+    const pool = new RpcPool(helius as any, alchemy as any, {
+      config: makeConfig({ forceAlchemyGpa: true }),
+      now: mockNow,
+    });
+
+    // Mark Alchemy unhealthy via consecutive fails.
+    for (let i = 0; i < 5; i++) pool.alchemyHealth.recordFailure();
+    pool.alchemyHealth.evaluate(null);
+    expect(pool.alchemyHealth.isHealthy).toBe(false);
+
+    await pool.getProgramAccounts(PublicKey.default);
+
+    // Must route to Helius — keeper can still operate, degraded.
+    expect(helius.getProgramAccounts).toHaveBeenCalledOnce();
+    expect(alchemy.getProgramAccounts).not.toHaveBeenCalled();
+  });
+
+  it("getProgramAccounts routes to Alchemy when forceAlchemyGpa=true and Alchemy is healthy", async () => {
+    const helius = makeConn();
+    const alchemy = makeConn();
+    const pool = new RpcPool(helius as any, alchemy as any, {
+      config: makeConfig({ forceAlchemyGpa: true }),
+      now: mockNow,
+    });
+
+    // Alchemy is healthy (default state).
+    expect(pool.alchemyHealth.isHealthy).toBe(true);
+
+    await pool.getProgramAccounts(PublicKey.default);
+
+    expect(alchemy.getProgramAccounts).toHaveBeenCalledOnce();
+    expect(helius.getProgramAccounts).not.toHaveBeenCalled();
+  });
+
+  it("gpa_alchemy_unhealthy failover counter is bumped when Alchemy unhealthy during GPA", async () => {
+    const metrics = await import("../../src/lib/metrics.js");
+    const helius = makeConn();
+    const alchemy = makeConn();
+    const pool = new RpcPool(helius as any, alchemy as any, {
+      config: makeConfig({ forceAlchemyGpa: true }),
+      now: mockNow,
+    });
+
+    for (let i = 0; i < 5; i++) pool.alchemyHealth.recordFailure();
+    pool.alchemyHealth.evaluate(null);
+    vi.clearAllMocks();
+
+    await pool.getProgramAccounts(PublicKey.default);
+
+    expect(metrics.rpcFailoverTotal.inc).toHaveBeenCalledWith({
+      from: "alchemy",
+      to: "helius",
+      reason: "gpa_alchemy_unhealthy",
+    });
+  });
+});
+
+// ── URL redaction (Fix 6) ─────────────────────────────────────────────────────
+
+describe("RpcPool — URL redaction in start() log", () => {
+  it("standard Alchemy URL shape: key after /v2/ is fully redacted", () => {
+    const standardUrl = "https://solana-mainnet.g.alchemy.com/v2/abcdef1234567890abcdef1234567890";
+    const redacted = standardUrl.replace(/\/v2\/.*/i, "/v2/<redacted>");
+    expect(redacted).toBe("https://solana-mainnet.g.alchemy.com/v2/<redacted>");
+    expect(redacted).not.toContain("abcdef");
+  });
+
+  it("short custom Alchemy URL shape: key after /v2/ is fully redacted regardless of base length", () => {
+    const shortUrl = "https://my.alchemy.com/v2/SECRETKEY123";
+    const redacted = shortUrl.replace(/\/v2\/.*/i, "/v2/<redacted>");
+    expect(redacted).toBe("https://my.alchemy.com/v2/<redacted>");
+    expect(redacted).not.toContain("SECRETKEY123");
+  });
+
+  it("URL without /v2/ path is returned unchanged (no key to strip)", () => {
+    const noV2Url = "https://helius.xyz/mainnet-key-here";
+    const redacted = noV2Url.replace(/\/v2\/.*/i, "/v2/<redacted>");
+    expect(redacted).toBe(noV2Url); // no /v2/ segment — nothing to strip
   });
 });
 

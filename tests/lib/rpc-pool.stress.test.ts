@@ -7,6 +7,7 @@ vi.mock("@percolatorct/shared", () => ({
     error: vi.fn(),
     debug: vi.fn(),
   })),
+  sendWarningAlert: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("../../src/lib/metrics.js", () => ({

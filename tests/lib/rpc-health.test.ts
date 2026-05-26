@@ -189,18 +189,17 @@ describe("RpcProviderHealth", () => {
       h.evaluate(null);
       expect(h.isHealthy).toBe(false);
 
-      // Start clean recovery window.
+      // Start clean recovery window — but null otherLastSeenSlot means slot lag can't be
+      // verified, so the recovery clock never starts (Fix 2: null slot blocks recovery).
       for (let i = 0; i < 5; i++) h.recordSuccess(500);
-      // First clean evaluate — starts recovery clock.
       h.evaluate(null);
       expect(h.isHealthy).toBe(false);
 
-      // A new failure resets the recovery clock — now we need another full window.
+      // A new failure also blocks recovery via fails criterion. Advance past window — still unhealthy.
       h.recordFailure();
       t += 61_000;
       h.evaluate(null);
-      // Still unhealthy: fail incremented consecutiveFails = 1, so failBreach not triggered
-      // but recoveryFailsOk requires 0 consecutive fails → recovery clock resets.
+      // Still unhealthy: recoveryFailsOk requires 0 consecutive fails AND slot data.
       expect(h.isHealthy).toBe(false);
     });
 
@@ -218,6 +217,38 @@ describe("RpcProviderHealth", () => {
       // Even after advancing time, slot lag still blocks recovery.
       h.evaluate(1100);
       expect(h.isHealthy).toBe(false);
+    });
+
+    it("recovery is BLOCKED while otherLastSeenSlot is null — slot freshness unverifiable", () => {
+      // Fix 2: null otherLastSeenSlot must NOT satisfy the slot-lag recovery criterion.
+      // Even if P99 is good and consecutive fails = 0, recovery cannot proceed without
+      // affirmative slot data from the other provider.
+      const h = new RpcProviderHealth("helius", TIGHT_CONFIG, now);
+
+      // Become unhealthy via consecutive fails.
+      for (let i = 0; i < 5; i++) h.recordFailure();
+      h.evaluate(null);
+      expect(h.isHealthy).toBe(false);
+
+      // Restore P99 and zero fails — but other provider slot is still null.
+      for (let i = 0; i < 20; i++) h.recordSuccess(300);
+      // First evaluate with otherLastSeenSlot = null: slot lag is null → NOT recoverable.
+      h.evaluate(null);
+      expect(h.isHealthy).toBe(false);
+
+      // Advance far past the recovery window — still blocked.
+      t += 120_000;
+      h.evaluate(null);
+      expect(h.isHealthy).toBe(false);
+
+      // Provide affirmative slot data: now recovery clock can start.
+      h.recordSlot(1000);
+      h.evaluate(1005); // slot lag = 5 < recoverySlotLag (10) — clock starts now
+      expect(h.isHealthy).toBe(false); // window not elapsed
+
+      t += 61_000;
+      h.evaluate(1005);
+      expect(h.isHealthy).toBe(true); // recovered only once slot data confirmed
     });
   });
 

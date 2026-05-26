@@ -146,7 +146,7 @@ export class RpcProviderHealth {
     if (!this._isHealthy) {
       // Check if we meet recovery criteria.
       const recoveryP99Ok = p99 === null || p99 < this.config.recoveryP99Ms;
-      const recoveryLagOk = slotLag === null || Math.abs(slotLag) < this.config.recoverySlotLag;
+      const recoveryLagOk = slotLag !== null && Math.abs(slotLag) < this.config.recoverySlotLag;
       const recoveryFailsOk = this._consecutiveFails === 0;
 
       if (recoveryP99Ok && recoveryLagOk && recoveryFailsOk) {
