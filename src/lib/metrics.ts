@@ -274,7 +274,33 @@ export const fraudOffchainUnavailableTotal = new Counter({
   registers: [registry],
 });
 
-// Wired in Workstream J (shadow-keeper observation harness PR)
+// ── Workstream J: shadow-keeper observation harness ──────────────────────────
+
+// Incremented on every decision the shadow keeper would have fired.
+// Partitioned by txType so the operator can tell which crank type the shadow
+// is most active on. Wired from decision-log.ts append().
+export const shadowDecisionsTotal = new Counter({
+  name: "keeper_shadow_decisions_total",
+  help: "Total shadow-keeper decisions logged (would-have-fired), partitioned by txType",
+  labelNames: ["txType"] as const,
+  registers: [registry],
+});
+
+// Incremented on every compared decision/tx pair. result is one of:
+//   "match"        — shadow decision matched a live tx
+//   "live_only"    — live tx had no corresponding shadow decision
+//   "shadow_only"  — shadow decision had no corresponding live tx
+// Wired from shadow-harness.ts compare().
+export const shadowMatchTotal = new Counter({
+  name: "keeper_shadow_match_total",
+  help: "Total shadow-keeper comparison outcomes, partitioned by txType and result",
+  labelNames: ["txType", "result"] as const,
+  registers: [registry],
+});
+
+// Updated after each comparison cycle. divergence_pct per txType computed
+// independently: (live_only + shadow_only) / total * 100. Wired from
+// shadow-harness.ts compare().
 export const shadowDivergencePct = new Gauge({
   name: "keeper_shadow_divergence_pct",
   help: "Divergence percentage between shadow-keeper decision and live-keeper decision, partitioned by txType",

@@ -7,6 +7,7 @@ import type { TxType, TxResult } from "./budget.js";
 import { HeliusPriorityFeeEstimator } from "./priority-fee.js";
 import type { PriorityFeeEstimator, PriorityFeeTier } from "./priority-fee.js";
 import { CuEstimator } from "./cu-estimator.js";
+import { sharedDecisionLog } from "./decision-log.js";
 
 const logger = createLogger("keeper:send");
 
@@ -147,6 +148,31 @@ export async function keeperSend(
       })),
       uniqueAccounts: Array.from(new Set(accountKeys)),
     });
+
+    // When the shadow harness is enabled, log the decision for the comparison
+    // loop. Errors are swallowed inside DecisionLog.append() — they must never
+    // propagate here. When SHADOW_HARNESS_ENABLED is false, this branch still
+    // runs but the append is still called; the decisionLog.append itself is a
+    // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
+    // inside append() rather than here to keep this path readable.
+    if (process.env.SHADOW_HARNESS_ENABLED === "true") {
+      const firstIx = instructions[0];
+      // The market is the first non-system account from the first instruction.
+      // For crank/liquidation/adl ixs the slab address is always at index 0.
+      const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
+      const instructionData =
+        firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
+      void sharedDecisionLog.append({
+        timestamp: new Date().toISOString(),
+        txType,
+        market,
+        accounts: Array.from(new Set(accountKeys)),
+        instructionData,
+        estimatedCost,
+        reasonChain: [],
+      });
+    }
+
     budget.recordTx(estimatedCost, txType, "success");
     return { signature, estimatedCost, simulatedCu };
   }

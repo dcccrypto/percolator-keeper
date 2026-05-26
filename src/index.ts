@@ -19,6 +19,8 @@ import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
 import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
+import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
+import { sharedDecisionLog } from "./lib/decision-log.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -512,6 +514,40 @@ res.writeHead(401, secureJsonHeaders);
     const statusCode = currentRole === "standby" ? 200 : status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
     res.writeHead(statusCode, secureJsonHeaders);
     res.end(JSON.stringify(healthData));
+  } else if (req.url !== null && req.url !== undefined && (req.url === "/shadow/report" || req.url.startsWith("/shadow/report?")) && req.method === "GET") {
+    // GET /shadow/report?from=<epoch_ms>&to=<epoch_ms>
+    // Returns the current shadow-keeper comparison report.
+    // Only meaningful when SHADOW_HARNESS_ENABLED=true (DRY_RUN shadow deploy).
+    if (process.env.SHADOW_HARNESS_ENABLED !== "true") {
+      res.writeHead(200, secureJsonHeaders);
+      res.end(JSON.stringify({ enabled: false, message: "SHADOW_HARNESS_ENABLED is not set to true" }));
+      return;
+    }
+    const harness = sharedShadowHarness;
+    if (!harness) {
+      res.writeHead(503, secureJsonHeaders);
+      res.end(JSON.stringify({ error: "Shadow harness not initialized" }));
+      return;
+    }
+    void (async () => {
+      try {
+        const urlObj = new URL(req.url!, `http://localhost`);
+        const fromParam = urlObj.searchParams.get("from");
+        const toParam = urlObj.searchParams.get("to");
+        const fromMs = fromParam !== null ? Number(fromParam) : undefined;
+        const toMs = toParam !== null ? Number(toParam) : undefined;
+        const report = await harness.buildReport(
+          fromMs !== undefined && Number.isFinite(fromMs) ? fromMs : undefined,
+          toMs !== undefined && Number.isFinite(toMs) ? toMs : undefined,
+        );
+        res.writeHead(200, secureJsonHeaders);
+        res.end(JSON.stringify({ enabled: true, ...report }));
+      } catch (err) {
+        logger.error("/shadow/report error", { error: err instanceof Error ? err.message : String(err) });
+        res.writeHead(500, secureJsonHeaders);
+        res.end(JSON.stringify({ error: "Internal error" }));
+      }
+    })();
   } else {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");
@@ -672,6 +708,20 @@ async function start() {
   registerDefaultMetrics();
   metricsServer.start();
 
+  // J: Shadow harness — only in DRY_RUN shadow deploys.
+  if (process.env.SHADOW_HARNESS_ENABLED === "true") {
+    const conn = (await import("@percolatorct/shared")).getConnection();
+    const harness = initSharedShadowHarness({
+      connection: conn,
+      readDecisions: (fromMs, toMs) => sharedDecisionLog.readWindow(fromMs, toMs),
+    });
+    harness.start();
+    logger.info("Shadow harness started", {
+      compareWindowMs: Number(process.env.SHADOW_HARNESS_COMPARE_WINDOW_MS ?? 300_000),
+      divergenceThresholdPct: Number(process.env.SHADOW_HARNESS_DIVERGENCE_THRESHOLD_PCT ?? 1.0),
+    });
+  }
+
   // Send startup alert
   await sendInfoAlert("Keeper service started", [
     { name: "Markets Tracked", value: markets.length.toString(), inline: true },
@@ -729,6 +779,13 @@ async function shutdown(signal: string): Promise<void> {
       oracle: qStats.oracle,
       crank: qStats.crank,
     });
+
+    // J: Stop shadow harness and flush decision log before releasing leader lock.
+    if (sharedShadowHarness) {
+      sharedShadowHarness.stop();
+      logger.info("Shadow harness stopped");
+    }
+    await sharedDecisionLog.close();
 
     // Stop stale oracle + liquidation + SOL balance checks
     clearInterval(staleCheckInterval);
