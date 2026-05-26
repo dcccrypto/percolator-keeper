@@ -59,9 +59,14 @@ export class OracleService {
   private readonly maxTrackedMarkets = 500;
   // BM2: Deduplicate concurrent requests for the same mint
   private inFlightRequests = new Map<string, Promise<bigint | null>>();
-  // Track consecutive single-source fetches to detect degraded cross-validation
-  private _consecutiveSingleSource = 0;
-  private _singleSourceAlertSent = false;
+  // B6: per-mint single-source state. The previous shared counters meant that
+  // any single-source fetch — even on a niche market — moved the same global
+  // counter, so a misbehaving feed for one mint could mute or trigger alerts
+  // for every other market.
+  private _singleSourceState = new Map<
+    string,
+    { consecutive: number; alertSent: boolean }
+  >();
   private static readonly SINGLE_SOURCE_ALERT_THRESHOLD = 10;
   // M-4: Track when an external source (DexScreener or Jupiter) last returned a
   // valid price for each slab. Used to cap the on-chain fallback duration so that
@@ -100,7 +105,12 @@ export class OracleService {
           if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY_USD) return null;
           const p = parseFloat(pair.priceUsd);
           if (!isFinite(p) || p <= 0) return null;
-          return BigInt(Math.round(p * PRICE_E6_MULTIPLIER));
+          // B8: parseFloat + Math.round can produce 0 for sub-1e-7 prices,
+          // which would pass downstream `!== null` checks but represent no
+          // price at all. Reject explicitly.
+          const priceE6 = BigInt(Math.round(p * PRICE_E6_MULTIPLIER));
+          if (priceE6 === 0n) return null;
+          return priceE6;
         }
       }
 
@@ -136,8 +146,17 @@ export class OracleService {
       if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY_USD) return null;
       const parsed = parseFloat(pair.priceUsd);
       if (!isFinite(parsed) || parsed <= 0) return null;
-      return BigInt(Math.round(parsed * PRICE_E6_MULTIPLIER));
-    } catch {
+      // B8: see cache-hit branch above.
+      const priceE6 = BigInt(Math.round(parsed * PRICE_E6_MULTIPLIER));
+      if (priceE6 === 0n) return null;
+      return priceE6;
+    } catch (err) {
+      // B9: log instead of silently swallowing — a sustained DexScreener outage
+      // used to be invisible until cross-source validation alerts fired downstream.
+      logger.warn("fetchDexScreenerPrice failed", {
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return null;
     }
   }
@@ -178,8 +197,16 @@ export class OracleService {
       if (!priceStr) return null;
       const parsed = parseFloat(priceStr);
       if (!isFinite(parsed) || parsed <= 0) return null;
-      return BigInt(Math.round(parsed * PRICE_E6_MULTIPLIER));
-    } catch {
+      // B8: explicit zero short-circuit — see fetchDexScreenerPrice for rationale.
+      const priceE6 = BigInt(Math.round(parsed * PRICE_E6_MULTIPLIER));
+      if (priceE6 === 0n) return null;
+      return priceE6;
+    } catch (err) {
+      // B9: log instead of swallowing.
+      logger.warn("fetchJupiterPrice failed", {
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return null;
     }
   }
@@ -219,37 +246,47 @@ export class OracleService {
       }
     }
 
-    // Track cross-validation coverage: alert when single-source mode persists
+    // B6: per-mint single-source tracking. Each mint has independent counters
+    // so a degraded feed for one market does not silence (or fire) alerts for
+    // any other.
     const bothAvailable = dexPrice !== null && jupPrice !== null;
+    const mintState = this._singleSourceState.get(mint) ?? {
+      consecutive: 0,
+      alertSent: false,
+    };
     if (bothAvailable) {
-      if (this._consecutiveSingleSource > 0) {
+      if (mintState.consecutive > 0) {
         logger.info("Cross-source validation restored", {
-          previousSingleSourceCount: this._consecutiveSingleSource,
+          mint,
+          previousSingleSourceCount: mintState.consecutive,
         });
       }
-      this._consecutiveSingleSource = 0;
-      this._singleSourceAlertSent = false;
+      mintState.consecutive = 0;
+      mintState.alertSent = false;
     } else if (dexPrice !== null || jupPrice !== null) {
-      this._consecutiveSingleSource++;
+      mintState.consecutive++;
       const degradedSource = dexPrice !== null ? "dexscreener" : "jupiter";
       const downSource = dexPrice !== null ? "jupiter" : "dexscreener";
       if (
-        this._consecutiveSingleSource >= OracleService.SINGLE_SOURCE_ALERT_THRESHOLD &&
-        !this._singleSourceAlertSent
+        mintState.consecutive >= OracleService.SINGLE_SOURCE_ALERT_THRESHOLD &&
+        !mintState.alertSent
       ) {
-        this._singleSourceAlertSent = true;
+        mintState.alertSent = true;
         logger.warn("Cross-source validation degraded — operating on single source", {
-          consecutiveSingleSource: this._consecutiveSingleSource,
+          mint,
+          consecutiveSingleSource: mintState.consecutive,
           activeSource: degradedSource,
           downSource,
         });
         sendWarningAlert("Oracle cross-validation degraded", [
+          { name: "Mint", value: mint.slice(0, 12), inline: true },
           { name: "Active Source", value: degradedSource, inline: true },
           { name: "Down Source", value: downSource, inline: true },
-          { name: "Consecutive", value: String(this._consecutiveSingleSource), inline: true },
+          { name: "Consecutive", value: String(mintState.consecutive), inline: true },
         ])?.catch(() => {});
       }
     }
+    this._singleSourceState.set(mint, mintState);
 
     // Select best available price (DexScreener preferred)
     let priceE6: bigint | null = dexPrice;
