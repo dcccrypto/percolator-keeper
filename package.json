@@ -15,11 +15,15 @@
     "@percolatorct/sdk": "2.0.9",
     "@percolatorct/shared": "1.0.0-beta.8",
     "@solana/web3.js": "^1.98.0",
+    "@upstash/redis": "^1.38.0",
     "dotenv": "^16.4.7",
+    "helius-laserstream": "^0.3.2",
+    "lru-cache": "^11.5.0",
     "prom-client": "^15.1.3"
   },
   "devDependencies": {
     "@types/node": "^25.2.2",
+    "fast-check": "^4.8.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^4.0.18"

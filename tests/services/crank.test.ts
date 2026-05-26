@@ -71,10 +71,19 @@ vi.mock('@percolatorct/shared', () => ({
   },
 }));
 
+vi.mock('../../src/lib/keeper-send.js', async () => {
+  const { KeeperBudget } = await vi.importActual<typeof import('../../src/lib/budget.js')>('../../src/lib/budget.js');
+  return {
+    keeperSend: vi.fn(async () => ({ signature: 'mock-keeper-sig-' + Date.now(), estimatedCost: 5000 })),
+    sharedBudget: new KeeperBudget(),
+  };
+});
+
 import { PublicKey } from '@solana/web3.js';
 import { CrankService } from '../../src/services/crank.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
+import * as keeperSendModule from '../../src/lib/keeper-send.js';
 
 describe('CrankService', () => {
   let crankService: CrankService;
@@ -211,7 +220,7 @@ describe('CrankService', () => {
       const result = await crankService.crankMarket(slabAddress);
 
       expect(result).toBe(true);
-      expect(shared.sendWithRetryKeeper).toHaveBeenCalled();
+      expect(keeperSendModule.keeperSend).toHaveBeenCalled();
       
       const state = crankService.getMarkets().get(slabAddress);
       expect(state?.successCount).toBe(1);
@@ -236,7 +245,7 @@ describe('CrankService', () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
 
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error('Transaction failed'));
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('Transaction failed'));
 
       const result = await crankService.crankMarket(slabAddress);
 
@@ -272,14 +281,14 @@ describe('CrankService', () => {
       vi.setSystemTime(startTime);
 
       // One successful crank to set lastCrankTime
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('initial-success');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'initial-success', estimatedCost: 5000 } as any);
       await crankService.crankMarket(slabAddress);
       const stateAfterSuccess = crankService.getMarkets().get(slabAddress)!;
       expect(stateAfterSuccess.isActive).toBe(true);
       expect(stateAfterSuccess.lastCrankTime).toBeCloseTo(startTime, -2);
 
       // Now fail 10 consecutive times → market becomes inactive
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error('Transaction failed'));
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('Transaction failed'));
       for (let i = 0; i < 10; i++) {
         await crankService.crankMarket(slabAddress);
       }
@@ -326,7 +335,7 @@ describe('CrankService', () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
 
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error('Transaction failed'));
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('Transaction failed'));
 
       // Fail 10 times
       for (let i = 0; i < 10; i++) {
@@ -363,7 +372,7 @@ describe('CrankService', () => {
       };
 
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('sig-raydium');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-raydium', estimatedCost: 5000 } as any);
       await crankService.discover();
 
       expect(await crankService.crankMarket(slabAddress)).toBe(true);
@@ -371,11 +380,13 @@ describe('CrankService', () => {
 
       expect(connection.getAccountInfo).toHaveBeenCalledTimes(1);
       expect(core.detectDexType).toHaveBeenCalledTimes(1);
-      expect(shared.sendWithRetryKeeper).toHaveBeenCalledTimes(2);
-      expect(shared.sendWithRetryKeeper).toHaveBeenLastCalledWith(
+      expect(keeperSendModule.keeperSend).toHaveBeenCalledTimes(2);
+      expect(keeperSendModule.keeperSend).toHaveBeenLastCalledWith(
         connection,
         expect.any(Array),
         expect.any(Array),
+        'crank',
+        expect.anything(),
         3,
         expect.objectContaining({
           skipPreflight: true,
@@ -405,7 +416,7 @@ describe('CrankService', () => {
       await crankService.discover();
 
       // Simulate 0x4 error → permanently skipped
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(
         new Error('failed to send transaction: Transaction simulation failed: Error processing Instruction 0: custom program error: 0x4')
       );
       await crankService.crankMarket(slabAddress);
@@ -440,7 +451,7 @@ describe('CrankService', () => {
       await crankService.discover();
 
       // Simulate 0x4 error
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(
         new Error('custom program error: 0x4')
       );
       await crankService.crankMarket(slabAddress);
@@ -477,7 +488,7 @@ describe('CrankService', () => {
       await crankService.discover();
 
       // Simulate multiple 0x4 errors
-      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(
         new Error('custom program error: 0x4')
       );
       await crankService.crankMarket(slabAddress);
@@ -550,7 +561,7 @@ describe('CrankService', () => {
 
       expect(result).toBe(false);
       // Should NOT have submitted a transaction
-      expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+      expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
 
       const state = crankService.getMarkets().get(slabAddress)!;
       expect(state.foreignOracleSkipped).toBe(true);
@@ -617,11 +628,11 @@ describe('CrankService', () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
       await crankService.discover();
 
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('sig-own-oracle');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-own-oracle', estimatedCost: 5000 } as any);
       const result = await crankService.crankMarket(slabAddress);
 
       expect(result).toBe(true);
-      expect(shared.sendWithRetryKeeper).toHaveBeenCalled();
+      expect(keeperSendModule.keeperSend).toHaveBeenCalled();
 
       const state = crankService.getMarkets().get(slabAddress)!;
       expect(state.foreignOracleSkipped).toBeUndefined();
@@ -663,7 +674,7 @@ describe('CrankService', () => {
       await localCrank.discover();
 
       mockOracleService.fetchPrice = vi.fn().mockResolvedValue({ priceE6: BigInt(50_000_000), source: 'dexscreener', timestamp: Date.now() });
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('sig-push-time');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-push-time', estimatedCost: 5000 } as any);
 
       try {
         const result = await localCrank.crankMarket(slabAddress);
@@ -722,7 +733,7 @@ describe('CrankService', () => {
       const foreignState = crankService.getMarkets().get(slabForeign)!;
       foreignState.foreignOracleSkipped = true;
 
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('sig-normal');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-normal', estimatedCost: 5000 } as any);
       const result = await crankService.crankAll();
 
       // Normal market cranked; foreign oracle market skipped → skipped >= 1
@@ -785,7 +796,7 @@ describe('CrankService', () => {
       // Now simulate discover() resetting the flag (as it does on each cycle)
       foreignState.foreignOracleSkipped = false;
 
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('sig-norm2');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-norm2', estimatedCost: 5000 } as any);
       const result = await crankService.crankAll();
 
       // The foreign oracle market should be SKIPPED, not failed
@@ -804,7 +815,7 @@ describe('CrankService', () => {
       // Regression: Small/256-slot Hyperp markets (indexFeedId=all-zeros, authorityPriceE6=0)
       // where fetchPrice returns null cause OracleInvalid (0xc) if cranked.
       // They must be skipped, not failed.
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('mock-sig');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000 } as any);
 
       const slabHyperp = 'HyperpZero1111111111111111111111111111111';
       const slabNormal = 'Normal111111111111111111111111111111111';
@@ -890,7 +901,7 @@ describe('CrankService', () => {
     });
 
     it('PERC-1254: should crank Hyperp market once fetchPrice returns a valid price', async () => {
-      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('mock-sig');
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000 } as any);
 
       const slabHyperp = 'HyperpWithPrice111111111111111111111111';
       const ZERO_BYTES = new Uint8Array(32);
@@ -990,21 +1001,19 @@ describe('CrankService', () => {
   describe('start and stop', () => {
     it('should start timer and perform initial discovery', async () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([]);
-      
-      crankService.start();
-      
+
+      // B11: start() is now async — await it so we can verify initial discovery synchronously
+      await crankService.start();
+
       expect(crankService.isRunning).toBe(true);
-      
-      // Wait for initial discovery
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
       expect(core.discoverMarkets).toHaveBeenCalled();
     });
 
-    it('should stop timer', () => {
-      crankService.start();
+    it('should stop timer', async () => {
+      vi.mocked(core.discoverMarkets).mockResolvedValue([]);
+      await crankService.start();
       expect(crankService.isRunning).toBe(true);
-      
+
       crankService.stop();
       expect(crankService.isRunning).toBe(false);
     });
@@ -1105,6 +1114,84 @@ describe('CrankService', () => {
       await crankService.discover();
       // Should only have been called once per program (2 programs × 1 attempt = 2)
       expect(callCount).toBe(2);
+    });
+  });
+
+  // A.1 (CRITICAL): a stream message at a known slab pubkey whose `owner`
+  // doesn't match the program ID must not be consumed by the fast path.
+  describe('A.1: owner-verified LaserStream fast-path', () => {
+    const EXPECTED_PROGRAM_ID = 'ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv';
+    const GOOD_SLAB = 'GoodSlab11111111111111111111111111111111111';
+    const BAD_SLAB = 'BadSlab1111111111111111111111111111111111111';
+
+    let restoreEnv: () => void;
+
+    beforeEach(() => {
+      const prev = process.env.KEEPER_USE_LASERSTREAM;
+      process.env.KEEPER_USE_LASERSTREAM = 'true';
+      restoreEnv = () => {
+        if (prev === undefined) delete process.env.KEEPER_USE_LASERSTREAM;
+        else process.env.KEEPER_USE_LASERSTREAM = prev;
+      };
+    });
+
+    afterEach(() => {
+      restoreEnv();
+    });
+
+    it('calls cache.getOwnerVerified with the loader program ID (not cache.get)', async () => {
+      const { AccountCache } = await import('../../src/lib/account-cache.js');
+      const realCache = new AccountCache();
+      realCache.set(GOOD_SLAB, new Uint8Array([1]), EXPECTED_PROGRAM_ID, 100);
+      realCache.set(BAD_SLAB, new Uint8Array([2]), 'AttackerProgram', 100);
+
+      const getOwnerVerifiedSpy = vi.spyOn(realCache, 'getOwnerVerified');
+
+      const fakeLoader = {
+        getCache: () => realCache,
+        getProgramId: () => EXPECTED_PROGRAM_ID,
+        getStats: () => ({
+          connected: true,
+          lastSlot: 110,
+          eventsReceived: 0,
+          eventsDropped: 0,
+          reconnectCount: 0,
+        }),
+      } as any;
+
+      const service = new CrankService(mockOracleService, undefined, fakeLoader);
+
+      // Seed both markets directly into the service's internal map.
+      const mkMarket = (slab: string) => ({
+        slabAddress: { toBase58: () => slab, equals: () => false },
+        programId: { toBase58: () => EXPECTED_PROGRAM_ID },
+        config: {
+          collateralMint: { toBase58: () => 'Mint' + slab.slice(0, 4) },
+          oracleAuthority: { toBase58: () => 'Auth' + slab.slice(0, 4), equals: () => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin' + slab.slice(0, 4) } },
+      });
+      const internal: any = service;
+      internal.markets.set(GOOD_SLAB, { market: mkMarket(GOOD_SLAB), missedDiscoveryCount: 0 });
+      internal.markets.set(BAD_SLAB, { market: mkMarket(BAD_SLAB), missedDiscoveryCount: 0 });
+      // Stay in the fast-path window so we don't trigger full rediscover.
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      // Both slabs should have been owner-verified with the expected program ID.
+      expect(getOwnerVerifiedSpy).toHaveBeenCalledWith(GOOD_SLAB, 110, EXPECTED_PROGRAM_ID);
+      expect(getOwnerVerifiedSpy).toHaveBeenCalledWith(BAD_SLAB, 110, EXPECTED_PROGRAM_ID);
+
+      // Owner mismatch on BAD_SLAB returned null → the malicious cache entry
+      // never reached the SDK parsers. Hits == 1 (good slab only).
+      const stats = realCache.stats();
+      expect(stats.hits).toBe(1);
+      expect(stats.misses).toBeGreaterThanOrEqual(1);
+
+      service.stop();
     });
   });
 });
