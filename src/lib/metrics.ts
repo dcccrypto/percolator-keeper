@@ -244,15 +244,32 @@ export const txQueueFailedTotal = new Counter({
   registers: [registry],
 });
 
-// ── Stubs for I/J — defined here so those workstreams can import without
-// introducing circular deps. Grafana panels will show "No data" until wired.
-//
-// (H's keeper_tx_queue_* metrics are fully wired above — no longer stubs.)
+// ── Workstream I: fraud-detection layer ──────────────────────────────────────
 
-// Wired in Workstream I (fraud-detection layer PR)
+// Per-mint divergence gauge: |onchain_mark - offchain_consensus| / offchain * 10_000.
+// Updated on every fraud-detector cycle regardless of whether the divergence
+// exceeds the alert threshold — allows trend analysis in Grafana.
 export const fraudDivergenceBps = new Gauge({
   name: "keeper_fraud_divergence_bps",
   help: "Absolute divergence in basis points between the on-chain EMA and the off-chain reference price, partitioned by mint",
+  labelNames: ["mint"] as const,
+  registers: [registry],
+});
+
+// Incremented each time a divergence alert fires for a mint (after cooldown passes).
+// Use rate() in Grafana to see alert frequency per mint.
+export const fraudAlertTotal = new Counter({
+  name: "keeper_fraud_alert_total",
+  help: "Total fraud-detection divergence alerts fired, partitioned by mint",
+  labelNames: ["mint"] as const,
+  registers: [registry],
+});
+
+// Incremented when the off-chain price is unavailable (null return, throw, or zero)
+// for a market. A sustained count indicates a feed outage for that mint.
+export const fraudOffchainUnavailableTotal = new Counter({
+  name: "keeper_fraud_offchain_unavailable_total",
+  help: "Total cycles where the off-chain price was unavailable for a market, partitioned by mint",
   labelNames: ["mint"] as const,
   registers: [registry],
 });

@@ -7,6 +7,7 @@ import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
 import { AdlService } from "./services/adl.js";
 import { MonitorService } from "./services/monitor.js";
+import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { assertMainnetProgramId } from "./lib/boot-assertions.js";
@@ -52,6 +53,7 @@ const oracleService = new OracleService();
 const crankService = new CrankService(oracleService);
 const liquidationService = new LiquidationService(oracleService);
 const monitorService = new MonitorService();
+const fraudDetector = new FraudDetectorService(oracleService, () => crankService.getMarkets());
 
 // ADL service — gated by ADL_ENABLED=true env var until on-chain instruction
 // (PERC-8273 T8) is live and T10 devnet upgrade is done (PERC-8275).
@@ -606,6 +608,8 @@ async function start() {
     logger.info("Liquidation scanner started");
     monitorService.start(() => crankService.getMarkets());
     logger.info("MonitorService started (invariant + ADL staleness checks)");
+    fraudDetector.start();
+    logger.info("FraudDetectorService started");
 
     if (adlService) {
       adlService.start(() => crankService.getMarkets());
@@ -624,6 +628,8 @@ async function start() {
     logger.info("Liquidation service stopped (HA demote)");
     monitorService.stop();
     logger.info("MonitorService stopped (HA demote)");
+    fraudDetector.stop();
+    logger.info("FraudDetectorService stopped (HA demote)");
   }
 
   if (leaderLock) {
@@ -758,7 +764,11 @@ async function shutdown(signal: string): Promise<void> {
     // Stop crank service (clears timers, stops processing)
     logger.info("Stopping crank service");
     crankService.stop();
-    
+
+    // Stop fraud-detection loop
+    logger.info("Stopping fraud-detector service");
+    fraudDetector.stop();
+
     // Stop liquidation service (clears timers)
     logger.info("Stopping liquidation service");
     liquidationService.stop();
