@@ -1,4 +1,4 @@
-import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
+import { PublicKey, SYSVAR_CLOCK_PUBKEY, TransactionInstruction } from "@solana/web3.js";
 import {
   fetchSlab,
   parseConfig,
@@ -27,6 +27,7 @@ import {
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
 
 const logger = createLogger("keeper:liquidation");
@@ -377,7 +378,7 @@ export class LiquidationService {
       // Build multi-instruction tx: crank → liquidate.
       // Admin-push oracle was removed by percolator-prog Phase G —
       // all markets now read Pyth/Chainlink/Hyperp directly.
-      const instructions = [];
+      const instructions: TransactionInstruction[] = [];
 
       // Determine oracle account for crank/liquidate
       const feedIdBytes = market.config.indexFeedId.toBytes();
@@ -456,7 +457,9 @@ export class LiquidationService {
       recordAttempt();
       let sig: string;
       try {
-        const sendResult = await keeperSend(connection, instructions, [keypair], "liquidation", sharedBudget, 3);
+        const sendResult = await sharedTxQueue.enqueue("liquidation", () =>
+          keeperSend(connection, instructions, [keypair], "liquidation", sharedBudget, 3),
+        );
         if (!sendResult) {
           recordFailed();
           return null;

@@ -1,5 +1,5 @@
 import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
-import type { Connection } from "@solana/web3.js";
+import type { Connection, TransactionInstruction } from "@solana/web3.js";
 import {
   discoverMarkets,
   encodeKeeperCrank,
@@ -31,6 +31,7 @@ import {
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { sharedTxQueue } from "../lib/tx-queue.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -688,7 +689,7 @@ export class CrankService {
       // UpdateHyperpMark to read DEX pool state directly on-chain. No off-chain
       // price push needed — the instruction reads Raydium/PumpSwap/Meteora pools.
       if (this.isHyperpOracle(market)) {
-        const instructions = [];
+        const instructions: TransactionInstruction[] = [];
 
         // UpdateHyperpMark: accounts = [slab(writable), dex_pool, clock, ...remaining]
         //
@@ -777,7 +778,12 @@ export class CrankService {
         let sig: string;
         const __dexType = state.dexPoolType ?? "unknown";
         try {
-          const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
+          // UpdateHyperpMark pushes oracle data from the DEX pool on-chain.
+          // txType="crank" for budget/priority-fee tiering; lane="oracle" because
+          // this instruction is oracle data, not a routine funding crank.
+          const sendResult = await sharedTxQueue.enqueue("oracle", () =>
+            keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS),
+          );
           if (!sendResult) {
             recordFailed();
             updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "skipped" });
@@ -823,7 +829,7 @@ export class CrankService {
       // are no longer reachable (oracle_authority is zero on all new markets
       // and the on-chain PushOraclePrice handler was deleted).
 
-      const instructions = [];
+      const instructions: TransactionInstruction[] = [];
 
       // Crank instruction
       const crankData = encodeKeeperCrank({ callerIdx: 65535 });
@@ -850,7 +856,9 @@ export class CrankService {
       recordAttempt();
       let sig: string;
       try {
-        const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
+        const sendResult = await sharedTxQueue.enqueue("crank", () =>
+          keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS),
+        );
         if (!sendResult) {
           recordFailed();
           return false;

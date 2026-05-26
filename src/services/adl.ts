@@ -55,6 +55,7 @@ import type { MarketCrankState } from "./crank-types.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import { txSentTotal, solSpentLamportsTotal, txLandTimeSeconds } from "../lib/metrics.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { sharedTxQueue } from "../lib/tx-queue.js";
 
 const logger = createLogger("keeper:adl");
 
@@ -476,12 +477,9 @@ export class AdlService {
           // was the only send-path that bypassed KeeperBudget; the cap that
           // protects the keeper wallet from a runaway crank or liquidation
           // loop did nothing for ADL until this fix.
-          const result = await keeperSend(
-            connection,
-            [ix],
-            [keypair],
-            "adl",
-            sharedBudget,
+          // ADL is liquidation-priority — always dispatched from the liquidation lane.
+          const result = await sharedTxQueue.enqueue("liquidation", () =>
+            keeperSend(connection, [ix], [keypair], "adl", sharedBudget),
           );
           if (!result) {
             logger.warn("ADL: budget gate refused send — skipping target", {

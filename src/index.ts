@@ -17,6 +17,7 @@ import { getRedisClient } from "./lib/redis-client.js";
 import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
+import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -710,7 +711,19 @@ async function shutdown(signal: string): Promise<void> {
     await sendInfoAlert("Keeper service shutting down", [
       { name: "Signal", value: signal, inline: true },
     ]);
-    
+
+    // Drain in-flight txs FIRST so they land before the leader lock is released
+    // and before the metrics server closes. This is the safest ordering:
+    //   txQueue.drain → leaderLock.stop → services.stop → healthServer → metricsServer
+    logger.info("Draining tx queue before shutdown", { timeoutMs: DRAIN_TIMEOUT_MS });
+    await sharedTxQueue.drain(DRAIN_TIMEOUT_MS);
+    const qStats = sharedTxQueue.getStats();
+    logger.info("Tx queue drained", {
+      liquidation: qStats.liquidation,
+      oracle: qStats.oracle,
+      crank: qStats.crank,
+    });
+
     // Stop stale oracle + liquidation + SOL balance checks
     clearInterval(staleCheckInterval);
     clearInterval(liqStaleCheckInterval);

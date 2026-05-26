@@ -206,10 +206,8 @@ export const updateHyperpMarkCu = new Histogram({
   registers: [registry],
 });
 
-// ── Stubs for H/I/J — defined here so those workstreams can import without
-// introducing circular deps. Grafana panels will show "No data" until wired.
+// ── Queue metrics (Workstream H) ──────────────────────────────────────────
 
-// Wired in Workstream H (priority-lanes p-queue PR)
 export const txQueueWaitSeconds = new Histogram({
   name: "keeper_tx_queue_wait_seconds",
   help: "Time a transaction spends waiting in the priority queue before dispatch, partitioned by lane",
@@ -217,6 +215,39 @@ export const txQueueWaitSeconds = new Histogram({
   buckets: [0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
   registers: [registry],
 });
+
+export const txQueuePending = new Gauge({
+  name: "keeper_tx_queue_pending",
+  help: "Number of transactions waiting in the priority queue (not yet dispatched), partitioned by lane",
+  labelNames: ["lane"] as const,
+  registers: [registry],
+});
+
+export const txQueueActive = new Gauge({
+  name: "keeper_tx_queue_active",
+  help: "Number of transactions currently being executed (dispatched but not yet resolved), partitioned by lane",
+  labelNames: ["lane"] as const,
+  registers: [registry],
+});
+
+export const txQueueCompletedTotal = new Counter({
+  name: "keeper_tx_queue_completed_total",
+  help: "Total transactions that completed successfully through the priority queue, partitioned by lane",
+  labelNames: ["lane"] as const,
+  registers: [registry],
+});
+
+export const txQueueFailedTotal = new Counter({
+  name: "keeper_tx_queue_failed_total",
+  help: "Total transactions that failed (threw) through the priority queue, partitioned by lane",
+  labelNames: ["lane"] as const,
+  registers: [registry],
+});
+
+// ── Stubs for I/J — defined here so those workstreams can import without
+// introducing circular deps. Grafana panels will show "No data" until wired.
+//
+// (H's keeper_tx_queue_* metrics are fully wired above — no longer stubs.)
 
 // Wired in Workstream I (fraud-detection layer PR)
 export const fraudDivergenceBps = new Gauge({
