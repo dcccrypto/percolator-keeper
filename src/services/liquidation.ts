@@ -16,10 +16,12 @@ import {
   derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
+import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
+import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { AlertAggregator } from "../lib/alert-aggregator.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -78,6 +80,24 @@ async function fetchSlabWithRetry(
 // BL2: Extract magic numbers to named constants
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
+
+/**
+ * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
+ * both compute this value; extracting it both unblocks property testing and
+ * prevents drift between the two call sites.
+ *
+ * Semantics (matches the inline code that was duplicated):
+ *  - notional == 0n  → 0n (no position, nothing to ratio)
+ *  - equity   <= 0n  → 0n (B3: underwater = liquidatable; the unreachable
+ *                          `-1` sentinel that lived inside the equity<=0n
+ *                          branch is removed in the same commit)
+ *  - else            → equity * 10_000n / notional (bigint divide truncates)
+ */
+export function computeMarginRatioBps(equity: bigint, notional: bigint): bigint {
+  if (notional === 0n) return 0n;
+  if (equity <= 0n) return 0n;
+  return equity * BPS_MULTIPLIER / notional;
+}
 
 /**
  * Oracle mode for a market.
@@ -175,6 +195,26 @@ export class LiquidationService {
   private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly _DEBOUNCE_MS = 1_000;
   private _unsubLoader?: () => void;
+  // B4: per-cycle dedup so the same owner is never targeted twice in the same
+  // scan cycle. A user underwater in multiple markets used to get N parallel
+  // liquidates fired; now we attempt one per cycle and let the next cycle pick
+  // up any residual undercollateralization.
+  private _cycleSeenOwners = new Set<string>();
+  // B5: collapse per-liquidation Discord alerts into a single summary alert per
+  // market within a 5 s window — prevents cascade-driven channel flooding.
+  private readonly _liquidationAlertAggregator = new AlertAggregator(
+    async (key, count) => {
+      const market = key.startsWith("liq:") ? key.slice(4) : key;
+      await sendWarningAlert(
+        count === 1 ? "Liquidation executed" : `${count} liquidations executed in market`,
+        [
+          { name: "Market", value: market.slice(0, 16), inline: true },
+          { name: "Count", value: count.toString(), inline: true },
+        ],
+      ).catch(() => {});
+    },
+    { bufferMs: 5_000 },
+  );
 
   constructor(oracleService: OracleService, intervalMs = 60_000, accountLoader?: AccountLoader) {
     this.oracleService = oracleService;
@@ -259,25 +299,12 @@ export class LiquidationService {
           // Use account.pnl directly — it is always populated and accurate.
           const markPnl = account.pnl;
           const equity = account.capital + markPnl;
+          const marginRatioBps = computeMarginRatioBps(equity, notional);
 
-          // H4: If equity <= 0, definitely liquidatable (skip ratio calc)
-          if (equity <= 0n) {
-            candidates.push({
-              slabAddress,
-              accountIdx: i,
-              owner: account.owner.toBase58(),
-              positionSize: account.positionSize,
-              capital: account.capital,
-              pnl: markPnl,
-              marginRatio: equity <= 0n ? 0 : -1,
-              maintenanceMarginBps,
-            });
-            continue;
-          }
-
-          const marginRatioBps = equity * BPS_MULTIPLIER / notional;
-
-          // If margin ratio < maintenance margin, this account is liquidatable
+          // If margin ratio < maintenance margin, this account is liquidatable.
+          // The equity<=0n short-circuit lives inside computeMarginRatioBps;
+          // a candidate with marginRatioBps == 0n is collected here just like
+          // any other below-threshold ratio.
           if (marginRatioBps < maintenanceMarginBps) {
             candidates.push({
               slabAddress,
@@ -395,18 +422,21 @@ export class LiquidationService {
         const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
         if (freshPrice > 0n) {
           const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
-          if (notional > 0n) {
-            // v12.17: entryPrice is always 0n (removed from on-chain struct).
-            // Use freshAccount.pnl directly for re-verification.
-            const freshMarkPnl = freshAccount.pnl;
-            const equity = freshAccount.capital + freshMarkPnl;
-            if (equity > 0n) {
-              const marginRatioBps = equity * BPS_MULTIPLIER / notional;
-              if (marginRatioBps >= freshParams.maintenanceMarginBps) {
-                logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
-                return null;
-              }
-            }
+          // A.13: shared helper. equity<=0n returns 0n, which is < any
+          // positive maintenanceMarginBps and so correctly proceeds with
+          // liquidation; the previous `if (equity > 0n)` wrapper just
+          // skipped the re-check entirely on underwater equity, missing
+          // the same liquidation case the scanMarket path catches.
+          const freshMarkPnl = freshAccount.pnl;
+          const equity = freshAccount.capital + freshMarkPnl;
+          const marginRatioBps = computeMarginRatioBps(equity, notional);
+          if (
+            notional > 0n &&
+            equity > 0n &&
+            marginRatioBps >= freshParams.maintenanceMarginBps
+          ) {
+            logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
+            return null;
           }
         }
       }
@@ -420,7 +450,12 @@ export class LiquidationService {
       recordAttempt();
       let sig: string;
       try {
-        sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3);
+        const sendResult = await keeperSend(connection, instructions, [keypair], "liquidation", sharedBudget, 3);
+        if (!sendResult) {
+          recordFailed();
+          return null;
+        }
+        sig = sendResult.signature;
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;
@@ -446,14 +481,10 @@ export class LiquidationService {
         signature: sig,
       });
       logger.info("Account liquidated", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), signature: sig });
-      
-      // Send Discord alert for liquidation execution — fire-and-forget; never let Discord errors crash the liquidation loop
-      sendWarningAlert("Liquidation executed", [
-        { name: "Market", value: slabAddress.toBase58().slice(0, 8), inline: true },
-        { name: "Account Index", value: accountIdx.toString(), inline: true },
-        { name: "Signature", value: sig.slice(0, 12), inline: true },
-      ])?.catch(() => {});
-      
+
+      // B5: aggregate per-liquidation Discord alerts into a 5 s summary per market.
+      this._liquidationAlertAggregator.add(`liq:${slabAddress.toBase58()}`);
+
       return sig;
     } catch (err) {
       const errMsg = getErrorMessage(err);
@@ -503,6 +534,10 @@ export class LiquidationService {
     let scanned = 0;
     let candidateCount = 0;
     let liquidated = 0;
+    // B4: fresh per-cycle dedup set — owners targeted in earlier cycles can
+    // be re-targeted next cycle (the previous liquidate may have only chipped
+    // away part of their exposure).
+    this._cycleSeenOwners.clear();
 
     // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
     // Markets re-add themselves on next parse failure, so this is safe.
@@ -546,8 +581,17 @@ export class LiquidationService {
         const candidates = result.value;
         candidateCount += candidates.length;
 
-        // Liquidations are sequential (each is a transaction)
+        // Liquidations are sequential (each is a transaction).
+        // B4: skip owners already targeted earlier in this scan cycle.
         for (const candidate of candidates) {
+          if (this._cycleSeenOwners.has(candidate.owner)) {
+            logger.debug("Skipping owner already targeted this cycle", {
+              owner: candidate.owner.slice(0, 8),
+              slabAddress: candidate.slabAddress.slice(0, 8),
+            });
+            continue;
+          }
+          this._cycleSeenOwners.add(candidate.owner);
           const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx);
           if (sig) liquidated++;
         }
@@ -671,6 +715,9 @@ export class LiquidationService {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+      // B5: flush any pending aggregated alerts so a SIGTERM during a cascade
+      // doesn't drop the summary.
+      void this._liquidationAlertAggregator.flush();
       logger.info("Liquidation service stopped");
     }
   }

@@ -47,13 +47,13 @@ import {
 import {
   getConnection,
   loadKeypair,
-  sendWithRetryKeeper,
   createLogger,
   sendWarningAlert,
   sendCriticalAlert,
 } from "@percolatorct/shared";
 import type { MarketCrankState } from "./crank-types.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
+import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 
 const logger = createLogger("keeper:adl");
 
@@ -353,6 +353,12 @@ export class AdlService {
    * Returns number of ExecuteAdl transactions sent (0 if ADL not needed).
    */
   async scanMarket(slabAddress: string, market: DiscoveredMarket): Promise<number> {
+    // B17: stamp lastScanTime on every scan so /status reports activity even
+    // when the trigger conditions are false. Without this the field stays at 0
+    // and looks like the ADL service has never run — operators can't tell
+    // "ADL is off" from "ADL is hung".
+    this._getOrCreateState(slabAddress).lastScanTime = Date.now();
+
     const connection = getConnection();
     const keypair = this._keypair;
     const programId = market.programId;
@@ -465,7 +471,27 @@ export class AdlService {
         recordAttempt();
         let sig: string;
         try {
-          sig = await sendWithRetryKeeper(connection, [ix], [keypair]);
+          // A.9: route ADL through the budget+priority-fee+CU pipeline. ADL
+          // was the only send-path that bypassed KeeperBudget; the cap that
+          // protects the keeper wallet from a runaway crank or liquidation
+          // loop did nothing for ADL until this fix.
+          const result = await keeperSend(
+            connection,
+            [ix],
+            [keypair],
+            "adl",
+            sharedBudget,
+          );
+          if (!result) {
+            logger.warn("ADL: budget gate refused send — skipping target", {
+              slabAddress,
+              targetIdx: pos.idx,
+              stats: sharedBudget.getStats(),
+            });
+            recordFailed();
+            break;
+          }
+          sig = result.signature;
           const __tip = process.env.USE_HELIUS_SENDER === "true"
             ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
             : 0;

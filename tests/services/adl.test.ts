@@ -414,4 +414,53 @@ describe("AdlService", () => {
       expect(marketStats?.consecutiveErrors).toBeGreaterThan(0);
     });
   });
+
+  // A.9 (HIGH): ADL no longer bypasses KeeperBudget. The two behaviours
+  // that the budget should now guard:
+  //   1. budget halt blocks ADL from sending
+  //   2. successful ADL records to the budget (so cap math sees ADL spend)
+  describe("A.9: ADL through KeeperBudget + keeperSend", () => {
+    beforeEach(() => {
+      service = new AdlService();
+    });
+
+    it("does NOT send when sharedBudget is halted", async () => {
+      const { sharedBudget } = await import("../../src/lib/keeper-send.js");
+      sharedBudget.haltManually("A.9 test halt");
+
+      try {
+        vi.mocked(sdk.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        vi.mocked(sdk.parseEngine).mockReturnValue(makeEngine({ pnlPosTot: 1_000_000n }) as any);
+        vi.mocked(sdk.parseConfig).mockReturnValue(makeConfig({ maxPnlCap: 500_000n }) as any);
+        vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+          makeAccounts([{ idx: 0, pnl: 600_000n, capital: 500_000n, positionSize: 100n }]) as any,
+        );
+
+        await service.scanMarket(slabAddress, makeMarket() as any);
+
+        expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+      } finally {
+        sharedBudget.resume("a9-test-cleanup");
+      }
+    });
+
+    it("records a successful ADL tx to sharedBudget (cycleTxCount and cycleSpend both grow)", async () => {
+      const { sharedBudget } = await import("../../src/lib/keeper-send.js");
+      sharedBudget.resume("a9-pre-test"); // ensure not halted from a prior test
+      const before = sharedBudget.getStats();
+
+      vi.mocked(sdk.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(sdk.parseEngine).mockReturnValue(makeEngine({ pnlPosTot: 1_000_000n }) as any);
+      vi.mocked(sdk.parseConfig).mockReturnValue(makeConfig({ maxPnlCap: 500_000n }) as any);
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([{ idx: 0, pnl: 600_000n, capital: 500_000n, positionSize: 100n }]) as any,
+      );
+
+      await service.scanMarket(slabAddress, makeMarket() as any);
+
+      const after = sharedBudget.getStats();
+      expect(after.cycleTxCount).toBe(before.cycleTxCount + 1);
+      expect(after.cycleSpend).toBeGreaterThan(before.cycleSpend);
+    });
+  });
 });
