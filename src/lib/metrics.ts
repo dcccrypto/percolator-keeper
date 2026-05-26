@@ -163,6 +163,77 @@ export const rpcSlotLag = new Gauge({
   registers: [registry],
 });
 
+// ── Workstream K: /metrics enrichment ────────────────────────────────────
+
+// Priority fee gauge — label `tier` is the tx-type name ("crank", "liquidation",
+// "oracle", "adl") because each tx type maps to exactly one configured percentile.
+// Using the tx-type name rather than the raw percentile number makes dashboards
+// readable without needing a legend that maps "p50" to "oracle".
+// Emitted from priority-fee.ts on every successful estimate() call.
+export const priorityFeeMicrolamports = new Gauge({
+  name: "keeper_priority_fee_microlamports",
+  help: "Most-recent priority fee estimate in microlamports, partitioned by account-set hash and tx-type tier",
+  labelNames: ["accountSet_hash", "tier"] as const,
+  registers: [registry],
+});
+
+// Counter — incremented on every estimate() call regardless of cache hit/miss.
+// Wired in priority-fee.ts HeliusPriorityFeeEstimator.estimate().
+export const priorityFeeEstimateTotal = new Counter({
+  name: "keeper_priority_fee_estimate_total",
+  help: "Total priority fee estimate() calls, partitioned by tier (tx type)",
+  labelNames: ["tier"] as const,
+  registers: [registry],
+});
+
+// Per-DEX-type UpdateHyperpMark instruction outcome counter.
+// Wired in crank.ts crankMarket() HYPERP branch.
+export const updateHyperpMarkTotal = new Counter({
+  name: "keeper_update_hyperp_mark_total",
+  help: "Total UpdateHyperpMark instructions attempted, partitioned by dex_type and result",
+  labelNames: ["dex_type", "result"] as const,
+  registers: [registry],
+});
+
+// Per-DEX-type CU histogram for UpdateHyperpMark instructions.
+// Observed with simulatedCu from CuEstimator when simulation ran for that send.
+// Wired in crank.ts crankMarket() HYPERP branch.
+export const updateHyperpMarkCu = new Histogram({
+  name: "keeper_update_hyperp_mark_cu",
+  help: "Simulated compute units consumed by UpdateHyperpMark instructions, partitioned by dex_type",
+  labelNames: ["dex_type"] as const,
+  buckets: [10_000, 50_000, 100_000, 200_000, 300_000, 500_000, 800_000, 1_400_000],
+  registers: [registry],
+});
+
+// ── Stubs for H/I/J — defined here so those workstreams can import without
+// introducing circular deps. Grafana panels will show "No data" until wired.
+
+// Wired in Workstream H (priority-lanes p-queue PR)
+export const txQueueWaitSeconds = new Histogram({
+  name: "keeper_tx_queue_wait_seconds",
+  help: "Time a transaction spends waiting in the priority queue before dispatch, partitioned by lane",
+  labelNames: ["lane"] as const,
+  buckets: [0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+  registers: [registry],
+});
+
+// Wired in Workstream I (fraud-detection layer PR)
+export const fraudDivergenceBps = new Gauge({
+  name: "keeper_fraud_divergence_bps",
+  help: "Absolute divergence in basis points between the on-chain EMA and the off-chain reference price, partitioned by mint",
+  labelNames: ["mint"] as const,
+  registers: [registry],
+});
+
+// Wired in Workstream J (shadow-keeper observation harness PR)
+export const shadowDivergencePct = new Gauge({
+  name: "keeper_shadow_divergence_pct",
+  help: "Divergence percentage between shadow-keeper decision and live-keeper decision, partitioned by txType",
+  labelNames: ["txType"] as const,
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }

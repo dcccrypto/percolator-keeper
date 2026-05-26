@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { createLogger } from "@percolatorct/shared";
+import { priorityFeeMicrolamports, priorityFeeEstimateTotal } from "./metrics.js";
 
 const logger = createLogger("keeper:priority-fee");
 
@@ -34,9 +36,21 @@ interface HeliusResponse {
   };
 }
 
-/** Stable hash of an account-key set for cache keying. */
+/** Stable hash of an account-key set for cache keying and metric labels. */
 function hashKeys(keys: string[]): string {
   return [...keys].sort().join(",");
+}
+
+/**
+ * Compact 16-char hex prefix of SHA-256 over sorted account base58 keys.
+ * Used as the `accountSet_hash` metric label — short enough to avoid label
+ * cardinality explosion while still distinguishing distinct account sets.
+ */
+function accountSetHash(keys: string[]): string {
+  return createHash("sha256")
+    .update([...keys].sort().join(","))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 function resolvePercentile(tier: PriorityFeeTier): number {
@@ -76,9 +90,14 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
   }
 
   async estimate(accountKeys: string[], tier: PriorityFeeTier): Promise<number> {
+    priorityFeeEstimateTotal.inc({ tier });
+
     const cacheKey = `${tier}:${hashKeys(accountKeys)}`;
     const cached = this._cache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) {
+      if (cached.value > 0) {
+        priorityFeeMicrolamports.set({ accountSet_hash: accountSetHash(accountKeys), tier }, cached.value);
+      }
       return cached.value;
     }
 
@@ -121,6 +140,10 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
 
       const value = Math.round(fee);
       this._cache.set(cacheKey, { value, expiresAt: Date.now() + this._cacheMs });
+      // Only emit the gauge for non-trivial fees to avoid label noise from zero-fee routes.
+      if (value > 0) {
+        priorityFeeMicrolamports.set({ accountSet_hash: accountSetHash(accountKeys), tier }, value);
+      }
       return value;
     } catch (err) {
       logger.warn("Priority fee estimation failed — using fallback", {

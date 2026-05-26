@@ -26,6 +26,8 @@ import {
   solSpentLamportsTotal,
   cycleDurationSeconds,
   txLandTimeSeconds,
+  updateHyperpMarkTotal,
+  updateHyperpMarkCu,
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
@@ -773,10 +775,12 @@ export class CrankService {
         const __t0 = Date.now();
         recordAttempt();
         let sig: string;
+        const __dexType = state.dexPoolType ?? "unknown";
         try {
           const sendResult = await keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS);
           if (!sendResult) {
             recordFailed();
+            updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "skipped" });
             return false;
           }
           sig = sendResult.signature;
@@ -788,8 +792,20 @@ export class CrankService {
           txSentTotal.inc({ result: "success", type: "crank" });
           txLandTimeSeconds.observe({ type: "crank", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
           if (__tip > 0) solSpentLamportsTotal.inc({ type: "crank" }, __tip);
+          updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "success" });
+          // Emit CU histogram when the instruction list includes UpdateHyperpMark
+          // (instructions.length > 1 means the pool address was resolved and the
+          // instruction was actually appended; length === 1 is crank-only / no-pool path).
+          if (sendResult.estimatedCost > 0 && instructions.length > 1) {
+            // estimatedCost is total lamports; no per-instruction CU is available here
+            // without a separate simulation. We record the send cost in the histogram
+            // as a proxy until Workstream D wires per-instruction CU simulation.
+            // The histogram label is dex_type so per-DEX trends are still visible.
+            updateHyperpMarkCu.observe({ dex_type: __dexType }, sendResult.estimatedCost);
+          }
         } catch (err) {
           recordFailed();
+          updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "failed" });
           throw err;
         }
         state.lastCrankTime = Date.now();
