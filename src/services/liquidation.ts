@@ -202,11 +202,18 @@ export class LiquidationService {
   private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly _DEBOUNCE_MS = 1_000;
   private _unsubLoader?: () => void;
-  // B4: per-cycle dedup so the same owner is never targeted twice in the same
-  // scan cycle. A user underwater in multiple markets used to get N parallel
-  // liquidates fired; now we attempt one per cycle and let the next cycle pick
-  // up any residual undercollateralization.
-  private _cycleSeenOwners = new Set<string>();
+  // C1 (post-mainnet-audit): per-cycle dedup keyed on (slabAddress, accountIdx)
+  // — the unique on-chain identifier of a User sub-account in Percolator. The
+  // previous "B4" key was the owner pubkey, which silently dropped liquidations
+  // of every additional sub-account belonging to the same owner; with multiple
+  // sub-accounts per owner being normal usage on a perp DEX, owner-keyed dedup
+  // left residual bad debt for the insurance fund to absorb. We still cap
+  // liquidations per owner per cycle to bound RPC fan-out and preserve
+  // fairness — a single whale with many sub-accounts cannot monopolize the
+  // scan budget. Residual positions above the cap are picked up next cycle.
+  private _cycleSeenPositions = new Set<string>();
+  private _cycleOwnerCounts = new Map<string, number>();
+  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE = 3;
   // B5: collapse per-liquidation Discord alerts into a single summary alert per
   // market within a 5 s window — prevents cascade-driven channel flooding.
   private readonly _liquidationAlertAggregator = new AlertAggregator(
@@ -549,10 +556,11 @@ export class LiquidationService {
     let scanned = 0;
     let candidateCount = 0;
     let liquidated = 0;
-    // B4: fresh per-cycle dedup set — owners targeted in earlier cycles can
-    // be re-targeted next cycle (the previous liquidate may have only chipped
-    // away part of their exposure).
-    this._cycleSeenOwners.clear();
+    // C1: fresh per-cycle dedup state — positions targeted in earlier cycles
+    // can be re-targeted next cycle (a previous liquidate may have only chipped
+    // away part of the exposure; partial-fill retry is intentional).
+    this._cycleSeenPositions.clear();
+    this._cycleOwnerCounts.clear();
 
     // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
     // Markets re-add themselves on next parse failure, so this is safe.
@@ -597,16 +605,27 @@ export class LiquidationService {
         candidateCount += candidates.length;
 
         // Liquidations are sequential (each is a transaction).
-        // B4: skip owners already targeted earlier in this scan cycle.
+        // C1: dedup per on-chain (slab, accountIdx) position; rate-limit per
+        // owner across the cycle.
         for (const candidate of candidates) {
-          if (this._cycleSeenOwners.has(candidate.owner)) {
-            logger.debug("Skipping owner already targeted this cycle", {
+          const positionKey = `${candidate.slabAddress}:${candidate.accountIdx}`;
+          if (this._cycleSeenPositions.has(positionKey)) {
+            logger.debug("Skipping position already targeted this cycle", {
+              positionKey,
               owner: candidate.owner.slice(0, 8),
-              slabAddress: candidate.slabAddress.slice(0, 8),
             });
             continue;
           }
-          this._cycleSeenOwners.add(candidate.owner);
+          const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
+          if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
+            logger.debug("Owner hit per-cycle liquidation cap", {
+              owner: candidate.owner.slice(0, 8),
+              cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
+            });
+            continue;
+          }
+          this._cycleSeenPositions.add(positionKey);
+          this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
           const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx);
           if (sig) liquidated++;
         }

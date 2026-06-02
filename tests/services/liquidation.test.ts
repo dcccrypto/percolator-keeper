@@ -672,10 +672,12 @@ describe('LiquidationService', () => {
     });
   });
 
-  // A.14 (MED): per-cycle owner dedup — same underwater owner across N markets
-  // produces ONE liquidate call per cycle, not N. The set resets between
-  // cycles so a residual undercollateralization can be retargeted next time.
-  describe('A.14: scanAndLiquidateAll owner dedup', () => {
+  // C1: per-cycle dedup is keyed on the on-chain position identifier
+  // (slabAddress, accountIdx), not the owner pubkey. An owner with multiple
+  // undercollateralized sub-accounts must get each one liquidated in the same
+  // cycle — owner-only dedup previously left residual bad debt for the
+  // insurance fund. A per-owner cap bounds RPC fan-out for fairness.
+  describe('C1: scanAndLiquidateAll position dedup', () => {
     function makeMarketAt(slabAddr: string) {
       return {
         slabAddress: { toBase58: () => slabAddr, equals: () => false },
@@ -690,29 +692,27 @@ describe('LiquidationService', () => {
       };
     }
 
-    it('liquidates the same owner ONCE when present in two markets in the same cycle', async () => {
+    function makeCandidate(slabAddress: string, accountIdx: number, owner: string) {
+      return {
+        slabAddress,
+        accountIdx,
+        owner,
+        positionSize: 1_000n,
+        capital: 100n,
+        pnl: -50n,
+        marginRatio: 4.0,
+        maintenanceMarginBps: 500n,
+      };
+    }
+
+    it('liquidates BOTH positions when the same owner is underwater in two markets', async () => {
       const svc = new LiquidationService(mockOracleService as any);
       const sharedOwner = 'OwnerShared111111111111111111111111111111111';
 
-      // Stub scanMarket directly so we can return identical candidates for
-      // both markets without wrestling with parser mocks.
       const scanSpy = vi.spyOn(svc, 'scanMarket').mockImplementation(
         async (market: any) =>
-          [
-            {
-              slabAddress: market.slabAddress.toBase58(),
-              accountIdx: 1,
-              owner: sharedOwner,
-              positionSize: 1_000n,
-              capital: 100n,
-              pnl: -50n,
-              marginRatio: 4.0,
-              maintenanceMarginBps: 500n,
-            },
-          ] as any,
+          [makeCandidate(market.slabAddress.toBase58(), 1, sharedOwner)] as any,
       );
-
-      // Stub liquidate so it just counts calls without exercising the send path.
       const liquidateSpy = vi
         .spyOn(svc, 'liquidate')
         .mockResolvedValue('mock-liq-sig');
@@ -724,46 +724,112 @@ describe('LiquidationService', () => {
 
       const result = await svc.scanAndLiquidateAll(markets);
 
-      // Both markets scanned…
+      // Both markets scanned, and both sub-accounts liquidated — distinct
+      // (slab, accountIdx) pairs even though the owner pubkey is shared.
       expect(scanSpy).toHaveBeenCalledTimes(2);
-      // …but liquidate fired only once thanks to the dedup set.
-      expect(liquidateSpy).toHaveBeenCalledTimes(1);
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
       expect(result.candidates).toBe(2);
-      expect(result.liquidated).toBe(1);
+      expect(result.liquidated).toBe(2);
     });
 
-    it('permits the same owner to be liquidated again on the NEXT cycle', async () => {
+    it('liquidates BOTH sub-accounts when the same owner has two positions in the SAME market', async () => {
       const svc = new LiquidationService(mockOracleService as any);
-      const sharedOwner = 'OwnerShared222222222222222222222222222222222';
+      const sharedOwner = 'OwnerSameMarket111111111111111111111111111';
 
-      const scanSpy = vi.spyOn(svc, 'scanMarket').mockImplementation(
+      vi.spyOn(svc, 'scanMarket').mockImplementation(
         async (market: any) =>
           [
-            {
-              slabAddress: market.slabAddress.toBase58(),
-              accountIdx: 1,
-              owner: sharedOwner,
-              positionSize: 1_000n,
-              capital: 100n,
-              pnl: -50n,
-              marginRatio: 4.0,
-              maintenanceMarginBps: 500n,
-            },
+            makeCandidate(market.slabAddress.toBase58(), 1, sharedOwner),
+            makeCandidate(market.slabAddress.toBase58(), 2, sharedOwner),
           ] as any,
       );
       const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue('mock-liq-sig');
 
       const markets = new Map([
-        ['SlabC3333333333333333333333333333333333333', { market: makeMarketAt('SlabC3333333333333333333333333333333333333') as any }],
+        ['SlabA1111111111111111111111111111111111111', { market: makeMarketAt('SlabA1111111111111111111111111111111111111') as any }],
+      ]);
+
+      const result = await svc.scanAndLiquidateAll(markets);
+
+      // Two distinct accountIdx in the same slab — both liquidated.
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
+      expect(liquidateSpy.mock.calls.map((c) => c[1]).sort()).toEqual([1, 2]);
+      expect(result.liquidated).toBe(2);
+    });
+
+    it('dedupes exact (slab, accountIdx) duplicates within the same cycle', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerDupe1111111111111111111111111111111';
+      const slab = 'SlabDupe111111111111111111111111111111111';
+
+      // Defensive: scanMarket somehow returns the same candidate twice in the
+      // same cycle. The composite-key dedup should collapse it to one liquidate.
+      vi.spyOn(svc, 'scanMarket').mockResolvedValue([
+        makeCandidate(slab, 7, owner),
+        makeCandidate(slab, 7, owner),
+      ] as any);
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue('mock-liq-sig');
+
+      const markets = new Map([
+        [slab, { market: makeMarketAt(slab) as any }],
       ]);
 
       await svc.scanAndLiquidateAll(markets);
+
+      expect(liquidateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('caps liquidations per owner at MAX_LIQ_PER_OWNER_PER_CYCLE (3) per cycle', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const whale = 'OwnerWhale1111111111111111111111111111111';
+
+      // One owner, five distinct (slab, accountIdx) positions across five
+      // markets — every position is genuinely underwater, but the per-owner
+      // cap of 3 keeps the keeper from blowing its RPC budget on a single
+      // whale. Residual positions are picked up on the next cycle.
+      const slabs = [
+        'SlabW0000000000000000000000000000000000000',
+        'SlabW1111111111111111111111111111111111111',
+        'SlabW2222222222222222222222222222222222222',
+        'SlabW3333333333333333333333333333333333333',
+        'SlabW4444444444444444444444444444444444444',
+      ];
+      vi.spyOn(svc, 'scanMarket').mockImplementation(
+        async (market: any) =>
+          [makeCandidate(market.slabAddress.toBase58(), 0, whale)] as any,
+      );
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue('mock-liq-sig');
+
+      const markets = new Map(
+        slabs.map((s) => [s, { market: makeMarketAt(s) as any }]),
+      );
+
+      const result = await svc.scanAndLiquidateAll(markets);
+
+      expect(liquidateSpy).toHaveBeenCalledTimes(3);
+      expect(result.liquidated).toBe(3);
+      expect(result.candidates).toBe(5);
+    });
+
+    it('clears per-cycle dedup state between scanAndLiquidateAll invocations', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerNextCycle111111111111111111111111111';
+      const slab = 'SlabC3333333333333333333333333333333333333';
+
+      vi.spyOn(svc, 'scanMarket').mockImplementation(
+        async (market: any) =>
+          [makeCandidate(market.slabAddress.toBase58(), 1, owner)] as any,
+      );
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue('mock-liq-sig');
+
+      const markets = new Map([[slab, { market: makeMarketAt(slab) as any }]]);
+
+      await svc.scanAndLiquidateAll(markets);
       await svc.scanAndLiquidateAll(markets);
 
-      // Two cycles, two liquidates — the dedup set is per-cycle, not lifetime.
+      // Per-cycle dedup, not lifetime: the same (slab, idx) can be retargeted
+      // next cycle (partial-fill retry path).
       expect(liquidateSpy).toHaveBeenCalledTimes(2);
-      // sanity: scanMarket also called twice (once per cycle)
-      expect(scanSpy).toHaveBeenCalledTimes(2);
     });
   });
 });
