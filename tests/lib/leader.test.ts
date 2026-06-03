@@ -9,12 +9,12 @@ type SetOpts = { ex: number; nx?: true } | { ex: number; xx?: true };
 function makeMockRedis(): {
   redis: RedisLike;
   store: Map<string, string>;
-  calls: { set: number; get: number; del: number };
-  failNext: { set?: boolean; get?: boolean };
+  calls: { set: number; get: number; del: number; eval: number };
+  failNext: { set?: boolean; get?: boolean; eval?: boolean };
 } {
   const store = new Map<string, string>();
-  const calls = { set: 0, get: 0, del: 0 };
-  const failNext = { set: false, get: false };
+  const calls = { set: 0, get: 0, del: 0, eval: 0 };
+  const failNext = { set: false, get: false, eval: false };
 
   const redis: RedisLike = {
     async set(key: string, value: string, opts: SetOpts): Promise<"OK" | null> {
@@ -39,6 +39,19 @@ function makeMockRedis(): {
         if (store.delete(k)) count++;
       }
       return count;
+    },
+    // C2: emulate the LeaderLock RENEW_SCRIPT semantics. We only model the
+    // single Lua script the keeper actually invokes — anything else throws.
+    async eval<T = unknown>(_script: string, keys: string[], args: (string | number)[]): Promise<T> {
+      calls.eval++;
+      if (failNext.eval) { failNext.eval = false; throw new Error("Redis error"); }
+      const [key] = keys;
+      const expectedIdentity = args[0] as string;
+      const stored = store.get(key!);
+      if (stored === undefined) return 0 as unknown as T;
+      if (stored !== expectedIdentity) return 0 as unknown as T;
+      // PEXPIRE returns 1 on success. We do not model TTL in this in-memory mock.
+      return 1 as unknown as T;
     },
   };
 
@@ -130,29 +143,30 @@ describe("LeaderLock state machine", () => {
     lock.start({ network: "devnet", onPromote, onDemote });
     await vi.advanceTimersByTimeAsync(100);
 
-    const setCountAfterPromote = calls.set;
+    // C2: renewal moved from SET XX to a fenced Lua EVAL — count EVALs, not SETs.
+    const evalCountAfterPromote = calls.eval;
     expect(lock.role()).toBe("leader");
 
     await vi.advanceTimersByTimeAsync(10_100);
-    expect(calls.set).toBeGreaterThan(setCountAfterPromote);
+    expect(calls.eval).toBeGreaterThan(evalCountAfterPromote);
     expect(lock.role()).toBe("leader");
 
     await lock.stop();
   });
 
   it("demotes after two consecutive renew failures", async () => {
-    let setCallCount = 0;
+    // C2: renewal now uses Lua EVAL; transient thrown errors from the EVAL
+    // call still observe the 2-strike tolerance (M15 is unchanged by C2).
     const mockRedis: RedisLike = {
       async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
-        setCallCount++;
         const hasNx = "nx" in opts && opts.nx === true;
-        if (setCallCount === 1 && hasNx) {
-          return "OK";
-        }
-        throw new Error("Redis connection refused");
+        return hasNx ? "OK" : null;
       },
       async get(_key: string): Promise<string | null> { return null; },
       async del(..._keys: string[]): Promise<number> { return 0; },
+      async eval<T = unknown>(): Promise<T> {
+        throw new Error("Redis connection refused");
+      },
     };
 
     const lock = new LeaderLock(mockRedis, "test-id", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
@@ -184,6 +198,7 @@ describe("LeaderLock state machine", () => {
     const mockRedis: RedisLike = {
       set: redis.set.bind(redis),
       del: redis.del.bind(redis),
+      eval: redis.eval.bind(redis),
       async get(key: string): Promise<string | null> {
         pollCallCount++;
         if (pollCallCount <= 2) throw new Error("network partition");
@@ -240,7 +255,7 @@ describe("LeaderLock state machine", () => {
     expect(calls.del).toBe(0);
   });
 
-  it("demotes when renew returns null (lock stolen)", async () => {
+  it("demotes when renew fencing fails (lock stolen)", async () => {
     let setCallCount = 0;
     const mockRedis: RedisLike = {
       async get(_key: string): Promise<string | null> { return null; },
@@ -250,6 +265,11 @@ describe("LeaderLock state machine", () => {
         const hasNx = "nx" in opts && opts.nx === true;
         if (setCallCount === 1 && hasNx) return "OK";
         return null;
+      },
+      // C2: fenced renew returns 0 when identity no longer matches the stored
+      // value — definitive lease loss, demote immediately.
+      async eval<T = unknown>(): Promise<T> {
+        return 0 as unknown as T;
       },
     };
 
@@ -278,18 +298,28 @@ describe("LeaderLock state machine", () => {
     await lock.stop();
   });
 
-  it("uses XX flag on renewal (not NX)", async () => {
+  it("C2: renews via fenced Lua EVAL, not SET XX", async () => {
+    // The previous A.6 test asserted that renewal used SET XX. The C2 finding
+    // showed SET XX is value-blind and allows split-brain; the renew path now
+    // uses an atomic compare-and-pexpire via EVAL. This test guards the new
+    // contract: renew issues at most one SET (the NX-acquire) and uses eval
+    // for ongoing renewals.
     const setCalls: Array<SetOpts> = [];
+    const evalCalls: Array<{ keys: string[]; args: (string | number)[] }> = [];
+    let identity = "";
     const mockRedis: RedisLike = {
       async get(_key: string): Promise<string | null> { return null; },
       async del(..._keys: string[]): Promise<number> { return 0; },
-      async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
+      async set(_key: string, value: string, opts: SetOpts): Promise<"OK" | null> {
         setCalls.push(opts);
         const hasNx = "nx" in opts && opts.nx === true;
-        const hasXx = "xx" in opts && (opts as { xx?: true }).xx === true;
-        if (setCalls.length === 1 && hasNx) return "OK";
-        if (hasXx) return "OK";
+        if (setCalls.length === 1 && hasNx) { identity = value; return "OK"; }
         return null;
+      },
+      async eval<T = unknown>(_script: string, keys: string[], args: (string | number)[]): Promise<T> {
+        evalCalls.push({ keys, args });
+        const expected = args[0] as string;
+        return (expected === identity ? 1 : 0) as unknown as T;
       },
     };
 
@@ -298,12 +328,115 @@ describe("LeaderLock state machine", () => {
     await vi.advanceTimersByTimeAsync(100);
     await vi.advanceTimersByTimeAsync(10_100);
 
-    const renewOpts = setCalls[1];
-    expect(renewOpts).toBeDefined();
-    expect("xx" in renewOpts!).toBe(true);
-    expect(!("nx" in renewOpts!) || (renewOpts as { nx?: true }).nx !== true).toBe(true);
+    // One SET (the NX-acquire), at least one EVAL (the renewal).
+    expect(setCalls.length).toBe(1);
+    expect(setCalls[0]).toMatchObject({ nx: true });
+    expect(evalCalls.length).toBeGreaterThanOrEqual(1);
+    // EVAL was given our identity as the first arg and the TTL in ms as the second.
+    expect(evalCalls[0]!.args[0]).toBe("test-id");
+    expect(evalCalls[0]!.args[1]).toBe(30_000);
+    // The key passed to EVAL is the lock key for the network.
+    expect(evalCalls[0]!.keys[0]).toBe("keeper:leader:devnet");
 
     await lock.stop();
+  });
+
+  // ─── C2: split-brain prevention via fenced renewal ─────────────────────────
+
+  it("C2: demotes immediately (no 2-strike) when external party overwrites lock identity", async () => {
+    const { redis, store } = makeMockRedis();
+    const lock = new LeaderLock(redis, "node-a", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
+    const onDemote = vi.fn();
+    lock.start({ network: "devnet", onPromote: vi.fn(), onDemote });
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(lock.role()).toBe("leader");
+    expect(store.get("keeper:leader:devnet")).toBe("node-a");
+
+    // Simulate the partition-heal scenario: while keeper-A was unreachable,
+    // standby B legitimately took over and the Upstash key now reflects B's
+    // identity. Without the C2 fix, A's next SET XX would blindly overwrite
+    // B's identity. With the fix, the fenced EVAL returns 0 and A demotes.
+    store.set("keeper:leader:devnet", "node-b");
+
+    await vi.advanceTimersByTimeAsync(10_100);
+
+    expect(lock.role()).toBe("standby");
+    expect(onDemote).toHaveBeenCalledWith("redis-lock-lost");
+    // Critical: A did NOT overwrite B's identity in the store.
+    expect(store.get("keeper:leader:devnet")).toBe("node-b");
+  });
+
+  it("C2: transient EVAL error counts toward 2-strike, does not demote on first failure", async () => {
+    const { redis, calls, failNext } = makeMockRedis();
+    const lock = new LeaderLock(redis, "node-a", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
+    const onDemote = vi.fn();
+    lock.start({ network: "devnet", onPromote: vi.fn(), onDemote });
+    await vi.advanceTimersByTimeAsync(100);
+
+    // First renew throws (transient transport error). 2-strike preserves the
+    // existing M15 behaviour: keeper stays leader after a single failure.
+    failNext.eval = true;
+    await vi.advanceTimersByTimeAsync(10_100);
+
+    expect(lock.role()).toBe("leader");
+    expect(onDemote).not.toHaveBeenCalled();
+    expect(calls.eval).toBeGreaterThanOrEqual(1);
+
+    await lock.stop();
+  });
+
+  it("C2: two consecutive thrown EVAL errors demote with redis-renew-failed", async () => {
+    let evalThrows = 0;
+    const mockRedis: RedisLike = {
+      async get(_key: string): Promise<string | null> { return null; },
+      async del(..._keys: string[]): Promise<number> { return 0; },
+      async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
+        const hasNx = "nx" in opts && opts.nx === true;
+        return hasNx ? "OK" : null;
+      },
+      async eval<T = unknown>(): Promise<T> {
+        evalThrows++;
+        throw new Error("upstream transport failure");
+      },
+    };
+
+    const lock = new LeaderLock(mockRedis, "node-a", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
+    const onDemote = vi.fn();
+    lock.start({ network: "devnet", onPromote: vi.fn(), onDemote });
+    await vi.advanceTimersByTimeAsync(100);
+
+    // Two consecutive thrown errors.
+    await vi.advanceTimersByTimeAsync(10_100);
+    await vi.advanceTimersByTimeAsync(10_100);
+
+    expect(lock.role()).toBe("standby");
+    expect(onDemote).toHaveBeenCalledWith("redis-renew-failed");
+    expect(evalThrows).toBeGreaterThanOrEqual(2);
+  });
+
+  it("C2: defensive — null EVAL return is treated as lease loss (immediate demote)", async () => {
+    const mockRedis: RedisLike = {
+      async get(_key: string): Promise<string | null> { return null; },
+      async del(..._keys: string[]): Promise<number> { return 0; },
+      async set(_key: string, _value: string, opts: SetOpts): Promise<"OK" | null> {
+        const hasNx = "nx" in opts && opts.nx === true;
+        return hasNx ? "OK" : null;
+      },
+      async eval<T = unknown>(): Promise<T> {
+        return null as unknown as T;
+      },
+    };
+
+    const lock = new LeaderLock(mockRedis, "node-a", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
+    const onDemote = vi.fn();
+    lock.start({ network: "devnet", onPromote: vi.fn(), onDemote });
+    await vi.advanceTimersByTimeAsync(100);
+
+    await vi.advanceTimersByTimeAsync(10_100);
+
+    expect(lock.role()).toBe("standby");
+    expect(onDemote).toHaveBeenCalledWith("redis-lock-lost");
   });
 
   it("initial acquire error falls back to standby gracefully", async () => {
@@ -311,6 +444,7 @@ describe("LeaderLock state machine", () => {
       async set(): Promise<"OK" | null> { throw new Error("connection refused"); },
       async get(): Promise<string | null> { return "other"; },
       async del(): Promise<number> { return 0; },
+      async eval<T = unknown>(): Promise<T> { return 0 as unknown as T; },
     };
 
     const lock = new LeaderLock(mockRedis, "test-id", { ttlMs: 30_000, renewMs: 10_000, pollMs: 5_000 });
@@ -383,6 +517,7 @@ describe("LeaderLock chaos (STRESS=true)", { skip: process.env.STRESS !== "true"
     const partitioned: RedisLike = {
       set: redis.set.bind(redis),
       del: redis.del.bind(redis),
+      eval: redis.eval.bind(redis),
       async get(): Promise<string | null> {
         throw new Error("network partition");
       },

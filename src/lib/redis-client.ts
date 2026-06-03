@@ -4,6 +4,12 @@ export interface RedisLike {
   set(key: string, value: string, opts: { ex: number; nx?: true } | { ex: number; xx?: true }): Promise<"OK" | null>;
   get(key: string): Promise<string | null>;
   del(...keys: string[]): Promise<number>;
+  // C2 (CRITICAL): atomic compare-and-pexpire for leader-lease renewal.
+  // SET XX is value-blind and allows split-brain on partition-heal; the renew
+  // path uses Lua EVAL to verify the stored value still matches our identity
+  // before extending the TTL. @upstash/redis exposes `eval(script, keys, args)`
+  // over REST natively.
+  eval<T = unknown>(script: string, keys: string[], args: (string | number)[]): Promise<T>;
 }
 
 let _client: RedisLike | null | undefined = undefined;

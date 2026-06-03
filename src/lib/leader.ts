@@ -4,6 +4,20 @@ import type { RedisLike } from "./redis-client.js";
 
 const logger = createLogger("keeper:leader");
 
+// C2 (CRITICAL): SET XX is value-blind — under a partition+heal sequence
+// where a standby legitimately takes over after TTL expiry, a stale leader's
+// blind XX renewal would overwrite the new leader's identity and produce
+// split-brain. Atomic compare-and-pexpire: only refresh the TTL if the
+// stored value still matches our identity. PEXPIRE returns 1 on success,
+// the script returns 0 when our identity no longer owns the key.
+const RENEW_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+else
+  return 0
+end
+`;
+
 export type LeaderRole = "leader" | "standby" | "starting";
 
 export interface LeaderLockOptions {
@@ -115,23 +129,54 @@ export class LeaderLock {
   private async _renew(opts: StartOptions): Promise<void> {
     if (this._role !== "leader") return;
 
-    const ttlSec = Math.ceil(this.ttlMs / 1000);
-
     try {
-      const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, xx: true } as { ex: number; xx?: true });
+      // C2 (CRITICAL): fenced renewal via Lua EVAL. The script atomically
+      // verifies our identity still owns the lock before extending the TTL.
+      // Returns 1 on success, 0 if the lease has been lost (identity mismatch
+      // or key gone). Identity mismatch is a definitive loss of lease and
+      // demotes IMMEDIATELY — it is NOT a transient error and must bypass the
+      // 2-strike counter (which is reserved for thrown transport errors).
+      const result = await this.redis.eval<number | null>(
+        RENEW_SCRIPT,
+        [this._lockKey],
+        [this.identity, this.ttlMs],
+      );
 
-      if (result === "OK") {
+      if (result === 1) {
         this._renewFailures = 0;
         this._scheduleRenew(opts);
-      } else {
-        this._renewFailures++;
-        logger.warn("LeaderLock renew returned null (lock lost)", {
+        return;
+      }
+
+      // result === 0: our identity no longer owns the key (or key vanished
+      // mid-script). result === null/undefined: defensive — treat as lease
+      // loss rather than ambiguous transient. In either case, demote now.
+      if (result === 0 || result === null || result === undefined) {
+        logger.warn("LeaderLock renew fencing failed (lease lost) — demoting immediately", {
           identity: this.identity,
-          renewFailures: this._renewFailures,
+          result,
         });
         this._demote("redis-lock-lost");
+        return;
+      }
+
+      // Unexpected non-numeric/non-null result. Treat as transient so we do
+      // not demote spuriously on, e.g., an upstream protocol oddity.
+      this._renewFailures++;
+      logger.warn("LeaderLock renew returned unexpected value — treating as transient", {
+        identity: this.identity,
+        renewFailures: this._renewFailures,
+        result,
+      });
+      if (this._renewFailures >= 2) {
+        this._demote("redis-renew-failed");
+      } else {
+        this._scheduleRenew(opts);
       }
     } catch (err) {
+      // Transient transport error (network blip, 5xx, rate-limit). Preserve
+      // the existing 2-strike tolerance — this is the path the M15 finding
+      // discusses; tightening it is a separate PR.
       this._renewFailures++;
       logger.warn("LeaderLock renew error", {
         identity: this.identity,
