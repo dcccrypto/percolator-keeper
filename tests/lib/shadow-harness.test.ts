@@ -39,14 +39,16 @@ function makeDecision(
   };
 }
 
-function makeConnection(signatureCount = 5): Connection {
-  const now = Math.floor(Date.now() / 1000);
+function makeConnection(signatureCount = 5, nowMs?: number): Connection {
+  // Anchor blockTimes inside the harness's window. Defaults to real wall-clock
+  // so tests not using `now:` injection keep working; tests with mocked time
+  // pass the same `nowMs` so blockTimes fall in [now-60s, now].
+  const now = Math.floor((nowMs ?? Date.now()) / 1000);
   return {
     getSignaturesForAddress: vi.fn(async () =>
       Array.from({ length: signatureCount }, (_, i) => ({
         signature: `sig_${i}`,
         slot: 1_000_000 + i,
-        // All within the last 60s so they always fall inside the 300s window
         blockTime: now - (i % 60),
         err: null,
         memo: null,
@@ -59,7 +61,6 @@ function makeConnection(signatureCount = 5): Connection {
 function makeHarness(
   decisions: DecisionEntry[],
   signatureCount = decisions.length,
-  threshold = 1.0,
 ): ShadowHarness {
   const conn = makeConnection(signatureCount);
   return new ShadowHarness({
@@ -67,7 +68,11 @@ function makeHarness(
     programId: PROGRAM_ID,
     readDecisions: vi.fn(async () => decisions),
     compareWindowMs: 300_000,
-    divergenceThresholdPct: threshold,
+    // C4: knobs default to production values; individual tests override.
+    silentCyclesBeforeAlert: 3,
+    runawayMultiplier: 3,
+    runawayMinSamples: 10,
+    alertCooldownMs: 3_600_000,
   });
 }
 
@@ -145,27 +150,170 @@ describe("ShadowHarness — comparison logic", () => {
     expect(result.shadowByType["oracle"]).toBeUndefined();
   });
 
-  it("discord alert fires when divergence_pct > threshold", async () => {
-    const decisions = Array.from({ length: 1 }, () => makeDecision());
-    const harness = makeHarness(decisions, 100, 1.0); // shadow=1, live=100 → ~99% divergence
+  // C4 (CRITICAL): the old `divergencePct > threshold` alert was structurally
+  // broken — liveTotal includes every program tx (traders/makers/oracles),
+  // not just the keeper's. It would fire every cycle on day 1 of mainnet.
+  // The tests below assert the replacement structural gates.
+  it("C4: shadow keeper firing alongside busy program does NOT alert (no false-positive)", async () => {
+    // This is THE C4 regression scenario: 5 shadow decisions, 500 live txs
+    // (mostly user/maker/oracle traffic). The old code fired on every cycle.
+    const decisions = Array.from({ length: 5 }, () => makeDecision());
+    const harness = makeHarness(decisions, 500);
     await harness.runCycle();
-    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalledOnce();
-    const [title] = vi.mocked(shared.sendWarningAlert).mock.calls[0]!;
-    expect(title).toContain("divergence");
-  });
-
-  it("discord alert does NOT fire when divergence_pct <= threshold", async () => {
-    const decisions = Array.from({ length: 10 }, () => makeDecision());
-    const harness = makeHarness(decisions, 10, 1.0); // perfect match → 0% divergence
+    await harness.runCycle();
     await harness.runCycle();
     expect(vi.mocked(shared.sendWarningAlert)).not.toHaveBeenCalled();
   });
 
-  it("discord alert does NOT fire when divergence_pct is exactly at threshold", async () => {
-    // shadow=50, live=100 → 50% divergence; threshold=51 → no alert
-    const decisions = Array.from({ length: 50 }, () => makeDecision());
-    const harness = makeHarness(decisions, 100, 51.0);
+  it("C4: shadow-silent + live-active streak < threshold does NOT alert", async () => {
+    const harness = makeHarness([], 100); // shadow=0, live=100
     await harness.runCycle();
+    await harness.runCycle();
+    // 2 silent cycles, threshold is 3 — no alert yet.
+    expect(vi.mocked(shared.sendWarningAlert)).not.toHaveBeenCalled();
+  });
+
+  it("C4: shadow-silent + live-active for N=silentCyclesBeforeAlert cycles fires ONE alert", async () => {
+    const harness = makeHarness([], 100);
+    await harness.runCycle();
+    await harness.runCycle();
+    await harness.runCycle();
+    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalledTimes(1);
+    const [title] = vi.mocked(shared.sendWarningAlert).mock.calls[0]!;
+    expect(title).toContain("silent");
+  });
+
+  it("C4: silent streak resets when shadow makes a decision", async () => {
+    let decisions: DecisionEntry[] = [];
+    const conn = makeConnection(100);
+    const harness = new ShadowHarness({
+      connection: conn,
+      programId: PROGRAM_ID,
+      readDecisions: vi.fn(async () => decisions),
+      compareWindowMs: 300_000,
+      silentCyclesBeforeAlert: 3,
+      runawayMultiplier: 3,
+      runawayMinSamples: 10,
+      alertCooldownMs: 3_600_000,
+    });
+    await harness.runCycle(); // silent #1
+    await harness.runCycle(); // silent #2
+    decisions = [makeDecision()]; // shadow recovers
+    await harness.runCycle(); // streak resets
+    decisions = [];
+    await harness.runCycle(); // silent #1 again
+    await harness.runCycle(); // silent #2
+    expect(vi.mocked(shared.sendWarningAlert)).not.toHaveBeenCalled();
+  });
+
+  it("C4: shadow-runaway alert fires when shadow >> live AND shadow >= minSamples", async () => {
+    // shadow=100, live=5 → ratio=20x, both above minSamples=10
+    const decisions = Array.from({ length: 100 }, () => makeDecision());
+    const harness = makeHarness(decisions, 5);
+    await harness.runCycle();
+    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalledTimes(1);
+    const [title] = vi.mocked(shared.sendWarningAlert).mock.calls[0]!;
+    expect(title).toContain("runaway");
+  });
+
+  it("C4: shadow-runaway does NOT fire below minSamples (small-sample guard)", async () => {
+    // shadow=9, live=0 → infinite ratio but shadowTotal < minSamples=10
+    const decisions = Array.from({ length: 9 }, () => makeDecision());
+    const harness = makeHarness(decisions, 0);
+    await harness.runCycle();
+    expect(vi.mocked(shared.sendWarningAlert)).not.toHaveBeenCalled();
+  });
+
+  it("C4: alerts honor cooldown — repeated silent cycles within cooldown only fire once", async () => {
+    let nowMs = 1_000_000_000_000; // year ~2001 epoch ms, large enough for blockTime to be positive
+    // Dynamic connection: blockTimes track nowMs so live sigs always fall in window.
+    const conn = {
+      getSignaturesForAddress: vi.fn(async () =>
+        Array.from({ length: 100 }, (_, i) => ({
+          signature: `sig_${i}`,
+          slot: 1_000_000 + i,
+          blockTime: Math.floor(nowMs / 1000) - (i % 60),
+          err: null,
+          memo: null,
+          confirmationStatus: "finalized" as const,
+        })),
+      ),
+    } as unknown as Connection;
+    const harness = new ShadowHarness({
+      connection: conn,
+      programId: PROGRAM_ID,
+      readDecisions: vi.fn(async () => []),
+      compareWindowMs: 300_000,
+      silentCyclesBeforeAlert: 3,
+      runawayMultiplier: 3,
+      runawayMinSamples: 10,
+      alertCooldownMs: 3_600_000,
+      now: () => nowMs,
+    });
+    await harness.runCycle(); nowMs += 300_000;
+    await harness.runCycle(); nowMs += 300_000;
+    await harness.runCycle(); nowMs += 300_000;
+    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 6; i++) {
+      await harness.runCycle();
+      nowMs += 300_000;
+    }
+    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalledTimes(1);
+  });
+
+  it("C4: alerts re-fire after cooldown expires", async () => {
+    let nowMs = 1_000_000_000_000;
+    const conn = {
+      getSignaturesForAddress: vi.fn(async () =>
+        Array.from({ length: 100 }, (_, i) => ({
+          signature: `sig_${i}`,
+          slot: 1_000_000 + i,
+          blockTime: Math.floor(nowMs / 1000) - (i % 60),
+          err: null,
+          memo: null,
+          confirmationStatus: "finalized" as const,
+        })),
+      ),
+    } as unknown as Connection;
+    const harness = new ShadowHarness({
+      connection: conn,
+      programId: PROGRAM_ID,
+      readDecisions: vi.fn(async () => []),
+      compareWindowMs: 300_000,
+      silentCyclesBeforeAlert: 3,
+      runawayMultiplier: 3,
+      runawayMinSamples: 10,
+      alertCooldownMs: 600_000,
+      now: () => nowMs,
+    });
+    await harness.runCycle(); nowMs += 300_000;
+    await harness.runCycle(); nowMs += 300_000;
+    await harness.runCycle(); // 1st alert at streak=3
+    nowMs += 700_000; // past cooldown
+    await harness.runCycle(); // streak=4, cooldown ready → 2nd alert
+    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalledTimes(2);
+  });
+
+  it("C4: RPC failure suspends BOTH alert gates — no false positive on transient outage", async () => {
+    // shadowTotal=20 with a sustained RPC outage. Old behavior: liveTotal=0,
+    // shadow vastly exceeds 0 → runaway alert every cycle. New behavior:
+    // liveFetchOk=false suspends alerts entirely so RPC blips don't page.
+    const conn = {
+      getSignaturesForAddress: vi.fn(async () => { throw new Error("RPC down"); }),
+    } as unknown as Connection;
+    const harness = new ShadowHarness({
+      connection: conn,
+      programId: PROGRAM_ID,
+      readDecisions: vi.fn(async () => Array.from({ length: 20 }, () => makeDecision())),
+      compareWindowMs: 300_000,
+      silentCyclesBeforeAlert: 3,
+      runawayMultiplier: 3,
+      runawayMinSamples: 10,
+      alertCooldownMs: 3_600_000,
+    });
+    for (let i = 0; i < 5; i++) {
+      await harness.runCycle();
+    }
     expect(vi.mocked(shared.sendWarningAlert)).not.toHaveBeenCalled();
   });
 
@@ -178,13 +326,10 @@ describe("ShadowHarness — comparison logic", () => {
       programId: PROGRAM_ID,
       readDecisions: vi.fn(async () => [makeDecision()]),
       compareWindowMs: 300_000,
-      divergenceThresholdPct: 99,
     });
     const result = await harness.runCycle();
     expect(result.liveTotal).toBe(0);
     expect(result.shadowTotal).toBe(1);
-    // 100% divergence but threshold is 99 — should still alert
-    expect(vi.mocked(shared.sendWarningAlert)).toHaveBeenCalled();
   });
 
   it("decision read failure is swallowed — result has shadowTotal=0", async () => {
@@ -194,7 +339,6 @@ describe("ShadowHarness — comparison logic", () => {
       programId: PROGRAM_ID,
       readDecisions: vi.fn(async () => { throw new Error("fs failure"); }),
       compareWindowMs: 300_000,
-      divergenceThresholdPct: 99,
     });
     const result = await harness.runCycle();
     expect(result.shadowTotal).toBe(0);
