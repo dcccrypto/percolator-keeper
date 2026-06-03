@@ -1,4 +1,4 @@
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, type Connection } from "@solana/web3.js";
 import { createLogger } from "@percolatorct/shared";
 import { AccountCache } from "./account-cache.js";
 import { ReconnectBackoff } from "./stream-reconnect.js";
@@ -8,6 +8,8 @@ const logger = createLogger("keeper:account-loader");
 
 const MAINNET_PROGRAM_ID = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const DEFAULT_DROP_QUEUE_MAX = 10_000;
+// C3: getMultipleAccountsInfo RPC accepts up to 100 pubkeys per call.
+const SNAPSHOT_CHUNK_SIZE = 100;
 
 export interface AccountUpdate {
   pubkey: string;
@@ -39,6 +41,13 @@ export interface AccountLoaderOptions {
   onDriftAlert?: (drift: number) => void;
   /** Injected getRpcSlot for SlotTracker; defaults to a no-op that never fires drift alerts. */
   getRpcSlot?: () => Promise<number>;
+  /**
+   * C3: optional RPC Connection used to backfill the cache on (re)connect.
+   * The stream uses replay:false, so without a snapshot the cache stays empty
+   * (or stale, after invalidateAll) until each tracked account is next mutated.
+   * When absent, the loader logs a warning and proceeds without seeding.
+   */
+  connection?: Connection;
 }
 
 /**
@@ -242,6 +251,16 @@ export class AccountLoader {
 
   private async connect(): Promise<void> {
     try {
+      // C3 (CRITICAL): pre-seed the cache via RPC BEFORE subscribing.
+      // Rationale: the stream is started with replay:false and onStreamError
+      // calls cache.invalidateAll(). Without this snapshot, every reconnect
+      // leaves downstream consumers (LiquidationService, CrankService) reading
+      // an empty cache until each tracked account is next mutated — risking
+      // missed liquidations / stale decisions for an unbounded window.
+      // Ordering: snapshot runs FIRST so it can't race against stream-driven
+      // cache.set() calls and overwrite newer slot data with older RPC data.
+      await this._snapshotKnownAccounts();
+
       await this.adapter.start(
         this.opts,
         (update) => this.enqueue(update),
@@ -259,11 +278,64 @@ export class AccountLoader {
       });
     } catch (err) {
       this.connected = false;
-      logger.warn("AccountLoader: initial connection failed", {
+      // adapter.stop() is idempotent; safe whether the failure was in the
+      // snapshot (no stream started) or the stream start (no stream running).
+      this.adapter.stop();
+      logger.warn("AccountLoader: connection failed", {
         error: err instanceof Error ? err.message : String(err),
       });
       this.scheduleReconnect();
     }
+  }
+
+  /**
+   * C3: fetch current account state for additionalAccounts via RPC and seed
+   * the cache. Uses getMultipleAccountsInfoAndContext so every entry is stamped
+   * with the RPC-context slot (not 0), which keeps slot-monotonicity guards in
+   * AccountCache.get() and SlotTracker behaving correctly.
+   *
+   * Throws on RPC failure — caller (connect()) catches and reschedules.
+   */
+  private async _snapshotKnownAccounts(): Promise<void> {
+    const accounts = this.opts.additionalAccounts ?? [];
+    if (accounts.length === 0) return;
+
+    if (!this.opts.connection) {
+      logger.warn(
+        "AccountLoader: RPC connection not provided — skipping cache snapshot. " +
+          "After reconnect, cache will be empty until each tracked account is next mutated.",
+        { additionalAccounts: accounts.length },
+      );
+      return;
+    }
+
+    const pubkeys = accounts.map((a) => new PublicKey(a));
+    let seeded = 0;
+
+    for (let i = 0; i < pubkeys.length; i += SNAPSHOT_CHUNK_SIZE) {
+      const chunk = pubkeys.slice(i, i + SNAPSHOT_CHUNK_SIZE);
+      const resp = await this.opts.connection.getMultipleAccountsInfoAndContext(
+        chunk,
+        { commitment: "confirmed" },
+      );
+      const slot = resp.context.slot;
+      for (let j = 0; j < chunk.length; j++) {
+        const info = resp.value[j];
+        if (!info) continue;
+        // info.data is a Node Buffer (which extends Uint8Array). Copy into a
+        // detached Uint8Array so the cache entry doesn't share the Buffer pool.
+        const raw = info.data as unknown as Uint8Array;
+        const data = new Uint8Array(raw.byteLength);
+        data.set(raw);
+        this.cache.set(chunk[j].toBase58(), data, info.owner.toBase58(), slot);
+        seeded++;
+      }
+    }
+
+    logger.info("AccountLoader: cache snapshot seeded", {
+      requested: accounts.length,
+      seeded,
+    });
   }
 
   private onStreamError(err: Error): void {
