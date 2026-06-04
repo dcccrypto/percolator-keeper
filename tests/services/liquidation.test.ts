@@ -477,13 +477,185 @@ describe('LiquidationService', () => {
       } as any);
 
       const statusBefore = liquidationService.getStatus();
-      
+
       await liquidationService.liquidate(mockMarket as any, 0);
 
       const statusAfter = liquidationService.getStatus();
       expect(statusAfter.liquidationCount).toBe(statusBefore.liquidationCount + 1);
     });
+
+    // ─── H3: cluster-time staleness via Clock sysvar (not wall clock) ────
+    // resolveMarketPrice previously computed `now = Date.now()/1000` (wall
+    // clock) and compared it to `cfg.authorityTimestamp` (written on-chain
+    // using Solana Clock sysvar = cluster time). The two sources can drift
+    // by seconds. Fix: fetch SYSVAR_CLOCK_PUBKEY and use its unix_timestamp
+    // so the keeper's staleness check matches the on-chain check.
+    describe('H3: cluster-time staleness via Clock sysvar', () => {
+      function makeClockSysvarInfo(unixTimestampSec: bigint) {
+        const buf = Buffer.alloc(40);
+        buf.writeBigInt64LE(unixTimestampSec, 32);
+        return { data: buf, executable: false, lamports: 1, owner: { toBase58: () => 'Sysvar1111111111111111111111111111111111111' } };
+      }
+
+      function makeAdminMarket() {
+        return {
+          slabAddress: { toBase58: () => 'MarketH3111111111111111111111111111111111' },
+          programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+          config: {
+            collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+            oracleAuthority: mockNonZeroKey(),
+            indexFeedId: mockNonZeroKey(),
+          },
+          params: { maintenanceMarginBps: 500n },
+          header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+        };
+      }
+
+      function stubAccount() {
+        vi.mocked(core.parseEngine).mockReturnValue({} as any);
+        vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+        vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
+        vi.mocked(core.parseAccount).mockReturnValue({
+          kind: 0,
+          owner: { toBase58: () => 'UserH3111111111111111111111111111111111' },
+          positionSize: 10_000_000_000n,
+          capital: 1_000_000n,
+          entryPrice: 1_000_000n,
+          pnl: 0n,
+        } as any);
+      }
+
+      function installConnectionWithClock(clockUnixSec: bigint) {
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async (key: any) => {
+            const k = typeof key?.toBase58 === 'function' ? key.toBase58() : String(key);
+            if (k === 'SysvarC1ock11111111111111111111111111111111') {
+              return makeClockSysvarInfo(clockUnixSec);
+            }
+            return null;
+          }),
+          getLatestBlockhash: vi.fn(async () => ({ blockhash: 'mock-blockhash', lastValidBlockHeight: 1000000 })),
+          sendRawTransaction: vi.fn(async () => 'mock-tx-signature'),
+        } as any);
+      }
+
+      it('H3: fetches SYSVAR_CLOCK_PUBKEY during liquidate() (proves cluster-time path executes)', async () => {
+        const wallNowSec = Math.floor(Date.now() / 1000);
+        const authorityTs = BigInt(wallNowSec - 30);
+        const clusterNowSec = authorityTs + 10n;
+
+        installConnectionWithClock(clusterNowSec);
+
+        const mockMarket = makeAdminMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 2_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: authorityTs,
+        } as any);
+
+        await liquidationService.liquidate(mockMarket as any, 0);
+
+        const conn = vi.mocked(shared.getConnection).mock.results[0]!.value as any;
+        const callKeys = conn.getAccountInfo.mock.calls.map((c: any[]) =>
+          typeof c[0]?.toBase58 === 'function' ? c[0].toBase58() : String(c[0]),
+        );
+        expect(callKeys).toContain('SysvarC1ock11111111111111111111111111111111');
+      });
+
+      it('H3: falls back to wall clock on Clock sysvar fetch failure', async () => {
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async (key: any) => {
+            const k = typeof key?.toBase58 === 'function' ? key.toBase58() : String(key);
+            if (k === 'SysvarC1ock11111111111111111111111111111111') {
+              throw new Error('RPC down');
+            }
+            return null;
+          }),
+          getLatestBlockhash: vi.fn(async () => ({ blockhash: 'mock-blockhash', lastValidBlockHeight: 1000000 })),
+          sendRawTransaction: vi.fn(async () => 'mock-tx-signature'),
+        } as any);
+
+        const mockMarket = makeAdminMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        } as any);
+
+        const sig = await liquidationService.liquidate(mockMarket as any, 0);
+        expect(sig).not.toBeNull();
+      });
+
+      it('H3: falls back to wall clock when Clock sysvar data is malformed', async () => {
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async (key: any) => {
+            const k = typeof key?.toBase58 === 'function' ? key.toBase58() : String(key);
+            if (k === 'SysvarC1ock11111111111111111111111111111111') {
+              return { data: Buffer.alloc(8), executable: false, lamports: 1, owner: { toBase58: () => 'X' } };
+            }
+            return null;
+          }),
+          getLatestBlockhash: vi.fn(async () => ({ blockhash: 'mock-blockhash', lastValidBlockHeight: 1000000 })),
+          sendRawTransaction: vi.fn(async () => 'mock-tx-signature'),
+        } as any);
+
+        const mockMarket = makeAdminMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        } as any);
+
+        const sig = await liquidationService.liquidate(mockMarket as any, 0);
+        expect(sig).not.toBeNull();
+      });
+
+      it('H3: scanMarket also fetches Clock sysvar (both call sites use cluster time)', async () => {
+        const wallNowSec = Math.floor(Date.now() / 1000);
+        const authorityTs = BigInt(wallNowSec);
+        installConnectionWithClock(authorityTs);
+
+        const mockMarket = makeAdminMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        vi.mocked(core.detectLayout).mockReturnValue({ slabHeader: 0, accounts: 0 } as any);
+        vi.mocked(core.parseEngine).mockReturnValue({
+          numUsedAccounts: 0,
+          vault: 0n,
+          insuranceFund: { balance: 0n, feeRevenue: 0n },
+        } as any);
+        vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: authorityTs,
+        } as any);
+        vi.mocked(core.parseUsedIndices).mockReturnValue([]);
+
+        await liquidationService.scanMarket(mockMarket as any);
+
+        const conn = vi.mocked(shared.getConnection).mock.results[0]!.value as any;
+        const callKeys = conn.getAccountInfo.mock.calls.map((c: any[]) =>
+          typeof c[0]?.toBase58 === 'function' ? c[0].toBase58() : String(c[0]),
+        );
+        expect(callKeys).toContain('SysvarC1ock11111111111111111111111111111111');
+      });
+    });
   });
+
 
   describe('start and stop', () => {
     it('should start and stop timer', () => {

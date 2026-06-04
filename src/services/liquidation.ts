@@ -130,9 +130,51 @@ function detectOracleMode(cfg: { oracleAuthority: PublicKey; indexFeedId: Public
 }
 
 /**
+ * H3: Fetch the cluster's current unix timestamp from the Solana Clock sysvar.
+ *
+ * `cfg.authorityTimestamp` is written by the on-chain program using the Clock
+ * sysvar (cluster time). The previous implementation compared it against
+ * `Date.now()/1000` (wall clock), which can diverge by seconds during NTP
+ * step corrections or validator congestion. The asymmetry is bounded by the
+ * 60s staleness window in practice but is still semantically wrong — the
+ * on-chain program rejects txs using its own Clock-sysvar check, so a
+ * wall-clock-skewed keeper produces wasted gas (rejected txs) at minimum.
+ *
+ * Falls back to wall clock on RPC failure so an outage doesn't freeze the
+ * scan loop. The fallback is logged at warn.
+ *
+ * Clock sysvar layout (40 bytes total, all LE):
+ *   slot                 (u64,  offset  0)
+ *   epoch_start_timestamp(i64,  offset  8)
+ *   epoch                (u64,  offset 16)
+ *   leader_schedule_epoch(u64,  offset 24)
+ *   unix_timestamp       (i64,  offset 32)  ← what we read
+ */
+async function fetchClusterUnixTimeSec(): Promise<bigint> {
+  try {
+    const info = await getConnection().getAccountInfo(SYSVAR_CLOCK_PUBKEY);
+    if (info && info.data && info.data.length >= 40) {
+      return info.data.readBigInt64LE(32);
+    }
+    logger.warn("H3: SYSVAR_CLOCK_PUBKEY account info malformed, falling back to wall clock", {
+      dataLen: info?.data?.length ?? 0,
+    });
+  } catch (err) {
+    logger.warn("H3: failed to fetch Clock sysvar, falling back to wall clock", {
+      error: getErrorMessage(err),
+    });
+  }
+  return BigInt(Math.floor(Date.now() / 1000));
+}
+
+/**
  * Resolve the effective price for a market based on its oracle mode.
  * Both scanMarket and liquidate call this to ensure identical price selection
  * logic, including the staleness fallback for admin-oracle markets.
+ *
+ * `nowSec` should be cluster time (Clock sysvar unix_timestamp) to match what
+ * the on-chain program sees. Use `fetchClusterUnixTimeSec()` to obtain it;
+ * if cluster time is unavailable the caller may pass wall-clock as a fallback.
  *
  * Returns 0n if no valid price is available.
  */
@@ -145,6 +187,7 @@ function resolveMarketPrice(
     authorityTimestamp: bigint;
   },
   mode: OracleMode,
+  nowSec: bigint,
 ): { price: bigint; stale: boolean } {
   if (mode === "pyth-pinned") {
     return { price: cfg.lastEffectivePriceE6, stale: false };
@@ -152,9 +195,8 @@ function resolveMarketPrice(
   if (mode === "hyperp") {
     return { price: cfg.lastEffectivePriceE6, stale: false };
   }
-  // Admin oracle: try authorityPriceE6 with off-chain staleness check
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
+  // Admin oracle: try authorityPriceE6 with on-chain-aligned staleness check
+  const priceAge = cfg.authorityTimestamp > 0n ? nowSec - cfg.authorityTimestamp : nowSec;
   const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
 
   if (authorityFresh) {
@@ -246,9 +288,13 @@ export class LiquidationService {
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
 
-      // Determine oracle mode and resolve price via shared helpers
+      // Determine oracle mode and resolve price via shared helpers.
+      // H3: use Solana Clock sysvar (cluster time) so the keeper's staleness
+      // check matches the on-chain program's check byte-for-byte. Falls back
+      // to wall clock on RPC failure.
       const oracleMode = detectOracleMode(cfg);
-      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode);
+      const nowSec = await fetchClusterUnixTimeSec();
+      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode, nowSec);
 
       let price: bigint;
       if (oracleMode === "pyth-pinned") {
@@ -425,8 +471,10 @@ export class LiquidationService {
 
         // Use the same price source as scanMarket via shared helpers
         // (fixes bug where admin-oracle staleness fallback was missing here)
+        // H3: cluster time, same source as scanMarket and as the on-chain check.
         const freshMode = detectOracleMode(freshCfg);
-        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
+        const freshNowSec = await fetchClusterUnixTimeSec();
+        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode, freshNowSec);
         if (freshPrice > 0n) {
           const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
           // A.13: shared helper. equity<=0n returns 0n, which is < any
