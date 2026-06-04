@@ -183,6 +183,16 @@ export class CrankService {
   private _isRunning = false;
   private _cycling = false;
   private _cycleStartedAt = 0;
+  // H4 (HIGH): wall-clock timestamp (ms) at which the watchdog first observed
+  // the current cycle exceeding MAX_CYCLE_MS. 0 when the watchdog is disarmed.
+  // The watchdog arms once, alerts once, and waits WATCHDOG_GRACE_MS before
+  // calling process.exit(1) for supervisor restart. It does NOT reset
+  // `_cycling` directly — flipping that flag while the in-flight cycle's
+  // Promise.all is still awaiting allows the next interval tick to launch a
+  // SECOND concurrent crankAll(), producing duplicate KeeperCrank txs +
+  // doubled funding accrual + RPC storms. Cleared on natural cycle recovery
+  // (the finally block) so transient slow cycles don't kill the process.
+  private _watchdogArmedAt = 0;
   private _stalePauseCheck?: (slabAddress: string) => boolean;
   // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
@@ -1263,24 +1273,50 @@ export class CrankService {
     // above the worst normal Sender retry window.
     const MAX_CYCLE_MS = Math.max(this.intervalMs * 10, 4 * 60_000);
 
+    // H4 (HIGH): when the watchdog observes a cycle exceeding MAX_CYCLE_MS we
+    // give it `WATCHDOG_GRACE_MS` more before exiting the process. A slow but
+    // recovering cycle clears its own _cycling/_watchdogArmedAt via the
+    // finally block; a truly hung cycle hits process.exit and the supervisor
+    // restarts. Critically we never flip `_cycling=false` here — that was the
+    // pre-fix bug that let the next interval tick start a second crankAll()
+    // while the first was still mid-Sender-retry. See the field-comment on
+    // `_watchdogArmedAt` for the full rationale.
+    const WATCHDOG_GRACE_MS = 30_000;
+
     this.timer = setInterval(async () => {
       if (this._cycling) {
         const elapsed = Date.now() - this._cycleStartedAt;
         if (elapsed > MAX_CYCLE_MS) {
-          logger.error("Crank cycle watchdog: cycle exceeded max duration, force-resetting", {
-            elapsedMs: elapsed,
-            maxCycleMs: MAX_CYCLE_MS,
-          });
-          sendCriticalAlert("Crank cycle hung — watchdog reset", [
-            { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
-            { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
-          ])?.catch(() => {});
-          this._cycling = false;
+          if (this._watchdogArmedAt === 0) {
+            // First tick observing the hang — alert once, start grace timer.
+            this._watchdogArmedAt = Date.now();
+            logger.error("Crank cycle watchdog: cycle hung, grace period started before process exit", {
+              elapsedMs: elapsed,
+              maxCycleMs: MAX_CYCLE_MS,
+              graceMs: WATCHDOG_GRACE_MS,
+            });
+            sendCriticalAlert("Crank cycle hung — supervisor restart pending", [
+              { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
+              { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
+              { name: "Grace", value: `${Math.round(WATCHDOG_GRACE_MS / 1000)}s`, inline: true },
+            ])?.catch(() => {});
+          } else if (Date.now() - this._watchdogArmedAt > WATCHDOG_GRACE_MS) {
+            // Grace expired, in-flight cycle did not recover — exit for supervisor restart.
+            // This is safer than flipping _cycling=false (which would double-execute) and
+            // safer than indefinite stall (which would silently halt the keeper).
+            logger.error("Crank cycle still hung after grace period — exiting for supervisor restart", {
+              elapsedMs: elapsed,
+              graceElapsedMs: Date.now() - this._watchdogArmedAt,
+            });
+            process.exit(1);
+          }
+          // NOTE: do NOT reset _cycling here. See field-comment on _watchdogArmedAt.
         }
         return;
       }
       this._cycling = true;
       this._cycleStartedAt = Date.now();
+      this._watchdogArmedAt = 0;
       try {
         // Only rediscover periodically (default 5min) to avoid RPC rate limits
         // PERC-8235: Don't use markets.size===0 as a trigger to rediscover every tick.
@@ -1310,6 +1346,9 @@ export class CrankService {
         logger.error("Crank cycle failed", { error: err });
       } finally {
         this._cycling = false;
+        // H4: disarm the watchdog on natural recovery so a transient slow
+        // cycle doesn't carry a pending kill timer into the next cycle.
+        this._watchdogArmedAt = 0;
       }
     }, this.intervalMs);
   }
