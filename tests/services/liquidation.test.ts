@@ -477,11 +477,132 @@ describe('LiquidationService', () => {
       } as any);
 
       const statusBefore = liquidationService.getStatus();
-      
+
       await liquidationService.liquidate(mockMarket as any, 0);
 
       const statusAfter = liquidationService.getStatus();
       expect(statusAfter.liquidationCount).toBe(statusBefore.liquidationCount + 1);
+    });
+
+    // ─── H2: pre-submit recheck must bail when fresh price is unavailable ──
+    // The previous `if (freshPrice > 0n) { ...recheck... }` envelope silently
+    // skipped the margin recheck when resolveMarketPrice returned 0n,
+    // letting the keeper submit a liquidation tx that may target an account
+    // that recovered. Fix: bail with null when freshPrice===0n.
+    describe('H2: freshPrice===0n bail-out', () => {
+      function makeMarket(opts: { hyperp?: boolean } = {}) {
+        const oracleAuthority = opts.hyperp ? mockNonZeroKey() : mockNonZeroKey();
+        const indexFeedId = opts.hyperp ? mockZeroKey() : mockNonZeroKey();
+        return {
+          slabAddress: { toBase58: () => 'MarketH2111111111111111111111111111111111' },
+          programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+          config: {
+            collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+            oracleAuthority,
+            indexFeedId,
+          },
+          params: { maintenanceMarginBps: 500n },
+          header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+        };
+      }
+
+      function stubAccount() {
+        vi.mocked(core.parseEngine).mockReturnValue({} as any);
+        vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+        vi.mocked(core.parseUsedIndices).mockReturnValue([0]);
+        vi.mocked(core.parseAccount).mockReturnValue({
+          kind: 0,
+          owner: { toBase58: () => 'UserH2111111111111111111111111111111111' },
+          positionSize: 10_000_000_000n,
+          capital: 1_000_000n,
+          entryPrice: 1_000_000n,
+          pnl: 0n,
+        } as any);
+      }
+
+      it('H2: returns null and does NOT submit when admin oracle is stale AND lastEffectivePriceE6 is 0n', async () => {
+        const mockMarket = makeMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),     // admin mode (non-zero authority, non-zero feed)
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 1_000_000n,          // stale
+          lastEffectivePriceE6: 0n,              // never cranked
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000) - 600), // 10 min old → stale
+        } as any);
+
+        const sendSpy = vi.mocked(shared.sendWithRetryKeeper);
+        const before = sendSpy.mock.calls.length;
+
+        const sig = await liquidationService.liquidate(mockMarket as any, 0);
+
+        expect(sig).toBeNull();
+        expect(sendSpy.mock.calls.length).toBe(before); // no new send
+      });
+
+      it('H2: returns null when pyth-pinned market has lastEffectivePriceE6===0n at submit', async () => {
+        const mockMarket = makeMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockZeroKey(),        // pyth-pinned (zero authority, non-zero feed)
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 0n,
+          lastEffectivePriceE6: 0n,              // not yet cranked
+          authorityTimestamp: 0n,
+        } as any);
+
+        const sendSpy = vi.mocked(shared.sendWithRetryKeeper);
+        const before = sendSpy.mock.calls.length;
+
+        const sig = await liquidationService.liquidate(mockMarket as any, 0);
+
+        expect(sig).toBeNull();
+        expect(sendSpy.mock.calls.length).toBe(before);
+      });
+
+      it('H2: returns null when hyperp market has lastEffectivePriceE6===0n at submit', async () => {
+        const mockMarket = makeMarket({ hyperp: true });
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),            // hyperp
+          authorityPriceE6: 0n,
+          lastEffectivePriceE6: 0n,
+          authorityTimestamp: 0n,
+        } as any);
+
+        const sendSpy = vi.mocked(shared.sendWithRetryKeeper);
+        const before = sendSpy.mock.calls.length;
+
+        const sig = await liquidationService.liquidate(mockMarket as any, 0);
+
+        expect(sig).toBeNull();
+        expect(sendSpy.mock.calls.length).toBe(before);
+      });
+
+      it('H2: still proceeds when admin oracle is stale but lastEffectivePriceE6 > 0 (stale-fallback path preserved)', async () => {
+        const mockMarket = makeMarket();
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        stubAccount();
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 0n,                  // no admin push
+          lastEffectivePriceE6: 1_000_000n,      // crank wrote a valid price
+          authorityTimestamp: 0n,
+        } as any);
+
+        const sig = await liquidationService.liquidate(mockMarket as any, 0);
+
+        // Falls through to the (now unconditional) margin recheck — at margin
+        // ratio 10% (positionSize=10k @ price 1.0, equity ~1.0), with
+        // maintenanceMarginBps=500, the account remains undercollateralized,
+        // so liquidation proceeds.
+        expect(sig).not.toBeNull();
+      });
     });
   });
 

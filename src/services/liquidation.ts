@@ -427,24 +427,40 @@ export class LiquidationService {
         // (fixes bug where admin-oracle staleness fallback was missing here)
         const freshMode = detectOracleMode(freshCfg);
         const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
-        if (freshPrice > 0n) {
-          const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
-          // A.13: shared helper. equity<=0n returns 0n, which is < any
-          // positive maintenanceMarginBps and so correctly proceeds with
-          // liquidation; the previous `if (equity > 0n)` wrapper just
-          // skipped the re-check entirely on underwater equity, missing
-          // the same liquidation case the scanMarket path catches.
-          const freshMarkPnl = freshAccount.pnl;
-          const equity = freshAccount.capital + freshMarkPnl;
-          const marginRatioBps = computeMarginRatioBps(equity, notional);
-          if (
-            notional > 0n &&
-            equity > 0n &&
-            marginRatioBps >= freshParams.maintenanceMarginBps
-          ) {
-            logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
-            return null;
-          }
+
+        // H2: fail-safe when no usable price is available. The previous
+        // `if (freshPrice > 0n) { ...recheck... }` envelope silently skipped
+        // the margin recheck whenever resolveMarketPrice returned 0n. That
+        // can happen on a race: scanMarket sees a non-zero price, then by
+        // submit time the admin authority has gone stale and the on-chain
+        // lastEffectivePriceE6 is also 0 (brand-new market never cranked).
+        // The keeper would then proceed to submit a liquidation tx with no
+        // recheck at all. Mirror scanMarket's own posture (which returns []
+        // on price===0n) and refuse to submit.
+        if (freshPrice === 0n) {
+          logger.warn(
+            "Race condition: no fresh price available for pre-submit recheck, aborting",
+            { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), oracleMode: freshMode },
+          );
+          return null;
+        }
+
+        const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
+        // A.13: shared helper. equity<=0n returns 0n, which is < any
+        // positive maintenanceMarginBps and so correctly proceeds with
+        // liquidation; the previous `if (equity > 0n)` wrapper just
+        // skipped the re-check entirely on underwater equity, missing
+        // the same liquidation case the scanMarket path catches.
+        const freshMarkPnl = freshAccount.pnl;
+        const equity = freshAccount.capital + freshMarkPnl;
+        const marginRatioBps = computeMarginRatioBps(equity, notional);
+        if (
+          notional > 0n &&
+          equity > 0n &&
+          marginRatioBps >= freshParams.maintenanceMarginBps
+        ) {
+          logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
+          return null;
         }
       }
 
