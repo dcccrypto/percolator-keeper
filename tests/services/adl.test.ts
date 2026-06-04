@@ -236,6 +236,54 @@ describe("AdlService", () => {
       const result = await service.scanMarket(slabAddress, makeMarket() as any);
       expect(result).toBe(0);
     });
+
+    // ─── H1: cross-multiplied ranking — no truncation collisions ───────────
+    it("H1: ranks by exact ratio, not truncated 1e6 fixed-point", async () => {
+      // Both positions truncate to the same pnlPct under the old code:
+      //   (1000 * 1_000_000) / 200_000_000 = 5
+      //   (1    * 1_000_000) / 170_000     = 5  (true 5.88, floored)
+      // True ratios: honest 1000/200M = 5e-6, attacker 1/170k ≈ 5.88e-6.
+      // OLD code: honest first (tie-break pnlAbs desc, 1000 > 1).
+      // NEW code: attacker first (cross-mult: 1*200M=200M > 1000*170k=170M).
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 11, pnl: 1_000n, capital: 200_000_000n, positionSize: 100n }, // honest
+          { idx: 22, pnl: 1n,     capital: 170_000n,    positionSize: 50n },  // attacker
+        ]) as any
+      );
+
+      await service.scanMarket(slabAddress, makeMarket() as any);
+
+      // Attacker (idx 22) has the higher true ratio → must be targeted first.
+      expect(sdk.encodeExecuteAdl).toHaveBeenNthCalledWith(1, { targetIdx: 22 });
+    });
+
+    it("H1: equal true ratios still tie-break by pnlAbs descending (preserved)", async () => {
+      // Both have ratio 30%: 300k/1M and 600k/2M. Higher pnlAbs ranks first.
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 3, pnl: 300_000n, capital: 1_000_000n, positionSize: 100n },
+          { idx: 8, pnl: 600_000n, capital: 2_000_000n, positionSize: 200n },
+        ]) as any
+      );
+
+      await service.scanMarket(slabAddress, makeMarket() as any);
+      expect(sdk.encodeExecuteAdl).toHaveBeenNthCalledWith(1, { targetIdx: 8 });
+    });
+
+    it("H1: when pnlAbs AND ratio are equal, idx ascending is the final deterministic tie-break", async () => {
+      // Both ratio 50%, both pnlAbs 500_000. Without the idx tie-break, ordering
+      // would be sort-stability-dependent. We assert the lower idx wins.
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 17, pnl: 500_000n, capital: 1_000_000n, positionSize: 100n },
+          { idx:  4, pnl: 500_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+
+      await service.scanMarket(slabAddress, makeMarket() as any);
+      expect(sdk.encodeExecuteAdl).toHaveBeenNthCalledWith(1, { targetIdx: 4 });
+    });
   });
 
   describe("scanMarket — oracle key selection", () => {
@@ -461,6 +509,35 @@ describe("AdlService", () => {
       const after = sharedBudget.getStats();
       expect(after.cycleTxCount).toBe(before.cycleTxCount + 1);
       expect(after.cycleSpend).toBeGreaterThan(before.cycleSpend);
+    });
+  });
+
+  // H1: regression guard on the /api/adl/rankings API contract. The fix drops
+  // the stored pnlPct field; the response still has to surface pnlPctMillionths.
+  describe("H1: getAdlState API contract", () => {
+    beforeEach(() => {
+      service = new AdlService();
+    });
+
+    it("surfaces pnlPctMillionths computed from pnlAbs/capital after the fix", async () => {
+      vi.mocked(sdk.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+      vi.mocked(sdk.parseEngine).mockReturnValue(makeEngine({ pnlPosTot: 1_000_000n }) as any);
+      vi.mocked(sdk.parseConfig).mockReturnValue(makeConfig({ maxPnlCap: 500_000n }) as any);
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 1, pnl: 300_000n, capital: 1_000_000n, positionSize: 100n }, // 30% → 300000 millionths
+          { idx: 2, pnl: 600_000n, capital: 1_000_000n, positionSize: 200n }, // 60% → 600000 millionths
+        ]) as any,
+      );
+
+      const state = await service.getAdlState(slabAddress, makeMarket() as any);
+      expect(state.adlNeeded).toBe(true);
+      expect(state.rankings).toHaveLength(2);
+      // Highest ratio first (idx 2, 60%).
+      expect(state.rankings[0]!.idx).toBe(2);
+      expect(state.rankings[0]!.pnlPctMillionths).toBe("600000");
+      expect(state.rankings[1]!.idx).toBe(1);
+      expect(state.rankings[1]!.pnlPctMillionths).toBe("300000");
     });
   });
 });

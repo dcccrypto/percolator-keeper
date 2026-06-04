@@ -133,7 +133,6 @@ const ADL_INSURANCE_UTIL_THRESHOLD_BPS = parseBigIntEnv(
 
 interface RankedPosition {
   idx: number;
-  pnlPct: bigint;   // PnL as % of capital × 1_000_000 (fixed-point)
   pnlAbs: bigint;   // Absolute positive PnL (raw)
   capital: bigint;
 }
@@ -270,17 +269,30 @@ function rankProfitablePositions(
 
     const capital = account.capital > 0n ? account.capital : 1n; // guard div-by-zero
     const pnlAbs = account.pnl;
-    // pnlPct = pnl * 1_000_000 / capital  (fixed-point, 6 decimal places)
-    const pnlPct = (pnlAbs * 1_000_000n) / capital;
 
-    profitable.push({ idx, pnlPct, pnlAbs, capital });
+    profitable.push({ idx, pnlAbs, capital });
   }
 
-  // Sort descending by PnL%: highest earner deleveraged first.
-  // Tie-break by absolute PnL descending.
+  // H1: rank by exact cross-multiplied PnL ratio — no precision loss.
+  //
+  // The previous implementation computed pnlPct = (pnlAbs * 1_000_000) / capital
+  // with BigInt floor division, then sorted descending by pnlPct with a
+  // pnlAbs-descending tie-break. Two positions with materially different
+  // true ratios could share the same truncated pnlPct, and the tie-break
+  // then placed the position with the larger pnlAbs first — potentially
+  // ranking an honest counterparty ahead of an attacker who tuned their
+  // position to collide on the truncated bucket. Cross-multiplication
+  // compares a.pnl/a.cap vs b.pnl/b.cap with exact BigInt arithmetic, so
+  // every position with a higher true ratio strictly outranks every
+  // position with a lower true ratio. We tie-break on pnlAbs descending
+  // (preserved from the original behavior), then on idx ascending so the
+  // final order is fully deterministic.
   profitable.sort((a, b) => {
-    if (b.pnlPct !== a.pnlPct) return b.pnlPct > a.pnlPct ? 1 : -1;
-    return b.pnlAbs > a.pnlAbs ? 1 : -1;
+    const lhs = a.pnlAbs * b.capital;
+    const rhs = b.pnlAbs * a.capital;
+    if (lhs !== rhs) return rhs > lhs ? 1 : -1;
+    if (b.pnlAbs !== a.pnlAbs) return b.pnlAbs > a.pnlAbs ? 1 : -1;
+    return a.idx - b.idx;
   });
 
   return profitable;
@@ -343,7 +355,10 @@ export class AdlService {
         idx: r.idx,
         pnlAbs: r.pnlAbs.toString(),
         capital: r.capital.toString(),
-        pnlPctMillionths: r.pnlPct.toString(),
+        // pnlPct is no longer stored on RankedPosition (H1 — ranking is via
+        // exact cross-multiplication). The API contract for observability
+        // still surfaces a millionths value computed on the fly.
+        pnlPctMillionths: ((r.pnlAbs * 1_000_000n) / r.capital).toString(),
       }));
     }
 
@@ -508,7 +523,7 @@ export class AdlService {
         logger.info("ADL tx sent", {
           slabAddress,
           targetIdx: pos.idx,
-          pnlPct: (Number(pos.pnlPct) / 1_000_000).toFixed(4) + "%",
+          pnlPct: (Number((pos.pnlAbs * 1_000_000n) / pos.capital) / 1_000_000).toFixed(4) + "%",
           sig,
         });
 
