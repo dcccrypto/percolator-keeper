@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { Keypair } from "@solana/web3.js";
 import { validateKeeperEnvGuards } from "../src/env-guards.js";
 
 describe("validateKeeperEnvGuards", () => {
@@ -267,6 +268,48 @@ describe("validateKeeperEnvGuards", () => {
       ALLOW_INSECURE_RPC: "true",
     } as NodeJS.ProcessEnv;
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  // ─── M1: CRANK_KEYPAIR parseability validation at boot ──────────────────
+  describe("M1: CRANK_KEYPAIR parseability", () => {
+    // A real, generated keypair — JSON-array form, which is the format
+    // operators typically paste into env vars from `solana-keygen new --outfile`.
+    const VALID_KEYPAIR_JSON = JSON.stringify(
+      Array.from(Keypair.generate().secretKey),
+    );
+
+    it("M1: throws when CRANK_KEYPAIR is a truncated JSON array", () => {
+      const env = { CRANK_KEYPAIR: "[1, 2, 3]" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /CRANK_KEYPAIR is not a valid keypair/,
+      );
+    });
+
+    it("M1: throws when CRANK_KEYPAIR is malformed JSON (unparseable)", () => {
+      const env = { CRANK_KEYPAIR: "[not, valid, json" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /CRANK_KEYPAIR is not a valid keypair/,
+      );
+    });
+
+    it("M1: throws when CRANK_KEYPAIR is a garbage base58 string", () => {
+      const env = { CRANK_KEYPAIR: "not-a-valid-base58-secret-!!!" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /CRANK_KEYPAIR is not a valid keypair/,
+      );
+    });
+
+    it("M1: accepts a well-formed 64-byte JSON array keypair", () => {
+      const env = { CRANK_KEYPAIR: VALID_KEYPAIR_JSON } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("M1: does NOT require CRANK_KEYPAIR to be set (presence is enforced in index.ts)", () => {
+      // env-guards only validates parseability if CRANK_KEYPAIR is set.
+      // Boot-time presence is enforced at src/index.ts:33 before this runs.
+      const env = {} as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
   });
 
   // A.7: RPC_URL is unguarded outside mainnet — local dev should still work.

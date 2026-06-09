@@ -1,3 +1,5 @@
+import { loadKeypair } from "@percolatorct/shared";
+
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
 const TEST_VALIDATOR_PORT = "8899";
 
@@ -31,6 +33,23 @@ function rejectLocalRpcUrl(varName: string, raw: string | undefined): void {
 }
 
 export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): void {
+  // M1: validate CRANK_KEYPAIR parseability at boot. Without this, a malformed
+  // keypair (truncated JSON, wrong base58) survives boot and only crashes in
+  // the 60s SOL-balance loop where the error is swallowed as warn — operators
+  // see the keeper "running" while it can't sign anything. Presence is enforced
+  // in index.ts before this function runs; here we only validate format if set.
+  const crankKp = env.CRANK_KEYPAIR?.trim();
+  if (crankKp) {
+    try {
+      loadKeypair(crankKp);
+    } catch (err) {
+      throw new Error(
+        `CRANK_KEYPAIR is not a valid keypair (expected a 64-byte JSON array or ` +
+          `base58-encoded secret key): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
   // K-2 (HIGH): hard-reject SUPABASE_SERVICE_ROLE_KEY being present at all.

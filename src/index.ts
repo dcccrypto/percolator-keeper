@@ -30,9 +30,31 @@ initSentry("keeper");
 
 const logger = createLogger("keeper");
 
+// M1: grace-gated deprecation of KEEPER_PRIVATE_KEY. The legacy alias used
+// to fall through silently with only `logger.warn` — operators had no
+// migration pressure and the deprecation was invisible on dashboards.
+// The fix:
+//   - if both vars are unset → throw (unchanged)
+//   - if CRANK_KEYPAIR is set → use it (unchanged; legacy is ignored)
+//   - if only KEEPER_PRIVATE_KEY is set → require an explicit opt-in
+//     (KEEPER_ALLOW_LEGACY_PRIVATE_KEY=true) for one more release cycle.
+//     Otherwise throw with migration instructions.
+// Boot-time keypair parseability is validated by validateKeeperEnvGuards()
+// at line 42 — catches malformed input here rather than 60s later inside
+// the SOL-balance interval.
 if (!process.env.CRANK_KEYPAIR) {
   if (process.env.KEEPER_PRIVATE_KEY) {
-    logger.warn("KEEPER_PRIVATE_KEY is deprecated — rename to CRANK_KEYPAIR in your .env");
+    if (process.env.KEEPER_ALLOW_LEGACY_PRIVATE_KEY !== "true") {
+      throw new Error(
+        "KEEPER_PRIVATE_KEY is deprecated and will be removed in a future release. " +
+          "Rename it to CRANK_KEYPAIR in your .env / Railway config, OR set " +
+          "KEEPER_ALLOW_LEGACY_PRIVATE_KEY=true to keep using the legacy name " +
+          "for one more release cycle.",
+      );
+    }
+    logger.warn(
+      "KEEPER_PRIVATE_KEY fallback active — migration to CRANK_KEYPAIR required before next release",
+    );
     process.env.CRANK_KEYPAIR = process.env.KEEPER_PRIVATE_KEY;
   } else {
     throw new Error("CRANK_KEYPAIR must be set for keeper service");
