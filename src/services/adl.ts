@@ -297,10 +297,28 @@ export class AdlService {
   // Cache keypair at construction — avoids re-parsing from env on every scanMarket() call
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
   private _cycleStartedAt = 0;
+  // M3: optional callback fired after each successful ExecuteAdl tx so the
+  // MonitorService can update its invariant gauges (cycleCountAtLastAdl,
+  // adlTxCounts). Mirrors CrankService.setOnCrankCycle's hook pattern.
+  // Until this is wired, MonitorService.notifyAdlTx() — exposed but never
+  // invoked — leaves ADL activity invisible on invariant dashboards.
+  private _onAdlTx?: (slabAddress: string) => void;
 
   /** Inject the crank service's market map so ADL can iterate tracked markets. */
   setMarketSource(fn: () => Map<string, MarketCrankState>): void {
     this._getMarkets = fn;
+  }
+
+  /**
+   * M3: register a callback fired by scanMarket() after each successful
+   * ExecuteAdl tx. Wired from index.ts to MonitorService.notifyAdlTx so
+   * the invariant layer can record ADL activity per market.
+   *
+   * Safe to call multiple times — the most recent callback wins. No-op if
+   * the callback throws (logged at warn).
+   */
+  setOnAdlTx(fn: (slabAddress: string) => void): void {
+    this._onAdlTx = fn;
   }
 
   get isRunning(): boolean {
@@ -511,6 +529,21 @@ export class AdlService {
           pnlPct: (Number(pos.pnlPct) / 1_000_000).toFixed(4) + "%",
           sig,
         });
+
+        // M3: notify the MonitorService (or any other observer) that an
+        // ExecuteAdl tx landed for this market. Pre-fix, this hook was
+        // exposed on MonitorService.notifyAdlTx() but never called — ADL
+        // success was invisible to the invariant layer's per-market gauges.
+        if (this._onAdlTx) {
+          try {
+            this._onAdlTx(slabAddress);
+          } catch (err) {
+            logger.warn("ADL onAdlTx callback threw", {
+              slabAddress,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
 
         sent++;
         // Optimistic: reduce remaining excess by the position's PnL.

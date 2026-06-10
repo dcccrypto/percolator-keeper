@@ -199,6 +199,59 @@ describe("AdlService", () => {
       expect(shared.sendWithRetryKeeper).toHaveBeenCalledTimes(1);
     });
 
+    // M3: success-path observer is invoked exactly once per successful ADL tx,
+    // with the slab address as the argument. Until this hook was wired, the
+    // MonitorService.notifyAdlTx() method existed but was never called →
+    // per-market `cycleCountAtLastAdl` invariant gauge stayed at 0 forever.
+    it("M3: invokes setOnAdlTx callback with slabAddress after each successful ADL tx", async () => {
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 3, pnl: 600_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+
+      const onAdlTx = vi.fn();
+      service.setOnAdlTx(onAdlTx);
+
+      await service.scanMarket(slabAddress, makeMarket() as any);
+
+      expect(onAdlTx).toHaveBeenCalledTimes(1);
+      expect(onAdlTx).toHaveBeenCalledWith(slabAddress);
+    });
+
+    it("M3: does NOT invoke setOnAdlTx callback when the send fails", async () => {
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 3, pnl: 600_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValueOnce(new Error("send failed"));
+
+      const onAdlTx = vi.fn();
+      service.setOnAdlTx(onAdlTx);
+
+      await service.scanMarket(slabAddress, makeMarket() as any);
+
+      expect(onAdlTx).not.toHaveBeenCalled();
+    });
+
+    it("M3: callback throwing does NOT abort the ADL cycle (errors swallowed as warn)", async () => {
+      vi.mocked(sdk.parseAllAccounts).mockReturnValue(
+        makeAccounts([
+          { idx: 3, pnl: 600_000n, capital: 1_000_000n, positionSize: 100n },
+          { idx: 5, pnl: 500_000n, capital: 1_000_000n, positionSize: 100n },
+        ]) as any
+      );
+
+      service.setOnAdlTx(() => {
+        throw new Error("observer threw");
+      });
+
+      const result = await service.scanMarket(slabAddress, makeMarket() as any);
+      // Both ADL targets should still get processed despite the callback throwing.
+      expect(result).toBeGreaterThanOrEqual(1);
+    });
+
     it("targets the highest PnL% position first (not highest abs PnL)", async () => {
       vi.mocked(sdk.parseAllAccounts).mockReturnValue(
         makeAccounts([

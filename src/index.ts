@@ -224,6 +224,16 @@ crankService.setStalePauseCheck(isMarketStalePaused);
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 
+// M3: wire ADL success notifications into MonitorService. MonitorService
+// already exposes notifyAdlTx() (used by the invariant gauges) but the ADL
+// service never invoked it pre-fix. Without this hook the per-market
+// `cycleCountAtLastAdl` field stays at 0 even when ADL fires, breaking the
+// "ADL stale" invariant downstream (it computes staleness as cycles-since-
+// last-ADL, which would diverge from reality forever).
+if (adlService) {
+  adlService.setOnAdlTx((slabAddress) => monitorService.notifyAdlTx(slabAddress));
+}
+
 // A4: deleted the per-market setInterval loop that used to live here. It was
 // unreachable: crankService.getMarkets() is called at module load time, before
 // discover() has populated the map, so the forEach iterated an empty Map and
