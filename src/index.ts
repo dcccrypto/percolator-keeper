@@ -41,6 +41,15 @@ if (!process.env.CRANK_KEYPAIR) {
 
 validateKeeperEnvGuards();
 
+// M2: cache the keeper signing keypair at boot. Previously `loadKeypair` was
+// called inside the 60s SOL-balance interval — re-parsing the same JSON/base58
+// every tick (wasteful) AND lumping keypair-format errors with RPC errors in
+// the catch block (silently degraded as warn). Hoisting the load to module
+// scope means a malformed keypair fails at boot (clean supervisor restart)
+// instead of producing a "keeper appears healthy but can't sign anything"
+// degraded state.
+const keeperKeypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+
 // If NETWORK=mainnet, the keeper runs against mainnet program (requires FORCE_MAINNET=1).
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
 // and price lookups use mainnet mints directly (no mainnetCA override needed).
@@ -103,7 +112,12 @@ let _lastSolBalanceAlertTime = 0;
 
 const solBalanceCheckInterval = setInterval(async () => {
   try {
-    const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+    // M2: reuse the keypair loaded at boot. The catch block below now only
+    // sees RPC errors, not keypair-format errors (those fail at boot when
+    // the module-scope loadKeypair call above throws). This lets ops
+    // distinguish "keeper can't sign" (boot failure) from "RPC outage"
+    // (transient warn).
+    const keypair = keeperKeypair;
     const conn = getConnection();
     const lamports = await conn.getBalance(keypair.publicKey);
     _keeperSolBalanceLamports = lamports;
