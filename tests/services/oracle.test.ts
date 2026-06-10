@@ -39,6 +39,7 @@ vi.mock('@percolatorct/shared', () => ({
     return String(err);
   }),
   sendWarningAlert: vi.fn(),
+  sendCriticalAlert: vi.fn(),
 }));
 
 import { OracleService } from '../../src/services/oracle.js';
@@ -337,6 +338,114 @@ describe('OracleService', () => {
   // Rate-limiting tests for pushPrice were removed after Phase G — admin-push
   // oracle is no longer a keeper responsibility. Pyth/Chainlink handle their
   // own rate limits upstream and Hyperp reads the DEX directly.
+
+  // M6: dual-source outage circuit breaker. Pre-fix, fetchPrice silently
+  // returned null when both DexScreener and Jupiter were down (and either
+  // cache was empty/stale), with no consecutive-failure counter. A sustained
+  // dual-source outage was invisible to ops.
+  describe('M6: dual-null circuit breaker', () => {
+    const DUAL_NULL_THRESHOLD = 5;
+
+    function mockBothSourcesDown() {
+      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 503 } as any);
+    }
+
+    function mockBothSourcesUp() {
+      vi.mocked(fetch).mockImplementation(async (url) => {
+        const u = typeof url === 'string' ? url : url.toString();
+        if (u.includes('dexscreener')) {
+          return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }) } as any;
+        }
+        // Extract the mint from the Jupiter URL so the response matches what
+        // _fetchJupiterPriceInternal looks up at `json.data?.[mint]?.price`.
+        const m = u.match(/ids=([^&]+)/);
+        const mint = m ? decodeURIComponent(m[1]!) : 'UNKNOWN';
+        return { ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as any;
+      });
+    }
+
+    it('M6: does NOT fire critical alert below threshold', async () => {
+      mockBothSourcesDown();
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      // 4 consecutive dual-nulls — below threshold (5).
+      for (let i = 0; i < DUAL_NULL_THRESHOLD - 1; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_BELOW', 'SLAB_M6_BELOW');
+      }
+
+      expect(criticalSpy).not.toHaveBeenCalled();
+    });
+
+    it('M6: fires critical alert exactly once at threshold (no spam on repeated outages)', async () => {
+      mockBothSourcesDown();
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      // 10 consecutive dual-nulls — twice the threshold.
+      for (let i = 0; i < DUAL_NULL_THRESHOLD * 2; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_FIRE', 'SLAB_M6_FIRE');
+      }
+
+      // Alert fires once, not on every cycle past the threshold.
+      expect(criticalSpy).toHaveBeenCalledTimes(1);
+      const [title] = criticalSpy.mock.calls[0]!;
+      expect(title).toContain('outage');
+    });
+
+    it('M6: dual-null state recovers cleanly on first successful fetch (no crash, no double-alert)', async () => {
+      mockBothSourcesDown();
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      // Trigger the alert on first outage.
+      for (let i = 0; i < 6; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
+      }
+      expect(criticalSpy).toHaveBeenCalledTimes(1);
+
+      // Recovery path: at least one source succeeds. dual-null state should
+      // reset internally — the function returns a real price and does not
+      // throw. (Note: post-recovery, the per-slab history is fresh, which
+      // suppresses any further dual-null alerts until the 60s cache window
+      // expires — that suppression is correct behavior, not a regression.)
+      mockBothSourcesUp();
+      const recovered = await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
+      expect(recovered).not.toBeNull();
+      expect(recovered?.priceE6).toBe(1_000_000n);
+
+      // Continued operation: subsequent successful fetches work normally.
+      const followUp = await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
+      expect(followUp).not.toBeNull();
+
+      // Critical alert count is unchanged (no double-fire on the recovery path).
+      expect(criticalSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('M6: does NOT fire critical alert when fresh history cache covers the gap', async () => {
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      // First seed a fresh history entry by getting one successful fetch.
+      mockBothSourcesUp();
+      const seed = await oracleService.fetchPrice('TESTMINT_M6_CACHE', 'SLAB_M6_CACHE');
+      expect(seed).not.toBeNull();
+
+      // Now both upstream sources go down. The per-slab history (priceHistory)
+      // still has the seeded entry and is < 60s old, so dual-null branch sees
+      // hasFreshCache=true and suppresses the critical alert.
+      mockBothSourcesDown();
+      // dex response cache (in-source TTL) may still serve the seeded value
+      // for ~10s; either path means the keeper has a usable price → no alert.
+      for (let i = 0; i < DUAL_NULL_THRESHOLD * 2; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_CACHE', 'SLAB_M6_CACHE');
+      }
+
+      // The critical-alert path is gated on hasFreshCache=false — the seeded
+      // history entry covers the gap, so no escalation.
+      expect(criticalSpy).not.toHaveBeenCalled();
+    });
+  });
 
   describe('price history tracking', () => {
     it('should track price history up to max entries per market', async () => {

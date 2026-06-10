@@ -2,7 +2,7 @@ import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   type MarketConfig,
 } from "@percolatorct/sdk";
-import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolatorct/shared";
+import { eventBus, createLogger, getErrorMessage, sendWarningAlert, sendCriticalAlert } from "@percolatorct/shared";
 import { oraclePushCountTotal, oracleStalenessSeconds } from "../lib/metrics.js";
 
 const logger = createLogger("keeper:oracle");
@@ -69,6 +69,19 @@ export class OracleService {
     { consecutive: number; alertSent: boolean }
   >();
   private static readonly SINGLE_SOURCE_ALERT_THRESHOLD = 10;
+  // M6: per-mint dual-null state. Pre-fix, the fetchPrice path silently
+  // returned null when BOTH DexScreener and Jupiter were down (and either
+  // no cached history existed or the cache was stale). The keeper would
+  // log a stale-cache warn at most, with no consecutive-failure counter
+  // and no escalation — a sustained dual-source outage was invisible on
+  // dashboards until the downstream "stale oracle" cron eventually fired.
+  // Track per-mint consecutive dual-null observations and escalate via
+  // sendCriticalAlert at the threshold so ops sees the outage immediately.
+  private _dualNullState = new Map<
+    string,
+    { consecutive: number; alertSent: boolean }
+  >();
+  private static readonly DUAL_NULL_ALERT_THRESHOLD = 5;
   // M-4: Track when an external source (DexScreener or Jupiter) last returned a
   // valid price for each slab. Used to cap the on-chain fallback duration so that
   // a prolonged external outage causes the oracle to go stale rather than cycling
@@ -298,7 +311,46 @@ export class OracleService {
     }
 
     if (priceE6 === null) {
+      // M6: dual-source outage. Both DexScreener and Jupiter returned null.
+      // Track consecutive observations so a sustained outage escalates to
+      // sendCriticalAlert rather than degrading silently into the cached
+      // path (or null) cycle after cycle.
+      const dualState = this._dualNullState.get(mint) ?? {
+        consecutive: 0,
+        alertSent: false,
+      };
+      dualState.consecutive++;
+
       const history = this.priceHistory.get(slabAddress);
+      const hasFreshCache =
+        history !== undefined &&
+        history.length > 0 &&
+        Date.now() - history[history.length - 1].timestamp <= CACHED_PRICE_MAX_AGE_MS;
+
+      // Critical alert: dual-null AND we cannot fall back to a fresh cache.
+      // The keeper has no usable price for this mint, period. Fire ONCE per
+      // outage and rearm on any successful fetch in the success path below.
+      if (
+        !hasFreshCache &&
+        dualState.consecutive >= OracleService.DUAL_NULL_ALERT_THRESHOLD &&
+        !dualState.alertSent
+      ) {
+        dualState.alertSent = true;
+        logger.error("Oracle dual-source outage: no usable price for mint", {
+          mint,
+          slabAddress,
+          consecutive: dualState.consecutive,
+          threshold: OracleService.DUAL_NULL_ALERT_THRESHOLD,
+        });
+        sendCriticalAlert("Oracle dual-source outage", [
+          { name: "Mint", value: mint.slice(0, 12), inline: true },
+          { name: "Slab", value: slabAddress.slice(0, 12), inline: true },
+          { name: "Consecutive", value: String(dualState.consecutive), inline: true },
+          { name: "Sources Down", value: "DexScreener + Jupiter", inline: false },
+        ])?.catch(() => {});
+      }
+      this._dualNullState.set(mint, dualState);
+
       if (history && history.length > 0) {
         const last = history[history.length - 1];
         // Reject stale cached prices (>60s) to prevent bad liquidations
@@ -313,6 +365,20 @@ export class OracleService {
         return { ...last, source: "cached" };
       }
       return null;
+    }
+
+    // M6: at least one source succeeded — reset dual-null state for this mint.
+    {
+      const dualState = this._dualNullState.get(mint);
+      if (dualState && (dualState.consecutive > 0 || dualState.alertSent)) {
+        logger.info("Oracle dual-source outage recovered", {
+          mint,
+          previousConsecutive: dualState.consecutive,
+        });
+        dualState.consecutive = 0;
+        dualState.alertSent = false;
+        this._dualNullState.set(mint, dualState);
+      }
     }
 
     // R2-S4: Historical deviation check — reject if >30% change from last known price
