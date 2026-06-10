@@ -3,6 +3,7 @@ import {
   type MarketConfig,
 } from "@percolatorct/sdk";
 import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolatorct/shared";
+import { isMainnet } from "../config/network.js";
 import { oraclePushCountTotal, oracleStalenessSeconds } from "../lib/metrics.js";
 
 const logger = createLogger("keeper:oracle");
@@ -74,6 +75,37 @@ export class OracleService {
   // a prolonged external outage causes the oracle to go stale rather than cycling
   // the same on-chain price forever.
   private lastExternalPriceMs = new Map<string, number>();
+
+  constructor() {
+    // M5: DexScreener and Jupiter REST APIs return prices with NO publisher
+    // signature and NO slot field. Cross-source validation (10% deviation) +
+    // min-liquidity filter ($1000) + historical deviation cap (30%) mitigate
+    // single-source manipulation, but if both sources are simultaneously
+    // attacker-influenced (DNS poisoning, CDN compromise, MITM on a non-pinned
+    // TLS chain), the keeper has no cryptographic recourse. Migrating to
+    // Pyth Pull (signed on-chain) is the actual fix; this warn makes the
+    // architectural debt explicit at boot so it is not silently inherited.
+    //
+    // To silence after operator acknowledgement, set
+    // ORACLE_ACK_UNSIGNED_SOURCES=true. The keeper still emits a single info
+    // log on boot so the acknowledgement remains audit-traceable in deploy logs.
+    if (isMainnet()) {
+      const ack = process.env.ORACLE_ACK_UNSIGNED_SOURCES === "true";
+      if (ack) {
+        logger.info(
+          "OracleService: mainnet running with unsigned price sources (DexScreener/Jupiter) — operator acknowledgement received (ORACLE_ACK_UNSIGNED_SOURCES=true)",
+        );
+      } else {
+        logger.warn(
+          "OracleService: mainnet running with unsigned price sources (DexScreener/Jupiter). " +
+            "These APIs have no publisher signature and no slot anchor. Cross-source validation, " +
+            "min-liquidity ($1000), and historical deviation (30%) are partial mitigations only. " +
+            "Migrate to Pyth Pull for cryptographic guarantees. Set ORACLE_ACK_UNSIGNED_SOURCES=true " +
+            "to acknowledge this risk and silence this warn.",
+        );
+      }
+    }
+  }
 
   /** Fetch price from DexScreener (with rate-limit cache) */
   async fetchDexScreenerPrice(mint: string): Promise<bigint | null> {
@@ -221,6 +253,18 @@ export class OracleService {
    *   3. Use the higher-confidence source (DexScreener preferred, Jupiter fallback)
    *   4. If both fail, use cached price (reject if stale >60s)
    *   5. Historical deviation check (reject if >30% change from last known price)
+   *
+   * M5 (LOW, architectural): both DexScreener and Jupiter REST APIs return
+   * prices with NO publisher signature and NO slot anchor — the keeper has
+   * no cryptographic proof the price is real, only the TLS chain back to the
+   * provider's CDN. The mitigations above (cross-source 10%, historical 30%,
+   * min-liquidity $1000) catch single-source single-tick manipulation, but a
+   * coordinated attack that controls BOTH sources (e.g. supply-chain
+   * compromise of a shared CDN, or both endpoints under the same TLS root)
+   * would slip through. The real fix is Pyth Pull (on-chain signed prices);
+   * see the boot warn in this service's constructor. Until then, treat
+   * `source: "dexscreener" | "jupiter"` returns as "best-effort price, not
+   * provably the on-chain reality."
    */
   async fetchPrice(mint: string, slabAddress: string): Promise<PriceEntry | null> {
     // Fetch both sources in parallel for cross-validation
