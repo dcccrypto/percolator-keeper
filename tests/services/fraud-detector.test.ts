@@ -61,10 +61,14 @@ function makeHyperpState(opts: {
         collateralMint: new PublicKey(mint),
         indexFeedId: opts.nonZeroFeed ? NONZERO : ZERO,
         oracleAuthority: opts.nonZeroAuthority ? NONZERO : ZERO,
+        // The on-chain HYPERP mark (program hyperp_mark_e6) is surfaced by the SDK
+        // as config.authorityPriceE6 — this is what the fraud detector reads.
+        authorityPriceE6: opts.markPriceE6 ?? 1_000_000n, // default $1.00 in E6
         dexPool: null,
       } as never,
       engine: {
-        markPriceE6: opts.markPriceE6 ?? 1_000_000n, // default $1.00 in E6
+        // v12.17+ dropped the engine mark field; parseEngine returns 0n.
+        markPriceE6: 0n,
       } as never,
       params: {} as never,
     },
@@ -315,7 +319,9 @@ describe("FraudDetectorService", () => {
 
   // ── non-HYPERP markets are skipped ──────────────────────────────────────
 
-  it("skips non-HYPERP market where oracleAuthority is non-zero", async () => {
+  it("STILL checks a HYPERP market that carries a non-zero oracle authority (program: hyperp iff index_feed_id==0)", async () => {
+    // Post-Phase-G a bootstrapped HYPERP market carries a non-zero hyperp_authority;
+    // it must still be cross-validated, so the detector must NOT skip it.
     const state = makeHyperpState({ nonZeroAuthority: true });
     const markets = new Map([["slab1", state]]);
     const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });
@@ -323,8 +329,7 @@ describe("FraudDetectorService", () => {
     const svc = new FraudDetectorService(oracle, () => markets);
     await svc._runCheck();
 
-    expect(oracle.fetchPrice).not.toHaveBeenCalled();
-    expect(mockFraudAlertTotal.inc).not.toHaveBeenCalled();
+    expect(oracle.fetchPrice).toHaveBeenCalled();
   });
 
   it("skips non-HYPERP market where indexFeedId is non-zero", async () => {
@@ -340,7 +345,7 @@ describe("FraudDetectorService", () => {
 
   // ── on-chain mark price is zero: skip market ─────────────────────────────
 
-  it("skips market when engine.markPriceE6 is zero", async () => {
+  it("skips market when the on-chain mark (config.authorityPriceE6) is zero", async () => {
     const state = makeHyperpState({ markPriceE6: 0n });
     const markets = new Map([["slab1", state]]);
     const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });

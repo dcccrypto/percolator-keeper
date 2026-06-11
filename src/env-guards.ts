@@ -1,10 +1,13 @@
 import { loadKeypair } from "@percolatorct/shared";
+import { isMainnetNetwork, isKnownNetwork, normalizeNetwork } from "./network.js";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
 const TEST_VALIDATOR_PORT = "8899";
 
+// Delegates to the canonical resolver — case/whitespace-insensitive, and always
+// agrees with isMainnet() / CURRENT_NETWORK / the HA lock key.
 function isMainnetEnv(env: NodeJS.ProcessEnv): boolean {
-  return env.NETWORK === "mainnet";
+  return isMainnetNetwork(env.NETWORK);
 }
 
 // A2: When NETWORK=mainnet, refuse any RPC URL that points at a local validator.
@@ -68,6 +71,16 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   // unreachable — the hard-reject above already throws on any non-empty
   // service-role key. Deleted; the supabaseKey lookup that fed it is gone too.
 
+  // Fail fast on an explicitly-set NETWORK that isn't a recognized token, so a
+  // typo (e.g. "mainnnet") cannot silently resolve to devnet. Unset/empty is
+  // allowed (defaults to devnet for local dev).
+  if (!isKnownNetwork(env.NETWORK)) {
+    throw new Error(
+      `NETWORK='${(env.NETWORK ?? "").trim().slice(0, 20)}' is not a recognized network — ` +
+        "expected mainnet, devnet, or testnet (case-insensitive).",
+    );
+  }
+
   // Reject insecure (plaintext) RPC URLs unless explicitly allowed.
   // http:// and ws:// transmit signed transactions and account data unencrypted,
   // enabling MITM attacks on the network path.
@@ -78,15 +91,19 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   // and could split-brain. Validate that NETWORK is set to a supported value
   // whenever HA is on.
   if (env.HA_ENABLED === "true") {
-    const network = env.NETWORK?.trim();
-    if (!network) {
+    const raw = env.NETWORK?.trim();
+    if (!raw) {
       throw new Error(
         "HA_ENABLED=true requires NETWORK to be set. Set NETWORK=mainnet or NETWORK=devnet.",
       );
     }
-    if (network !== "mainnet" && network !== "devnet") {
+    // Normalized so "Mainnet"/" mainnet " are accepted consistently; the HA lock
+    // key (index.ts) uses the same normalized value, so two nodes that differ
+    // only by case/whitespace share one lock instead of splitting the brain.
+    const net = normalizeNetwork(env.NETWORK);
+    if (net !== "mainnet" && net !== "devnet") {
       throw new Error(
-        `HA_ENABLED=true: NETWORK must be 'mainnet' or 'devnet' (got '${network.slice(0, 20)}').`,
+        `HA_ENABLED=true: NETWORK must resolve to 'mainnet' or 'devnet' (got '${raw.slice(0, 20)}').`,
       );
     }
   }

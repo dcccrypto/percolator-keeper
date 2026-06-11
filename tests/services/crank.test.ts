@@ -685,128 +685,41 @@ describe('CrankService', () => {
       }
     });
 
-    it('crankAll should count foreignOracleSkipped markets in skipped total', async () => {
+    // Post-Phase-G: the "foreign oracle" skip (admin-push oracle requiring the keeper
+    // to be the oracle authority) was removed. A market with a non-zero oracle authority
+    // and index_feed_id == 0 is a normal HYPERP market and must be cranked, not skipped.
+    // (The two prior tests that asserted the skip behavior were deleted with this change.)
+    it('Post-Phase-G: a market with a non-zero (foreign) oracle authority is cranked as HYPERP, not skipped', async () => {
       const slabForeign = 'MarketFO3111111111111111111111111111111';
-      const slabNormal = 'MarketNorm111111111111111111111111111111';
-      const FOREIGN_AUTH = 'ForeignAuth31111111111111111111111111111';
       const mockForeignMarket = {
         slabAddress: { toBase58: () => slabForeign },
         programId: { toBase58: () => '11111111111111111111111111111111' },
         config: {
           collateralMint: { toBase58: () => 'MintFO31111111111111111111111111111111' },
-          // Non-default, non-keeper oracle authority → isAdminOracle=true, keeper≠authority
-          oracleAuthority: {
-            toBase58: () => FOREIGN_AUTH,
-            equals: (_other: any) => false, // not PublicKey.default AND not keeper key
-          },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
+          // Non-default, non-keeper oracle authority — the old "foreign oracle" case.
+          oracleAuthority: { toBase58: () => 'ForeignAuth31111111111111111111111111111', equals: (_o: any) => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) }, // index_feed_id == 0 → HYPERP
+          authorityPriceE6: BigInt(50_000_000), // mark already set → not hyperp-no-price-skipped
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: { toBase58: () => 'AdminFO31111111111111111111111111111111' } },
       };
-      const mockNormalMarket = {
-        slabAddress: { toBase58: () => slabNormal },
-        programId: { toBase58: () => '11111111111111111111111111111111' },
-        config: {
-          collateralMint: { toBase58: () => 'MintNorm1111111111111111111111111111111' },
-          oracleAuthority: { toBase58: () => '11111111111111111111111111111111', equals: () => true },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'AdminNorm111111111111111111111111111111' } },
-      };
 
-      // GH#1251: crankAll now calls loadKeypair() for a live authority check.
-      // Keeper key must NOT match oracleAuthority so the foreign market is skipped.
+      // Keeper key does NOT match the foreign oracle authority — pre-fix this forced a skip.
       vi.mocked(shared.loadKeypair).mockReturnValue({
-        publicKey: {
-          toBase58: () => 'KeeperKey311111111111111111111111111111',
-          equals: (_other: any) => false, // keeper ≠ foreign oracle authority
-        },
+        publicKey: { toBase58: () => 'KeeperKey311111111111111111111111111111', equals: (_o: any) => false },
         secretKey: new Uint8Array(64),
       } as any);
 
-      vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket, mockNormalMarket] as any);
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket] as any);
       await crankService.discover();
 
-      // Pre-mark the foreign oracle market as skipped (as crankMarket would do in steady state)
-      const foreignState = crankService.getMarkets().get(slabForeign)!;
-      foreignState.foreignOracleSkipped = true;
-
-      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-normal', estimatedCost: 5000 } as any);
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-foreign', estimatedCost: 5000 } as any);
       const result = await crankService.crankAll();
 
-      // Normal market cranked; foreign oracle market skipped → skipped >= 1
-      expect(result.skipped).toBeGreaterThanOrEqual(1);
-      expect(result.success).toBe(1);
-    });
-
-    it('GH#1251: crankAll should count foreign-oracle market as skipped (not failed) even after discover() resets the flag', async () => {
-      // Regression test: after discover() resets foreignOracleSkipped=false, crankAll used to
-      // enqueue the market, call crankMarket() which returned false → failed++ instead of skipped++.
-      // Fix: live authority check in crankAll before enqueue.
-      const slabForeign = 'MarketFO4111111111111111111111111111111';
-      const slabNormal  = 'MarketNorm2111111111111111111111111111111';
-
-      const FOREIGN_AUTHORITY = 'ForeignAuth41111111111111111111111111111';
-
-      const mockForeignMarket = {
-        slabAddress: { toBase58: () => slabForeign },
-        programId:   { toBase58: () => '11111111111111111111111111111111' },
-        config: {
-          collateralMint: { toBase58: () => 'MintFO41111111111111111111111111111111' },
-          // Non-default, non-keeper oracle authority
-          oracleAuthority: {
-            toBase58: () => FOREIGN_AUTHORITY,
-            equals: (_other: any) => false, // not PublicKey.default → isAdminOracle=true; not keeper → should skip
-          },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'AdminFO41111111111111111111111111111111' } },
-      };
-      const mockNormalMarket = {
-        slabAddress: { toBase58: () => slabNormal },
-        programId:   { toBase58: () => '11111111111111111111111111111111' },
-        config: {
-          collateralMint: { toBase58: () => 'MintNorm2111111111111111111111111111111' },
-          oracleAuthority: { toBase58: () => '11111111111111111111111111111111', equals: () => true },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'AdminNorm2111111111111111111111111111111' } },
-      };
-
-      // Keeper key does NOT match FOREIGN_AUTHORITY
-      vi.mocked(shared.loadKeypair).mockReturnValue({
-        publicKey: {
-          toBase58: () => 'KeeperKey411111111111111111111111111111',
-          equals: (_other: any) => false,
-        },
-        secretKey: new Uint8Array(64),
-      } as any);
-
-      vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket, mockNormalMarket] as any);
-      await crankService.discover();
-
-      // Simulate what crankMarket() does: set foreignOracleSkipped=true
-      const foreignState = crankService.getMarkets().get(slabForeign)!;
-      foreignState.foreignOracleSkipped = true;
-
-      // Now simulate discover() resetting the flag (as it does on each cycle)
-      foreignState.foreignOracleSkipped = false;
-
-      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-norm2', estimatedCost: 5000 } as any);
-      const result = await crankService.crankAll();
-
-      // The foreign oracle market should be SKIPPED, not failed
+      // No longer foreign-oracle-skipped: cranked as HYPERP, not skipped or failed.
       expect(result.failed).toBe(0);
-      expect(result.skipped).toBeGreaterThanOrEqual(1);
-      expect(result.success).toBe(1);
-
-      // Confirm the flag was re-set by crankAll's live check
-      const stateAfter = crankService.getMarkets().get(slabForeign)!;
-      expect(stateAfter.foreignOracleSkipped).toBe(true);
+      expect(result.success).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -936,6 +849,9 @@ describe('CrankService', () => {
           oracleAuthority: keeperOracleAuth2,
           authorityPriceE6: BigInt(0),
           lastEffectivePriceE6: BigInt(1_000_000),
+          // New model: a HYPERP market refreshes its mark from a pinned DEX pool
+          // (UpdateHyperpMark), not an off-chain fetchPrice.
+          dexPool: { toBase58: () => 'So11111111111111111111111111111111111111112' },
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: { toBase58: () => 'Admin311111111111111111111111111111111' } },
@@ -952,10 +868,11 @@ describe('CrankService', () => {
         const stateAfterSkip = localCrank.getMarkets().get(slabHyperp)!;
         expect(stateAfterSkip.hyperpNoPriceSkipped).toBe(true);
 
-        // Second cycle: price available — should clear flag and crank
-        mockOracleService.fetchPrice = vi.fn().mockResolvedValue({ priceE6: BigInt(75_000_000) });
-        // Simulate discovery reset (as discover() does)
+        // Second cycle: the pinned DEX pool is now resolved (cached), so
+        // UpdateHyperpMark can refresh the mark. Simulate discovery resetting the flag.
         stateAfterSkip.hyperpNoPriceSkipped = false;
+        stateAfterSkip.dexPoolResolvedAddress = 'So11111111111111111111111111111111111111112';
+        stateAfterSkip.dexPoolRemainingAccounts = [];
 
         const result2 = await localCrank.crankMarket(slabHyperp);
         expect(result2).toBe(true);
@@ -1016,6 +933,122 @@ describe('CrankService', () => {
 
       crankService.stop();
       expect(crankService.isRunning).toBe(false);
+    });
+  });
+
+  // ─── H4 (HIGH): watchdog must not let a second crank cycle launch while the first ──
+  // ─── is still in-flight, and must trigger supervisor restart on a genuine hang.   ──
+  // Pre-fix bug: watchdog set `_cycling=false` when elapsed > MAX_CYCLE_MS, letting
+  // the next interval tick run `crankAll()` concurrently with the in-flight one →
+  // duplicate KeeperCrank txs, doubled funding, RPC storms.
+  describe('H4: watchdog double-execution guard', () => {
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      // Mock process.exit so the test doesn't actually kill vitest. The fix calls
+      // process.exit(1) when a cycle hangs beyond MAX_CYCLE_MS + WATCHDOG_GRACE_MS.
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(((_code?: number) => undefined) as never);
+    });
+
+    afterEach(() => {
+      // Stop the keeper + restore timers + restore process.exit BEFORE the next
+      // test, even if this one timed out — otherwise the leftover setInterval
+      // leaks fake-timer state into subsequent describe blocks.
+      crankService.stop();
+      vi.useRealTimers();
+      exitSpy.mockRestore();
+    });
+
+    // Pre-populates a single dummy market so start() bypasses its initial
+    // `await this.discover()` (which hangs under fake timers when called
+    // before discoverMarkets() resolves). Then under fake timers we can
+    // observe the setInterval ticks directly.
+    function prepStartedService(): void {
+      (crankService as any).markets.set('dummy-slab', {
+        slabAddress: 'dummy-slab',
+        market: {},
+        lastCrankTime: Date.now(),
+        successCount: 0,
+        failureCount: 0,
+        isActive: true,
+        consecutiveErrors: 0,
+      });
+    }
+
+    // Pump the interval into the watchdog branch. _cycling is pre-staged so
+    // the watchdog branch runs synchronously and we never enter the
+    // crankAll/discover path (which would await mocked RPCs and stall the
+    // fake-timer scheduler).
+    function setCyclingHung(elapsedMs: number = 6 * 60_000) {
+      (crankService as any)._cycling = true;
+      (crankService as any)._cycleStartedAt = Date.now() - elapsedMs;
+    }
+
+    it('H4: does NOT reset _cycling when watchdog observes a hung cycle', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start(); // sync return — markets is non-empty so discover is skipped
+      setCyclingHung(); // 6 min elapsed > 5 min MAX_CYCLE_MS
+
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      expect((crankService as any)._cycling).toBe(true);
+      expect((crankService as any)._watchdogArmedAt).toBeGreaterThan(0);
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+
+    it('H4: alerts once even across multiple watchdog ticks within grace', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start();
+      setCyclingHung();
+      const alertSpy = vi.mocked(shared.sendCriticalAlert);
+      alertSpy.mockClear();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      // Re-stage so _cycling stays true and elapsed stays > MAX_CYCLE_MS for the next tick.
+      setCyclingHung();
+      await vi.advanceTimersByTimeAsync(15_000); // still inside grace
+
+      expect(alertSpy).toHaveBeenCalledTimes(1);
+      const [title] = alertSpy.mock.calls[0]!;
+      expect(title).toContain('hung');
+    });
+
+    it('H4: process.exit(1) fires after grace period if cycle stays hung', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start();
+      setCyclingHung();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      setCyclingHung();
+      // Advance well past the 30s grace boundary (>= 31s + small slop). The check
+      // is strictly >, so being inside the same fake-time tick that equals exactly
+      // 30s wouldn't fire — give it a comfortable margin.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('H4: watchdog disarms cleanly when cycle is no longer hung', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start();
+      setCyclingHung();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect((crankService as any)._watchdogArmedAt).toBeGreaterThan(0);
+
+      // Simulate the in-flight cycle recovering: _cycling=true with elapsed
+      // under MAX_CYCLE_MS means the watchdog skips the hung branch entirely.
+      setCyclingHung(1_000); // 1s elapsed, well under 5min cap
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      // Next watchdog tick should NOT fire process.exit, because elapsed is now < MAX_CYCLE_MS.
+      expect(exitSpy).not.toHaveBeenCalled();
     });
   });
 

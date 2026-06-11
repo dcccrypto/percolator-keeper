@@ -315,6 +315,104 @@ describe("RpcPool — pickProvider", () => {
     pool.alchemyHealth.evaluate(null);
     expect(pool.pickProvider("getAccountInfo")).toBe("helius");
   });
+
+  // ── H7 (MEDIUM): high-water mark + slot-floor failover guard ───────────────
+  // The default slack is 10. The pool refuses to failover to Alchemy when its
+  // lastSeenSlot is materially below the highest slot we've ever served.
+  describe("H7: slot-floor failover guard", () => {
+    function setHeliusUnhealthy(pool: any) {
+      for (let i = 0; i < 5; i++) pool.heliusHealth.recordFailure();
+      pool.heliusHealth.evaluate(null);
+    }
+
+    it("H7: failover to Alchemy when its slot is at the high-water mark", async () => {
+      const helius = makeConn({ getSlot: vi.fn(async () => 1000) });
+      const alchemy = makeConn();
+      const pool = new RpcPool(helius, alchemy, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      // Establish high-water at 1000 by calling getSlot via the pool.
+      await pool.getSlot();
+      pool.alchemyHealth.recordSlot(1000); // Alchemy caught up
+
+      setHeliusUnhealthy(pool);
+
+      expect(pool.pickProvider("getAccountInfo")).toBe("alchemy");
+    });
+
+    it("H7: refuses Alchemy and degrades to Helius when Alchemy is below high-water mark by > slack", async () => {
+      const helius = makeConn({ getSlot: vi.fn(async () => 1000) });
+      const alchemy = makeConn();
+      const pool = new RpcPool(helius, alchemy, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      await pool.getSlot(); // high-water = 1000
+      pool.alchemyHealth.recordSlot(950); // 50 slots behind, > 10 slack
+
+      setHeliusUnhealthy(pool);
+
+      expect(pool.pickProvider("getAccountInfo")).toBe("helius");
+    });
+
+    it("H7: accepts Alchemy within the slack window (default slack=10)", async () => {
+      const helius = makeConn({ getSlot: vi.fn(async () => 1000) });
+      const alchemy = makeConn();
+      const pool = new RpcPool(helius, alchemy, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      await pool.getSlot(); // high-water = 1000
+      pool.alchemyHealth.recordSlot(992); // 8 slots behind, within slack
+
+      setHeliusUnhealthy(pool);
+
+      expect(pool.pickProvider("getAccountInfo")).toBe("alchemy");
+    });
+
+    it("H7: high-water mark is monotonic across successive getSlot calls (does not regress)", async () => {
+      const slots = [1000, 1010, 1005, 1020, 1015];
+      let idx = 0;
+      const helius = makeConn({ getSlot: vi.fn(async () => slots[idx++] ?? 1020) });
+      const pool = new RpcPool(helius, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      for (let i = 0; i < slots.length; i++) await pool.getSlot();
+
+      // High-water now = 1020. Alchemy at 1009 is 11 behind > 10 slack → reject.
+      pool.alchemyHealth.recordSlot(1009);
+      setHeliusUnhealthy(pool);
+      expect(pool.pickProvider("getAccountInfo")).toBe("helius");
+    });
+
+    it("H7: cold start (no high-water observed yet) does NOT reject Alchemy", () => {
+      const pool = new RpcPool(makeConn() as any, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      // Never called getSlot, never recorded a probe — high-water stays 0.
+      // Alchemy hasn't recorded a slot either.
+      setHeliusUnhealthy(pool);
+      expect(pool.pickProvider("getAccountInfo")).toBe("alchemy");
+    });
+
+    it("H7: RPC_FAILOVER_SLOT_FLOOR_SLACK env var overrides the default", async () => {
+      const helius = makeConn({ getSlot: vi.fn(async () => 1000) });
+      const pool = new RpcPool(helius, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        env: { RPC_FAILOVER_SLOT_FLOOR_SLACK: "100" },
+        now: mockNow,
+      });
+      await pool.getSlot(); // high-water = 1000
+      pool.alchemyHealth.recordSlot(950); // 50 behind, within 100 slack → accept
+
+      setHeliusUnhealthy(pool);
+
+      expect(pool.pickProvider("getAccountInfo")).toBe("alchemy");
+    });
+  });
 });
 
 // ── Lifecycle tests ───────────────────────────────────────────────────────────

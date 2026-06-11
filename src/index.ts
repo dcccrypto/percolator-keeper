@@ -10,6 +10,7 @@ import { MonitorService } from "./services/monitor.js";
 import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
+import { CURRENT_NETWORK } from "./network.js";
 import { assertMainnetProgramId } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
@@ -694,7 +695,10 @@ async function start() {
     // A.3: env-guards asserts NETWORK is set to mainnet|devnet whenever
     // HA_ENABLED=true, so the previous `?? "devnet"` fallback is gone —
     // a missing NETWORK would silently share a lock with the wrong cluster.
-    const network = process.env.NETWORK!;
+    // Use the normalized CURRENT_NETWORK (not raw process.env.NETWORK) so two
+    // nodes differing only by case/whitespace ("Mainnet" vs "mainnet") derive
+    // the SAME lock key and cannot both become leader.
+    const network = CURRENT_NETWORK;
     leaderLock.start({
       network,
       onPromote: () => {

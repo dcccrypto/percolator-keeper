@@ -42,7 +42,16 @@ import {
 const logger = createLogger("keeper:shadow-harness");
 
 const DEFAULT_COMPARE_WINDOW_MS = 300_000; // 5 minutes
-const DEFAULT_DIVERGENCE_THRESHOLD_PCT = 1.0;
+// C4 (CRITICAL): the original pct-divergence alert was structurally broken —
+// `liveTotal` from getSignaturesForAddress(programId) counts every user/maker/
+// oracle/other-keeper tx, while `shadowTotal` counts only this keeper's own
+// decisions. Divergence is ~100% on day 1 of mainnet, producing alert fatigue
+// every 5 min from boot. The pct gate is removed entirely and replaced with
+// two structurally-correct gates that don't rely on signer attribution.
+const DEFAULT_SILENT_CYCLES_BEFORE_ALERT = 3;   // ~15 min at 5 min/cycle
+const DEFAULT_RUNAWAY_MULTIPLIER = 3;            // shadow > 3x live
+const DEFAULT_RUNAWAY_MIN_SAMPLES = 10;          // small-sample guard
+const DEFAULT_ALERT_COOLDOWN_MS = 3_600_000;     // 1 hour between alerts
 // When the program id is not set in env, fall back to the mainnet constant.
 // This constant must match MAINNET_PROGRAM_ID in boot-assertions.ts.
 const FALLBACK_PROGRAM_ID = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
@@ -87,7 +96,14 @@ interface ShadowHarnessDeps {
   readDecisions: (fromMs: number, toMs: number) => Promise<DecisionEntry[]>;
   now?: () => number;
   compareWindowMs?: number;
-  divergenceThresholdPct?: number;
+  /** C4: number of consecutive shadow-silent-live-active cycles before alert. */
+  silentCyclesBeforeAlert?: number;
+  /** C4: shadowTotal > runawayMultiplier * liveTotal triggers shadow-runaway alert. */
+  runawayMultiplier?: number;
+  /** C4: minimum shadowTotal for the runaway alert to fire (small-sample guard). */
+  runawayMinSamples?: number;
+  /** C4: minimum gap between alerts of the same type (anti-spam). */
+  alertCooldownMs?: number;
 }
 
 export class ShadowHarness {
@@ -96,10 +112,18 @@ export class ShadowHarness {
   private readonly readDecisions: (fromMs: number, toMs: number) => Promise<DecisionEntry[]>;
   private readonly _now: () => number;
   private readonly compareWindowMs: number;
-  private readonly divergenceThresholdPct: number;
+  private readonly silentCyclesBeforeAlert: number;
+  private readonly runawayMultiplier: number;
+  private readonly runawayMinSamples: number;
+  private readonly alertCooldownMs: number;
   private _intervalHandle: ReturnType<typeof setInterval> | null = null;
   /** Last comparison result — used by buildReport(). */
   private _lastResult: ShadowCompareResult | null = null;
+  // C4: gating state for the structural alerts. _consecutiveSilentCycles
+  // tracks shadow=0 / live>0 streaks (resets on any cycle where shadow>0 OR
+  // the live RPC fetch failed). _lastAlertMs is the cooldown floor.
+  private _consecutiveSilentCycles = 0;
+  private _lastAlertMs = 0;
 
   constructor(deps: ShadowHarnessDeps) {
     this.connection = deps.connection;
@@ -113,9 +137,18 @@ export class ShadowHarness {
     this.compareWindowMs =
       deps.compareWindowMs ??
       Number(process.env.SHADOW_HARNESS_COMPARE_WINDOW_MS ?? DEFAULT_COMPARE_WINDOW_MS);
-    this.divergenceThresholdPct =
-      deps.divergenceThresholdPct ??
-      Number(process.env.SHADOW_HARNESS_DIVERGENCE_THRESHOLD_PCT ?? DEFAULT_DIVERGENCE_THRESHOLD_PCT);
+    this.silentCyclesBeforeAlert =
+      deps.silentCyclesBeforeAlert ??
+      Number(process.env.SHADOW_HARNESS_SILENT_CYCLES_BEFORE_ALERT ?? DEFAULT_SILENT_CYCLES_BEFORE_ALERT);
+    this.runawayMultiplier =
+      deps.runawayMultiplier ??
+      Number(process.env.SHADOW_HARNESS_RUNAWAY_MULTIPLIER ?? DEFAULT_RUNAWAY_MULTIPLIER);
+    this.runawayMinSamples =
+      deps.runawayMinSamples ??
+      Number(process.env.SHADOW_HARNESS_RUNAWAY_MIN_SAMPLES ?? DEFAULT_RUNAWAY_MIN_SAMPLES);
+    this.alertCooldownMs =
+      deps.alertCooldownMs ??
+      Number(process.env.SHADOW_HARNESS_ALERT_COOLDOWN_MS ?? DEFAULT_ALERT_COOLDOWN_MS);
   }
 
   /**
@@ -126,7 +159,10 @@ export class ShadowHarness {
     if (this._intervalHandle !== null) return;
     logger.info("ShadowHarness: comparison loop started", {
       compareWindowMs: this.compareWindowMs,
-      divergenceThresholdPct: this.divergenceThresholdPct,
+      silentCyclesBeforeAlert: this.silentCyclesBeforeAlert,
+      runawayMultiplier: this.runawayMultiplier,
+      runawayMinSamples: this.runawayMinSamples,
+      alertCooldownMs: this.alertCooldownMs,
       programId: this.programId.toBase58(),
     });
     // Run immediately, then on the interval.
@@ -184,6 +220,7 @@ export class ShadowHarness {
     }
 
     let liveTotal = 0;
+    let liveFetchOk = false;
     try {
       const fromSec = Math.floor(fromMs / 1000);
       const toSec = Math.floor(toMs / 1000);
@@ -196,6 +233,7 @@ export class ShadowHarness {
         const bt = s.blockTime;
         return bt !== null && bt !== undefined && bt >= fromSec && bt <= toSec;
       }).length;
+      liveFetchOk = true;
     } catch (err) {
       logger.error("ShadowHarness: getSignaturesForAddress failed", {
         error: err instanceof Error ? err.message : String(err),
@@ -243,18 +281,59 @@ export class ShadowHarness {
       toMs,
       shadowTotal,
       liveTotal,
+      liveFetchOk,
       divergencePct: divergencePct.toFixed(2),
+      consecutiveSilentCycles: this._consecutiveSilentCycles,
     });
 
-    // Alert if divergence exceeds threshold.
-    if (divergencePct > this.divergenceThresholdPct) {
-      sendWarningAlert("Shadow keeper divergence threshold exceeded", [
-        { name: "Shadow Total", value: String(shadowTotal), inline: true },
-        { name: "Live Total", value: String(liveTotal), inline: true },
-        { name: "Divergence", value: `${divergencePct.toFixed(2)}%`, inline: true },
-        { name: "Threshold", value: `${this.divergenceThresholdPct}%`, inline: true },
-        { name: "Window", value: `${Math.round(windowMs / 60_000)} min`, inline: true },
-      ]).catch(() => {});
+    // C4 (CRITICAL): structural alert gates. The old `divergencePct > threshold`
+    // gate fired on every cycle because liveTotal counts everyone's txs, not
+    // just the live keeper's. The two gates below are structurally correct —
+    // they don't depend on signer attribution and don't fire on legitimate
+    // mixed live activity.
+    //
+    // Gate 1 — SHADOW SILENT: shadowTotal === 0 while live activity exists
+    // for `silentCyclesBeforeAlert` consecutive cycles. The streak counter
+    // suppresses one-off transient silence (startup, brief decision-log gap)
+    // and only fires when shadow has been quiet for ~15 min (3 × 5 min).
+    // RPC failures (liveFetchOk=false) neither advance nor reset the streak —
+    // we genuinely don't know the live state.
+    //
+    // Gate 2 — SHADOW RUNAWAY: shadowTotal > runawayMultiplier * liveTotal
+    // AND shadowTotal >= runawayMinSamples. Catches the inverse failure
+    // (shadow over-fires, including the case where live keeper is dead and
+    // submits nothing). Min-samples guard prevents N=1 vs N=0 alerts.
+    if (liveFetchOk) {
+      const shadowSilent = shadowTotal === 0 && liveTotal > 0;
+      if (shadowSilent) {
+        this._consecutiveSilentCycles++;
+      } else {
+        this._consecutiveSilentCycles = 0;
+      }
+
+      const now = this._now();
+      const cooldownReady = now - this._lastAlertMs >= this.alertCooldownMs;
+
+      if (this._consecutiveSilentCycles >= this.silentCyclesBeforeAlert && cooldownReady) {
+        this._lastAlertMs = now;
+        sendWarningAlert("Shadow keeper silent while live program is active", [
+          { name: "Consecutive Silent Cycles", value: String(this._consecutiveSilentCycles), inline: true },
+          { name: "Live Total", value: String(liveTotal), inline: true },
+          { name: "Window", value: `${Math.round(windowMs / 60_000)} min`, inline: true },
+        ]).catch(() => {});
+      } else if (
+        shadowTotal >= this.runawayMinSamples &&
+        shadowTotal > this.runawayMultiplier * liveTotal &&
+        cooldownReady
+      ) {
+        this._lastAlertMs = now;
+        sendWarningAlert("Shadow keeper runaway: shadow fires vastly exceed live activity", [
+          { name: "Shadow Total", value: String(shadowTotal), inline: true },
+          { name: "Live Total", value: String(liveTotal), inline: true },
+          { name: "Multiplier", value: `${this.runawayMultiplier}x`, inline: true },
+          { name: "Window", value: `${Math.round(windowMs / 60_000)} min`, inline: true },
+        ]).catch(() => {});
+      }
     }
 
     return {

@@ -8,6 +8,7 @@ import { HeliusPriorityFeeEstimator } from "./priority-fee.js";
 import type { PriorityFeeEstimator, PriorityFeeTier } from "./priority-fee.js";
 import { CuEstimator } from "./cu-estimator.js";
 import { sharedDecisionLog } from "./decision-log.js";
+import { isMainnetNetwork } from "../network.js";
 
 const logger = createLogger("keeper:send");
 
@@ -53,7 +54,7 @@ export const sharedBudget = new KeeperBudget();
 
 function isMainnetSender(): boolean {
   return (
-    process.env.NETWORK === "mainnet" &&
+    isMainnetNetwork(process.env.NETWORK) &&
     process.env.USE_HELIUS_SENDER === "true"
   );
 }

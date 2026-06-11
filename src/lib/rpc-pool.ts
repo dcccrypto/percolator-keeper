@@ -82,6 +82,32 @@ export class RpcPool {
   // Tracks the active provider for reads to detect transitions.
   private _activeProvider: ProviderName = "helius";
 
+  /**
+   * H7: highest slot the pool has ever observed (either via a `getSlot()`
+   * response served to a caller, or via a health-probe `lastSeenSlot` update).
+   * Used by pickProvider() to refuse failover to a secondary whose
+   * lastSeenSlot is materially below this value, preventing the caller from
+   * observing a backwards slot across a provider transition.
+   *
+   * The existing cross-provider lag check in RpcProviderHealth.evaluate()
+   * marks a provider unhealthy at lag > 50 slots, but only runs every
+   * `healthCheckIntervalMs` (default 5s). This high-water mark closes the
+   * within-tick window where the secondary is "healthy by stale data"
+   * while the primary has just been marked unhealthy.
+   */
+  private _highestServedSlot = 0;
+
+  /**
+   * H7: slack tolerance (slots) for the high-water mark check in
+   * pickProvider(). A secondary is rejected if its lastSeenSlot is below
+   * `_highestServedSlot - FAILOVER_SLOT_FLOOR_SLACK`. The default of 10
+   * mirrors the existing `recoverySlotLag` semantics (a provider is allowed
+   * to be 10 slots behind without being considered "behind").
+   *
+   * Set via `RPC_FAILOVER_SLOT_FLOOR_SLACK` env var.
+   */
+  private readonly _failoverSlotFloorSlack: number;
+
   constructor(
     helius: Connection,
     alchemy: Connection,
@@ -107,6 +133,12 @@ export class RpcPool {
 
     this._heliusHealth = new RpcProviderHealth("helius", healthCfg, this._now);
     this._alchemyHealth = new RpcProviderHealth("alchemy", healthCfg, this._now);
+
+    // H7: failover slot-floor slack. Env override falls back to recoverySlotLag
+    // (10) which mirrors the cross-provider "caught up" semantics from health.
+    const envRaw = (deps.env ?? process.env).RPC_FAILOVER_SLOT_FLOOR_SLACK;
+    const parsed = envRaw === undefined ? NaN : parseInt(envRaw, 10);
+    this._failoverSlotFloorSlack = Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
 
     // Initialise Prometheus gauges to healthy (1).
     rpcProviderHealthy.set({ provider: "helius" }, 1);
@@ -162,7 +194,28 @@ export class RpcPool {
     const alchemyOk = this._alchemyHealth.isHealthy;
 
     if (heliusOk) return "helius";
-    if (alchemyOk) return "alchemy";
+    if (alchemyOk) {
+      // H7: refuse failover when the secondary's lastSeenSlot is materially
+      // below the highest slot the pool has ever served. The existing
+      // cross-provider lag check in RpcProviderHealth runs only every
+      // healthCheckIntervalMs (default 5s); between ticks, Alchemy can be
+      // "healthy by stale data" while Helius's primary has just failed —
+      // routing reads to Alchemy would move the caller backwards in slot.
+      // Degraded Helius beats backwards Alchemy.
+      const alchemySlot = this._alchemyHealth.lastSeenSlot ?? 0;
+      if (
+        this._highestServedSlot > 0 &&
+        alchemySlot < this._highestServedSlot - this._failoverSlotFloorSlack
+      ) {
+        rpcFailoverTotal.inc({
+          from: "alchemy",
+          to: "helius",
+          reason: "alchemy_below_highwater",
+        });
+        return "helius";
+      }
+      return "alchemy";
+    }
 
     // Fail-safe: both unhealthy → degrade to Helius.
     return "helius";
@@ -213,9 +266,13 @@ export class RpcPool {
   // ── Public read interface ─────────────────────────────────────────────────
 
   async getSlot(commitment?: string): Promise<number> {
-    return this._read("getSlot", (c) =>
+    const slot = await this._read("getSlot", (c) =>
       commitment ? c.getSlot(commitment as Parameters<Connection["getSlot"]>[0]) : c.getSlot(),
     );
+    // H7: advance the global high-water mark so subsequent failovers don't
+    // move callers backwards.
+    if (slot > this._highestServedSlot) this._highestServedSlot = slot;
+    return slot;
   }
 
   async getAccountInfo(pubkey: PublicKey): Promise<AccountInfo<Buffer> | null> {
@@ -335,6 +392,11 @@ export class RpcPool {
   private _evaluateAndTransition(): void {
     const heliusSlot = this._heliusHealth.lastSeenSlot;
     const alchemySlot = this._alchemyHealth.lastSeenSlot;
+
+    // H7: advance the global high-water mark from probe data so the
+    // slot-floor check has fresh state even if no caller ever calls getSlot().
+    const probedMax = Math.max(heliusSlot ?? 0, alchemySlot ?? 0);
+    if (probedMax > this._highestServedSlot) this._highestServedSlot = probedMax;
 
     this._heliusHealth.evaluate(alchemySlot);
     this._alchemyHealth.evaluate(heliusSlot);

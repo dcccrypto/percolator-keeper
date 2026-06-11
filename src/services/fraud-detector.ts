@@ -6,9 +6,10 @@
  * affects any other code path. A divergence above the threshold fires a Discord
  * warning via sendWarningAlert and increments Prometheus counters only.
  *
- * On-chain mark source: engine.markPriceE6 (parsed from slab data by
- * parseEngine). This field is updated on-chain by UpdateHyperpMark and
- * represents the EMA mark price in E6 format (i.e. USD * 1e6).
+ * On-chain mark source: MarketConfig.hyperp_mark_e6, surfaced by the SDK as
+ * config.authorityPriceE6 (config offset 176), written on-chain by
+ * UpdateHyperpMark and represented in E6 format (i.e. USD * 1e6). The engine
+ * mark field (engine.markPriceE6) was dropped in v12.17 and parses as 0.
  *
  * Off-chain consensus: OracleService.fetchPrice(mint, slabAddress), which
  * returns the DexScreener / Jupiter median as priceE6 (also E6 format).
@@ -32,9 +33,9 @@ import {
 const logger = createLogger("keeper:fraud-detector");
 
 // Price scale used by both on-chain and off-chain price representations.
-// engine.markPriceE6 is in USD * 1e6; OracleService.fetchPrice returns priceE6
-// in the same units. No conversion required — just compare the raw bigint values
-// after converting to Number for the floating-point division.
+// config.authorityPriceE6 (the on-chain HYPERP mark) is in USD * 1e6;
+// OracleService.fetchPrice returns priceE6 in the same units. No conversion
+// required — just compare the raw bigint values after Number() for the division.
 const PRICE_E6_SCALE = 1_000_000;
 
 /**
@@ -125,21 +126,24 @@ export class FraudDetectorService {
     const now = Date.now();
 
     for (const [slabAddress, state] of markets) {
-      // Only HYPERP markets have engine.markPriceE6 set by UpdateHyperpMark.
-      // Non-HYPERP markets use Pyth/Chainlink — no cross-validate needed here.
-      // HYPERP detection: indexFeedId all-zeros AND oracleAuthority all-zeros.
+      // HYPERP detection matches the program's oracle::is_hyperp_mode, which keys
+      // ONLY off index_feed_id == [0;32]. A bootstrapped HYPERP market may carry a
+      // non-zero hyperp_authority, so we must NOT additionally require
+      // oracle_authority == 0 (that silently skipped such markets). Non-HYPERP
+      // markets read an external Pyth/Chainlink feed — nothing to cross-validate.
       const feedBytes = state.market.config.indexFeedId.toBytes();
       const isZeroFeed = feedBytes.every((b: number) => b === 0);
-      const isZeroAuthority = state.market.config.oracleAuthority.toBytes().every((b: number) => b === 0);
-      if (!isZeroFeed || !isZeroAuthority) {
-        // Not a true HYPERP market — no on-chain EMA to compare.
+      if (!isZeroFeed) {
         continue;
       }
 
-      // On-chain mark price: engine.markPriceE6 (E6 units, updated by UpdateHyperpMark).
-      const onChainMarkE6 = state.market.engine.markPriceE6;
+      // On-chain HYPERP mark (E6). v12.17+ dropped the engine mark field
+      // (parseEngine returns 0n), so the live mark is MarketConfig.hyperp_mark_e6,
+      // which the SDK surfaces as config.authorityPriceE6 (config offset 176) and
+      // UpdateHyperpMark writes.
+      const onChainMarkE6 = state.market.config.authorityPriceE6;
       if (onChainMarkE6 === undefined || onChainMarkE6 === 0n) {
-        logger.debug("FraudDetector: on-chain markPriceE6 is zero — skipping market", {
+        logger.debug("FraudDetector: on-chain HYPERP mark is zero — skipping market", {
           slabAddress: slabAddress.slice(0, 8),
         });
         continue;

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { PublicKey } from "@solana/web3.js";
 import {
   AccountLoader,
   type AccountUpdate,
@@ -19,6 +20,42 @@ const BASE_OPTS: AccountLoaderOptions = {
   apiKey: "test-key",
   endpoint: "http://localhost:1234",
 };
+
+/**
+ * C3: minimal Connection stub exposing only getMultipleAccountsInfoAndContext.
+ * The real type is large; the loader only calls this one method.
+ */
+interface AccountInfoLite {
+  data: Uint8Array;
+  owner: PublicKey;
+}
+function makeMockConnection(opts: {
+  accounts: Record<string, AccountInfoLite | null>;
+  slot?: number;
+  throws?: Error;
+  trackCalls?: { count: number; lastChunkSizes: number[] };
+}) {
+  return {
+    getMultipleAccountsInfoAndContext: vi.fn(
+      async (pubkeys: PublicKey[]) => {
+        if (opts.trackCalls) {
+          opts.trackCalls.count++;
+          opts.trackCalls.lastChunkSizes.push(pubkeys.length);
+        }
+        if (opts.throws) throw opts.throws;
+        return {
+          context: { slot: opts.slot ?? 1000 },
+          value: pubkeys.map((p) => opts.accounts[p.toBase58()] ?? null),
+        };
+      },
+    ),
+  };
+}
+
+// Two valid Solana pubkeys for additionalAccounts tests.
+const PK_A = "So11111111111111111111111111111111111111112";
+const PK_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const OWNER = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 
 /** Test double for StreamAdapter that lets tests control connection lifecycle. */
 class FakeAdapter implements StreamAdapter {
@@ -290,6 +327,163 @@ describe("AccountLoader", () => {
       // At least 3 attempts made (initial + 2 reconnects)
       expect(failing.startCallCount).toBeGreaterThanOrEqual(3);
       await errLoader.stop();
+    });
+  });
+
+  describe("C3: RPC snapshot on (re)connect", () => {
+    it("seeds cache from RPC before adapter.start() returns", async () => {
+      const conn = makeMockConnection({
+        accounts: {
+          [PK_A]: { data: new Uint8Array([0xaa, 0xbb]), owner: new PublicKey(OWNER) },
+          [PK_B]: { data: new Uint8Array([0xcc]), owner: new PublicKey(OWNER) },
+        },
+        slot: 5000,
+      });
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, additionalAccounts: [PK_A, PK_B], connection: conn as never },
+        ad,
+      );
+      await l.start();
+
+      expect(conn.getMultipleAccountsInfoAndContext).toHaveBeenCalledTimes(1);
+      // The snapshot must run before adapter.start completes — otherwise
+      // downstream code could read from the cache during the gap. We assert
+      // this indirectly: at the moment loader.start() resolves, the cache is
+      // already populated.
+      const a = l.getCache().get(PK_A, 5000);
+      const b = l.getCache().get(PK_B, 5000);
+      expect(a?.slot).toBe(5000);
+      expect(b?.slot).toBe(5000);
+      expect(a?.owner).toBe(OWNER);
+      await l.stop();
+    });
+
+    it("schedules reconnect when snapshot RPC throws and leaves connected=false", async () => {
+      vi.useFakeTimers();
+      const conn = makeMockConnection({
+        accounts: {},
+        throws: new Error("rpc 503"),
+      });
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, additionalAccounts: [PK_A], connection: conn as never },
+        ad,
+      );
+      await l.start();
+
+      // adapter.start() must NOT have been called — snapshot ran first and failed.
+      expect(ad.startCallCount).toBe(0);
+      expect(l.getStats().connected).toBe(false);
+      // Reconnect must be queued.
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(l.getStats().reconnectCount).toBeGreaterThanOrEqual(1);
+      vi.useRealTimers();
+      await l.stop();
+    });
+
+    it("re-runs snapshot after stream error → reconnect", async () => {
+      vi.useFakeTimers();
+      const conn = makeMockConnection({
+        accounts: {
+          [PK_A]: { data: new Uint8Array([1]), owner: new PublicKey(OWNER) },
+        },
+        slot: 7000,
+      });
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, additionalAccounts: [PK_A], connection: conn as never },
+        ad,
+      );
+      await l.start();
+      expect(conn.getMultipleAccountsInfoAndContext).toHaveBeenCalledTimes(1);
+
+      ad.pushError(new Error("stream dropped"));
+      // Cache flushed on error (existing behavior).
+      expect(l.getCache().size()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(1_100); // first backoff
+      await Promise.resolve();
+      vi.useRealTimers();
+
+      // Snapshot must have been re-run on reconnect.
+      expect(conn.getMultipleAccountsInfoAndContext).toHaveBeenCalledTimes(2);
+      expect(l.getCache().get(PK_A, 7000)?.slot).toBe(7000);
+      await l.stop();
+    });
+
+    it("chunks additionalAccounts > 100 into separate RPC calls", async () => {
+      // Build 250 valid pubkeys (we use derived seeds of PK_A for simplicity).
+      // Easier: use a sequence of 32-byte buffers cast through PublicKey.
+      const pubkeys: string[] = [];
+      const accountsMap: Record<string, AccountInfoLite> = {};
+      for (let i = 0; i < 250; i++) {
+        const bytes = new Uint8Array(32);
+        bytes[0] = i & 0xff;
+        bytes[1] = (i >> 8) & 0xff;
+        const pk = new PublicKey(bytes).toBase58();
+        pubkeys.push(pk);
+        accountsMap[pk] = { data: new Uint8Array([1]), owner: new PublicKey(OWNER) };
+      }
+      const tracker = { count: 0, lastChunkSizes: [] as number[] };
+      const conn = makeMockConnection({ accounts: accountsMap, slot: 8000, trackCalls: tracker });
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, additionalAccounts: pubkeys, connection: conn as never },
+        ad,
+      );
+      await l.start();
+
+      // 250 / 100 = 3 chunks (100, 100, 50).
+      expect(tracker.count).toBe(3);
+      expect(tracker.lastChunkSizes).toEqual([100, 100, 50]);
+      expect(l.getCache().size()).toBe(250);
+      await l.stop();
+    });
+
+    it("skips snapshot when no connection is provided (degraded mode)", async () => {
+      // No `connection` opt — loader logs warn and proceeds without seeding.
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, additionalAccounts: [PK_A] },
+        ad,
+      );
+      await l.start();
+      expect(l.getStats().connected).toBe(true);
+      expect(l.getCache().size()).toBe(0);
+      await l.stop();
+    });
+
+    it("skips snapshot when additionalAccounts is empty (no RPC call)", async () => {
+      const conn = makeMockConnection({ accounts: {} });
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, connection: conn as never },
+        ad,
+      );
+      await l.start();
+      expect(conn.getMultipleAccountsInfoAndContext).not.toHaveBeenCalled();
+      expect(l.getStats().connected).toBe(true);
+      await l.stop();
+    });
+
+    it("skips entries whose RPC value is null (account does not exist)", async () => {
+      const conn = makeMockConnection({
+        accounts: {
+          [PK_A]: { data: new Uint8Array([1]), owner: new PublicKey(OWNER) },
+          [PK_B]: null,
+        },
+        slot: 9000,
+      });
+      const ad = new FakeAdapter();
+      const l = new AccountLoader(
+        { ...BASE_OPTS, additionalAccounts: [PK_A, PK_B], connection: conn as never },
+        ad,
+      );
+      await l.start();
+      expect(l.getCache().get(PK_A, 9000)?.slot).toBe(9000);
+      expect(l.getCache().get(PK_B, 9000)).toBeNull();
+      await l.stop();
     });
   });
 });

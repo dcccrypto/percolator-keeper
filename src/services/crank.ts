@@ -183,6 +183,16 @@ export class CrankService {
   private _isRunning = false;
   private _cycling = false;
   private _cycleStartedAt = 0;
+  // H4 (HIGH): wall-clock timestamp (ms) at which the watchdog first observed
+  // the current cycle exceeding MAX_CYCLE_MS. 0 when the watchdog is disarmed.
+  // The watchdog arms once, alerts once, and waits WATCHDOG_GRACE_MS before
+  // calling process.exit(1) for supervisor restart. It does NOT reset
+  // `_cycling` directly — flipping that flag while the in-flight cycle's
+  // Promise.all is still awaiting allows the next interval tick to launch a
+  // SECOND concurrent crankAll(), producing duplicate KeeperCrank txs +
+  // doubled funding accrual + RPC storms. Cleared on natural cycle recovery
+  // (the finally block) so transient slow cycles don't kill the process.
+  private _watchdogArmedAt = 0;
   private _stalePauseCheck?: (slabAddress: string) => boolean;
   // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
@@ -557,13 +567,20 @@ export class CrankService {
   }
 
   /**
-   * True HYPERP mode: oracle_authority == [0;32] AND index_feed_id == [0;32].
-   * Uses toBytes() check — compatible with both real PublicKey and test mocks.
+   * HYPERP mode iff index_feed_id == [0;32], matching the program's
+   * `oracle::is_hyperp_mode` (percolator.rs:4156-4158), which keys ONLY off
+   * index_feed_id. The old extra `oracle_authority == 0` condition was a stale
+   * pre-Phase-G "admin oracle" artifact: post-Phase-G that field is
+   * `hyperp_authority` and is intentionally bootstrapped non-zero on HYPERP
+   * markets (UpdateAuthority HYPERP_MARK), yet `UpdateHyperpMark` is gated only
+   * on is_hyperp_mode and has no authority check — so requiring authority==0
+   * here misclassified bootstrapped HYPERP markets as non-hyperp and silently
+   * stopped refreshing their DEX-EMA mark.
+   * Uses toBytes() — compatible with both real PublicKey and test mocks.
    */
   private isHyperpOracle(market: DiscoveredMarket): boolean {
     const feedBytes = market.config.indexFeedId.toBytes();
-    const isZeroFeed = feedBytes.every((b: number) => b === 0);
-    return !this.isAdminOracle(market) && isZeroFeed;
+    return feedBytes.every((b: number) => b === 0);
   }
 
   private async resolveHyperpPoolRemainingAccounts(
@@ -896,11 +913,13 @@ export class CrankService {
 
       const errMsg = err instanceof Error ? err.message : String(err);
 
-      // P1 FIX: Detect InsufficientDexLiquidity (error 0x25 = 37) specifically.
-      // This is a permanent program-level rejection — the DEX pool doesn't meet the
-      // MIN_DEX_QUOTE_LIQUIDITY threshold. Log clearly so operators know the fix is
-      // to either change the pool or redeploy the program with a lower threshold.
-      if (errMsg.includes("Custom\":37") || errMsg.includes("custom program error: 0x25")) {
+      // P1 FIX: Detect InsufficientDexLiquidity (error 0x33 = 51) specifically.
+      // This is the program's PercolatorError ordinal for the MIN_DEX_QUOTE_LIQUIDITY
+      // rejection on UpdateHyperpMark. (Ordinal 37 / 0x25 is LpVaultNoNewFees — the
+      // keeper previously matched that by mistake, so this diagnostic never fired.)
+      // Log clearly so operators know the fix is to either change the pool or
+      // redeploy the program with a lower threshold.
+      if (errMsg.includes("Custom\":51") || errMsg.includes("custom program error: 0x33")) {
         logger.error("InsufficientDexLiquidity — DEX pool does not meet program minimum liquidity threshold. " +
           "Fix: use a pool with more liquidity, or redeploy the program with a lower MIN_DEX_QUOTE_LIQUIDITY.", {
           slabAddress,
@@ -989,34 +1008,13 @@ export class CrankService {
       txSentTotal.inc({ result: "drop", type: "crank" });
       continue;
     }
-    // GH#1251: Live authority check — covers both the steady-state case (flag already set)
-    // and the post-discover() window where the flag was just reset.
-    // Any admin-oracle market where the keeper is NOT the oracle authority is always skipped.
-    if (
-      this.isAdminOracle(state.market) &&
-      !keeperKey.equals(state.market.config.oracleAuthority)
-    ) {
-      // Keep the flag in sync so crankMarket() also fast-paths correctly.
-      if (!state.foreignOracleSkipped) {
-        state.foreignOracleSkipped = true;
-        // GH#1748: Use WARN (not debug) on first detection, include both keys so ops can
-        // immediately diagnose a CRANK_KEYPAIR mismatch without reading the source.
-        logger.warn("crankAll: admin-oracle market skipped — keeper is NOT the oracle authority (key mismatch). " +
-          "Fix: set CRANK_KEYPAIR to the oracle authority key, or update the on-chain oracle authority.", {
-          slabAddress,
-          marketOracleAuthority: state.market.config.oracleAuthority.toBase58(),
-          keeperPublicKey: keeperKey.toBase58(),
-        });
-      } else {
-        logger.debug("crankAll: re-skipping foreign oracle market (flag was reset by discover)", {
-          slabAddress,
-          marketOracleAuthority: state.market.config.oracleAuthority.toBase58(),
-          keeperPublicKey: keeperKey.toBase58(),
-        });
-      }
-      skippedForeignOracle++;
-      continue;
-    }
+    // Post-Phase-G: the "foreign oracle" skip (admin-push oracle requiring the
+    // keeper to be the oracle authority) was removed. The program no longer has
+    // an admin-push oracle; `oracle_authority` is now `hyperp_authority`, which
+    // does NOT gate cranking — KeeperCrank/UpdateHyperpMark are permissionless.
+    // Skipping markets whose keeper != hyperp_authority false-skipped crankable
+    // markets, so the check is gone. (skippedForeignOracle stays 0.)
+
     // PERC-1254: Live Hyperp-no-price check.
     // Condition: admin-oracle market where keeper IS the authority, indexFeedId=all-zeros
     // (Hyperp mode), and on-chain authority_price_e6 is still 0.  Sending KeeperCrank in
@@ -1263,24 +1261,50 @@ export class CrankService {
     // above the worst normal Sender retry window.
     const MAX_CYCLE_MS = Math.max(this.intervalMs * 10, 4 * 60_000);
 
+    // H4 (HIGH): when the watchdog observes a cycle exceeding MAX_CYCLE_MS we
+    // give it `WATCHDOG_GRACE_MS` more before exiting the process. A slow but
+    // recovering cycle clears its own _cycling/_watchdogArmedAt via the
+    // finally block; a truly hung cycle hits process.exit and the supervisor
+    // restarts. Critically we never flip `_cycling=false` here — that was the
+    // pre-fix bug that let the next interval tick start a second crankAll()
+    // while the first was still mid-Sender-retry. See the field-comment on
+    // `_watchdogArmedAt` for the full rationale.
+    const WATCHDOG_GRACE_MS = 30_000;
+
     this.timer = setInterval(async () => {
       if (this._cycling) {
         const elapsed = Date.now() - this._cycleStartedAt;
         if (elapsed > MAX_CYCLE_MS) {
-          logger.error("Crank cycle watchdog: cycle exceeded max duration, force-resetting", {
-            elapsedMs: elapsed,
-            maxCycleMs: MAX_CYCLE_MS,
-          });
-          sendCriticalAlert("Crank cycle hung — watchdog reset", [
-            { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
-            { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
-          ])?.catch(() => {});
-          this._cycling = false;
+          if (this._watchdogArmedAt === 0) {
+            // First tick observing the hang — alert once, start grace timer.
+            this._watchdogArmedAt = Date.now();
+            logger.error("Crank cycle watchdog: cycle hung, grace period started before process exit", {
+              elapsedMs: elapsed,
+              maxCycleMs: MAX_CYCLE_MS,
+              graceMs: WATCHDOG_GRACE_MS,
+            });
+            sendCriticalAlert("Crank cycle hung — supervisor restart pending", [
+              { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
+              { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
+              { name: "Grace", value: `${Math.round(WATCHDOG_GRACE_MS / 1000)}s`, inline: true },
+            ])?.catch(() => {});
+          } else if (Date.now() - this._watchdogArmedAt > WATCHDOG_GRACE_MS) {
+            // Grace expired, in-flight cycle did not recover — exit for supervisor restart.
+            // This is safer than flipping _cycling=false (which would double-execute) and
+            // safer than indefinite stall (which would silently halt the keeper).
+            logger.error("Crank cycle still hung after grace period — exiting for supervisor restart", {
+              elapsedMs: elapsed,
+              graceElapsedMs: Date.now() - this._watchdogArmedAt,
+            });
+            process.exit(1);
+          }
+          // NOTE: do NOT reset _cycling here. See field-comment on _watchdogArmedAt.
         }
         return;
       }
       this._cycling = true;
       this._cycleStartedAt = Date.now();
+      this._watchdogArmedAt = 0;
       try {
         // Only rediscover periodically (default 5min) to avoid RPC rate limits
         // PERC-8235: Don't use markets.size===0 as a trigger to rediscover every tick.
@@ -1310,6 +1334,9 @@ export class CrankService {
         logger.error("Crank cycle failed", { error: err });
       } finally {
         this._cycling = false;
+        // H4: disarm the watchdog on natural recovery so a transient slow
+        // cycle doesn't carry a pending kill timer into the next cycle.
+        this._watchdogArmedAt = 0;
       }
     }, this.intervalMs);
   }
