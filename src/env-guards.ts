@@ -35,6 +35,42 @@ function rejectLocalRpcUrl(varName: string, raw: string | undefined): void {
   }
 }
 
+// A8: classify an RPC host as devnet/testnet. Anchored on dot-delimited
+// hostname labels, never a raw substring, so a legit mainnet host that merely
+// contains the text "devnet" (e.g. "my-devnet-migration.example.com", label
+// "my-devnet-migration") or "mainnet-beta" is never a false positive. Catches
+// every real form: api.devnet.solana.com, devnet.helius-rpc.com,
+// api.testnet.solana.com, testnet.helius-rpc.com.
+function isDevnetOrTestnetHost(hostname: string): boolean {
+  const labels = hostname.toLowerCase().split(".");
+  return labels.includes("devnet") || labels.includes("testnet");
+}
+
+// A8: When NETWORK=mainnet, refuse any RPC URL whose host is a known
+// devnet/testnet cluster. Complements rejectLocalRpcUrl (localhost/port-8899);
+// this catches public devnet hosts that the local-host guard lets through —
+// most importantly api.devnet.solana.com, which @percolatorct/shared substitutes
+// for an unset FALLBACK_RPC_URL. The keeper runs ALL market discovery and
+// liquidation retry on the fallback connection, so a devnet host there means it
+// discovers zero mainnet markets and cranks nothing.
+function rejectDevnetTestnetRpcUrl(varName: string, raw: string | undefined): void {
+  if (!raw) return; // presence is enforced separately for FALLBACK_RPC_URL
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    // Malformed URLs are reported by rejectLocalRpcUrl (which runs first).
+    return;
+  }
+  if (isDevnetOrTestnetHost(parsed.hostname)) {
+    throw new Error(
+      `${varName} points at devnet/testnet host '${parsed.hostname}' but NETWORK=mainnet — ` +
+        `refusing to boot. A mainnet keeper must use a mainnet RPC endpoint. ` +
+        `(@percolatorct/shared defaults an unset FALLBACK_RPC_URL to api.devnet.solana.com.)`,
+    );
+  }
+}
+
 export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): void {
   // M1: validate CRANK_KEYPAIR parseability at boot. Without this, a malformed
   // keypair (truncated JSON, wrong base58) survives boot and only crashes in
@@ -145,5 +181,26 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
     // (not SOLANA_RPC_URL). Without this guard a RPC_URL=http://localhost
     // on mainnet would be accepted while the other vars are caught.
     rejectLocalRpcUrl("RPC_URL", env.RPC_URL?.trim());
+
+    // A8: reject devnet/testnet hosts on every connection a mainnet keeper opens
+    // (discovery + liquidation retry run on the fallback connection).
+    rejectDevnetTestnetRpcUrl("SOLANA_RPC_URL", env.SOLANA_RPC_URL?.trim());
+    rejectDevnetTestnetRpcUrl("SOLANA_RPC_WS_URL", env.SOLANA_RPC_WS_URL?.trim());
+    rejectDevnetTestnetRpcUrl("FALLBACK_RPC_URL", env.FALLBACK_RPC_URL?.trim());
+    rejectDevnetTestnetRpcUrl("RPC_URL", env.RPC_URL?.trim());
+
+    // A8: FALLBACK_RPC_URL has no safe default on mainnet — when unset,
+    // @percolatorct/shared substitutes https://api.devnet.solana.com (with no
+    // network condition), and the keeper runs all market discovery + liquidation
+    // retry on that devnet connection. Require it to be set explicitly. (Checked
+    // last so an offending localhost/devnet value still gets its specific error.)
+    if (!env.FALLBACK_RPC_URL?.trim()) {
+      throw new Error(
+        "FALLBACK_RPC_URL must be set to a mainnet RPC endpoint when NETWORK=mainnet. " +
+          "It is unset, and @percolatorct/shared silently defaults it to " +
+          "api.devnet.solana.com — which would run all market discovery and " +
+          "liquidation retry on devnet, discovering zero mainnet markets.",
+      );
+    }
   }
 }

@@ -321,4 +321,103 @@ describe("validateKeeperEnvGuards", () => {
     } as NodeJS.ProcessEnv;
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
   });
+
+  // A8: mainnet must not silently fall back to devnet RPC. @percolatorct/shared
+  // defaults an unset FALLBACK_RPC_URL to api.devnet.solana.com, and the keeper
+  // runs all market discovery + liquidation retry on the fallback connection.
+  describe("A8: mainnet devnet/testnet RPC guard", () => {
+    const MAINNET = "https://mainnet.helius-rpc.com/?api-key=test";
+
+    it("throws when FALLBACK_RPC_URL is unset on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /FALLBACK_RPC_URL must be set to a mainnet RPC endpoint/,
+      );
+    });
+
+    it("throws when FALLBACK_RPC_URL is whitespace-only on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "   ",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /FALLBACK_RPC_URL must be set to a mainnet RPC endpoint/,
+      );
+    });
+
+    it.each([
+      ["FALLBACK_RPC_URL", "https://api.devnet.solana.com"],
+      ["FALLBACK_RPC_URL", "https://devnet.helius-rpc.com/?api-key=test"],
+      ["FALLBACK_RPC_URL", "https://api.testnet.solana.com"],
+      ["SOLANA_RPC_URL", "https://api.devnet.solana.com"],
+      ["RPC_URL", "https://api.testnet.solana.com"],
+    ])("rejects %s pointing at a devnet/testnet host on mainnet", (varName, url) => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        [varName]: url,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        new RegExp(`${varName} points at devnet/testnet host`),
+      );
+    });
+
+    it("accepts a complete mainnet env with an explicit mainnet FALLBACK_RPC_URL", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        SOLANA_RPC_WS_URL: "wss://mainnet.helius-rpc.com/?api-key=test",
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        RPC_URL: MAINNET,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    // Label-anchored, not substring: a mainnet host that merely contains the
+    // text "devnet" inside a label is NOT a false positive.
+    it("does not reject a mainnet host containing 'devnet' as a substring", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: "https://my-devnet-migration.example.com",
+        RPC_URL: "https://my-devnet-migration.example.com",
+        FALLBACK_RPC_URL: "https://my-devnet-migration.example.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    // The guard is independent of ALLOW_INSECURE_RPC (which only gates http/https).
+    it("rejects a devnet fallback on mainnet even when ALLOW_INSECURE_RPC=true", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.devnet.solana.com",
+        ALLOW_INSECURE_RPC: "true",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /FALLBACK_RPC_URL points at devnet\/testnet host/,
+      );
+    });
+
+    it("does NOT require FALLBACK_RPC_URL off mainnet (devnet/unset)", () => {
+      expect(() => validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv)).not.toThrow();
+      expect(() => validateKeeperEnvGuards({} as NodeJS.ProcessEnv)).not.toThrow();
+    });
+
+    it("allows a devnet FALLBACK_RPC_URL when NETWORK=devnet", () => {
+      const env = {
+        NETWORK: "devnet",
+        FALLBACK_RPC_URL: "https://api.devnet.solana.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+  });
 });
