@@ -189,9 +189,16 @@ export class LiquidationService {
   private liquidationCount = 0;
   private scanCount = 0;
   private lastScanTime = 0;
-  // Overlap guard: prevent concurrent scan cycles from interleaving
-  private _scanning = false;
-  private _scanStartedAt = 0;
+  // Overlap guard: the in-flight scan promise (null ⇒ no scan running). A new
+  // cycle starts only when this is null — i.e. the previous scan has SETTLED.
+  // We never force-clear it: a JS promise can't be cancelled, so clearing the
+  // guard while a scan is still awaiting its RPCs would only start a second
+  // scan concurrently (duplicate liquidations against the same accounts). A
+  // genuinely hung cycle therefore stops new scans; lastScanTime stops
+  // advancing, which the index.ts stall alert (3min) and /health "down" (5min →
+  // supervisor restart) already act on.
+  private _inFlight: Promise<void> | null = null;
+  private _scanStartedAt = 0; // start of the in-flight scan — for the watchdog WARN log only
   // BC1: Signature replay protection
   private recentSignatures = new Map<string, number>(); // signature -> timestamp
   private readonly signatureTTLMs = 60_000; // 60 seconds
@@ -680,49 +687,65 @@ export class LiquidationService {
 
     const MAX_SCAN_MS = this.intervalMs * 5;
 
-    const runCycle = async () => {
-      if (this._scanning) {
+    const runCycle = (): void => {
+      // Single-flight: never start a second scan while one is in flight. The
+      // watchdog only WARNs on an over-long cycle — it must NOT force-reset the
+      // guard, because clearing it cannot cancel the in-flight RPCs and would
+      // only spawn a concurrent scan. A hung cycle stops new scans; recovery is
+      // driven by the existing stall alert / health-down → restart path.
+      if (this._inFlight) {
         const elapsed = Date.now() - this._scanStartedAt;
         if (elapsed > MAX_SCAN_MS) {
-          logger.error("Liquidation scan watchdog: cycle exceeded max duration, force-resetting", {
+          logger.warn("Liquidation scan still in flight past max duration — not starting a concurrent scan", {
             elapsedMs: elapsed,
             maxScanMs: MAX_SCAN_MS,
           });
-          this._scanning = false;
         }
         return;
       }
-      this._scanning = true;
+
       this._scanStartedAt = Date.now();
-      try {
-        const marketsSnapshot = new Map(getMarkets());
-        const result = await this.scanAndLiquidateAll(marketsSnapshot);
-        this.consecutiveFailures = 0; // Reset on success
-        if (result.candidates > 0) {
-          logger.info("Liquidation scan complete", {
-            scanned: result.scanned,
-            candidates: result.candidates,
-            liquidated: result.liquidated
+      const scan = (async () => {
+        try {
+          const marketsSnapshot = new Map(getMarkets());
+          const result = await this.scanAndLiquidateAll(marketsSnapshot);
+          this.consecutiveFailures = 0; // Reset on success
+          if (result.candidates > 0) {
+            logger.info("Liquidation scan complete", {
+              scanned: result.scanned,
+              candidates: result.candidates,
+              liquidated: result.liquidated,
+            });
+          }
+        } catch (err) {
+          this.consecutiveFailures++;
+          const backoff = Math.min(
+            this.intervalMs * Math.pow(2, this.consecutiveFailures - 1),
+            this.maxBackoffMs,
+          );
+          logger.error("Liquidation cycle failed", {
+            error: err instanceof Error ? err.message : String(err),
+            consecutiveFailures: this.consecutiveFailures,
+            nextRetryMs: Math.round(backoff),
           });
+          // Schedule a delayed retry instead of waiting for the next fixed
+          // interval. Guard on this.timer so a queued retry can't start a scan
+          // after stop(); the single-flight check above prevents overlap if the
+          // regular interval tick also fires.
+          if (backoff > this.intervalMs && this.timer !== null) {
+            setTimeout(() => {
+              if (this.timer !== null) runCycle();
+            }, backoff - this.intervalMs);
+          }
         }
-      } catch (err) {
-        this.consecutiveFailures++;
-        const backoff = Math.min(
-          this.intervalMs * Math.pow(2, this.consecutiveFailures - 1),
-          this.maxBackoffMs,
-        );
-        logger.error("Liquidation cycle failed", {
-          error: err instanceof Error ? err.message : String(err),
-          consecutiveFailures: this.consecutiveFailures,
-          nextRetryMs: Math.round(backoff),
-        });
-        // Schedule delayed retry instead of waiting for next fixed interval
-        if (backoff > this.intervalMs) {
-          setTimeout(runCycle, backoff - this.intervalMs);
-        }
-      } finally {
-        this._scanning = false;
-      }
+      })();
+
+      this._inFlight = scan;
+      // Clear the guard only when THIS scan settles. The identity check makes a
+      // slow cycle unable to clobber a newer cycle's guard.
+      void scan.finally(() => {
+        if (this._inFlight === scan) this._inFlight = null;
+      });
     };
     this.timer = setInterval(runCycle, this.intervalMs);
 
