@@ -12,7 +12,7 @@ const PROPERTY_CONFIG = {
   txSuccessRateMinSamples: 4,
 } as const;
 
-const txResultArb: fc.Arbitrary<TxResult> = fc.constantFrom("success", "fail", "drop");
+const txResultArb: fc.Arbitrary<TxResult> = fc.constantFrom("success", "fail", "reverted", "drop");
 const lamportsArb = fc.integer({ min: 1, max: 100_000 });
 const advanceArb = fc.integer({ min: 0, max: 5_000 });
 

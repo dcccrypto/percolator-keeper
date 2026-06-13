@@ -131,6 +131,28 @@ export interface KeeperSendResult {
 }
 
 /**
+ * Classify a send failure for budget accounting.
+ *
+ * `pollSignatureStatus` (in @percolatorct/shared) is the only source that throws
+ * AFTER the tx confirmed on-chain: on `status.err` it throws
+ * `Transaction failed: <err json>`. So that prefix is a reliable "the tx LANDED
+ * and the program reverted" marker. Every other keeper-path throw — confirmation
+ * timeout ("... not confirmed after ...ms"), broadcast rejection, RPC/429,
+ * blockhash, signing, oversize — means the tx did NOT land.
+ *
+ * A landed-but-reverted tx proves the send path works, so it is recorded as
+ * "reverted" (counts as spend + attempt, but excluded from the success-rate
+ * breaker — see KeeperBudget.recordTx). This stops an attacker who dodges
+ * liquidations, or one reverting market, from halting the whole keeper. Anything
+ * we cannot positively identify as a revert defaults to "fail" — the safe
+ * direction, since it keeps feeding the systemic "are we landing?" guard.
+ */
+export function classifySendError(err: unknown): TxResult {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.startsWith("Transaction failed:") ? "reverted" : "fail";
+}
+
+/**
  * Send a keeper transaction with budget gate, priority-fee estimation, and CU simulation.
  *
  * Returns null if the budget is exhausted (budget.canSpend returned false) — caller
@@ -224,7 +246,10 @@ export async function keeperSend(
     result = "success";
     return { signature, estimatedCost, simulatedCu };
   } catch (err) {
-    result = "fail";
+    // A landed-but-reverted tx ("Transaction failed: ...") is recorded as
+    // "reverted" so it doesn't poison the success-rate breaker; genuine
+    // never-landed failures stay "fail". The error is rethrown unchanged.
+    result = classifySendError(err);
     throw err;
   } finally {
     budget.recordTx(estimatedCost, txType, result);

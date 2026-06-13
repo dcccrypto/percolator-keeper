@@ -320,6 +320,29 @@ describe("KeeperBudget — drop result accounting", () => {
   });
 });
 
+describe("KeeperBudget — reverted result accounting", () => {
+  it("counts toward tx count + spend but NOT the success-rate window", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+    b.recordTx(300, "liquidation", "reverted");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(300); // fees were paid — the tx landed
+    expect(s.cycleTxCount).toBe(1);
+    expect(s.hourSpend).toBe(300);
+    expect(s.daySpend).toBe(300);
+    expect(s.txWindowSize).toBe(0); // excluded from the breaker
+  });
+
+  it("a flood of reverts never trips the tx-success-rate breaker", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, maxTxPerCycle: 999, maxSolPerCycle: 1e12, maxSolPerHour: 1e12, maxSolPerDay: 1e12 }, { now: clock.now });
+    for (let i = 0; i < 50; i++) b.recordTx(1, "liquidation", "reverted");
+    expect(b.canSpend(1, "crank")).toBe(true);
+    expect(b.isHalted()).toBe(false);
+    expect(b.getStats().txSuccessRate).toBeNull(); // no success/fail samples at all
+  });
+});
+
 describe("KeeperBudget — resume() semantics", () => {
   it("resume clears halt state and lets canSpend return true again", () => {
     const clock = makeClock();

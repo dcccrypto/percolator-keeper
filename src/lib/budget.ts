@@ -21,7 +21,7 @@ import { createLogger } from "@percolatorct/shared";
 const logger = createLogger("keeper:budget");
 
 export type TxType = "crank" | "liquidation" | "oracle" | "adl";
-export type TxResult = "success" | "fail" | "drop";
+export type TxResult = "success" | "fail" | "reverted" | "drop";
 
 export interface KeeperBudgetConfig {
   /** Per cycle cap in lamports (default 50_000_000 = 0.05 SOL). */
@@ -225,8 +225,16 @@ export class KeeperBudget {
    * Record a settled tx. Called regardless of halt state — accounts for
    * in-flight txs that settle after the budget has already tripped.
    *
-   * - 'success' / 'fail': lamports are added to spend trackers (fees pay on
-   *   failed txs that landed in a block).
+   * - 'success' / 'fail' / 'reverted': lamports are added to spend trackers
+   *   (fees are paid on any tx that landed in a block).
+   * - Only 'success' and 'fail' feed the tx-success-rate window. 'reverted'
+   *   means the tx LANDED on-chain and the program returned an error — the
+   *   send path demonstrably works, so a revert is NOT an "are we landing?"
+   *   failure and must not move that breaker. Otherwise a single
+   *   persistently-reverting market, or an attacker who front-runs liquidations
+   *   to make them revert, would drive the global rate down and halt every
+   *   market (cross-market DoS). A reverting market is instead contained by the
+   *   per-market consecutiveFailures skip in crank.ts.
    * - 'drop': lamports are NOT added (we never reached the chain). Still
    *   counts toward cycleTxCount as an attempt.
    */
@@ -243,10 +251,14 @@ export class KeeperBudget {
       this._hourSpendSum += lamports;
       this._dayEvents.push({ ts: nowMs, lamports });
       this._daySpendSum += lamports;
-      const success = result === "success";
-      this._txWindow.push({ ts: nowMs, success });
-      if (success) this._txWindowSuccesses++;
-      else this._txWindowFailures++;
+      // Only landing outcomes feed the success-rate guard. A revert landed, so
+      // it is excluded from the window entirely (neither success nor failure).
+      if (result === "success" || result === "fail") {
+        const success = result === "success";
+        this._txWindow.push({ ts: nowMs, success });
+        if (success) this._txWindowSuccesses++;
+        else this._txWindowFailures++;
+      }
     }
 
     this._pruneOld(nowMs);
