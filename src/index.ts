@@ -93,14 +93,17 @@ const liquidationService = new LiquidationService(oracleService);
 const monitorService = new MonitorService();
 const fraudDetector = new FraudDetectorService(oracleService, () => crankService.getMarkets());
 
-// ADL service — gated by ADL_ENABLED=true env var until on-chain instruction
-// (PERC-8273 T8) is live and T10 devnet upgrade is done (PERC-8275).
+// ADL service — OBSERVE-ONLY, gated by ADL_ENABLED=true.
+// ExecuteAdl is admin/multisig-gated on-chain (require_admin + insurance must be
+// fully depleted); the keeper does NOT send it. Protective deleveraging happens
+// permissionlessly inside KeeperCrank/LiquidateAtOracle. This service only reports
+// when on-chain ADL preconditions are met. See services/adl.ts header.
 const adlEnabled = process.env.ADL_ENABLED === "true";
 const adlService = adlEnabled ? new AdlService() : null;
 if (adlEnabled) {
-  logger.info("ADL service enabled (ADL_ENABLED=true)");
+  logger.info("ADL service enabled (observe-only — ExecuteAdl is admin/multisig-gated)");
 } else {
-  logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
+  logger.info("ADL service disabled — set ADL_ENABLED=true for observe-only ADL monitoring");
 }
 
 // HA leader lock — null when HA_ENABLED is not set or KEEPER_REDIS_URL is absent
@@ -269,15 +272,8 @@ crankService.setStalePauseCheck(isMarketStalePaused);
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 
-// M3: wire ADL success notifications into MonitorService. MonitorService
-// already exposes notifyAdlTx() (used by the invariant gauges) but the ADL
-// service never invoked it pre-fix. Without this hook the per-market
-// `cycleCountAtLastAdl` field stays at 0 even when ADL fires, breaking the
-// "ADL stale" invariant downstream (it computes staleness as cycles-since-
-// last-ADL, which would diverge from reality forever).
-if (adlService) {
-  adlService.setOnAdlTx((slabAddress) => monitorService.notifyAdlTx(slabAddress));
-}
+// ADL is observe-only — no tx notification hook needed. ADL staleness monitoring
+// in MonitorService tracks when preconditions are met, not when txs land.
 
 // A4: deleted the per-market setInterval loop that used to live here. It was
 // unreachable: crankService.getMarkets() is called at module load time, before
@@ -562,13 +558,11 @@ res.writeHead(401, secureJsonHeaders);
     let adlStats: Record<string, unknown> | null = null;
     if (adlService) {
       const stats = adlService.getStats();
-      let totalAdlTxSent = 0;
-      let activeMarkets = 0;
+      let marketsNeedingAdl = 0;
       for (const [, s] of stats) {
-        totalAdlTxSent += s.adlTxSent;
-        if (s.adlTxSent > 0) activeMarkets++;
+        if (s.adlNeeded) marketsNeedingAdl++;
       }
-      adlStats = { enabled: true, totalAdlTxSent, activeMarkets };
+      adlStats = { enabled: true, mode: "observe-only", marketsNeedingAdl };
     } else {
       adlStats = { enabled: false };
     }

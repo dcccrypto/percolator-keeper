@@ -251,10 +251,15 @@ export class MonitorService {
         // ── 6.3: ADL staleness ─────────────────────────────────────────────
         // Check if ADL is needed by comparing pnl_pos_tot against max_pnl_cap.
         // We reuse the data already fetched above.
+        // ADL preconditions must match on-chain require checks in handle_execute_adl:
+        // 1. Insurance fund must be fully depleted (balance == 0n)
+        // 2. PnL above the cap (pnl_pos_tot > max_pnl_cap, cap > 0)
+        // ExecuteAdl is admin/multisig-gated — this is an alert path only.
         const { pnlPosTot } = engine;
         // maxPnlCap lives on MarketConfig (parseConfig), already parsed above.
         const maxPnlCap = cfg.maxPnlCap;
-        const adlNeeded = maxPnlCap > 0n && pnlPosTot > maxPnlCap;
+        const insuranceDepleted = engine.insuranceFund.balance === 0n;
+        const adlNeeded = insuranceDepleted && maxPnlCap > 0n && pnlPosTot > maxPnlCap;
 
         const mState = this._getOrCreatePerMarket(slabAddress);
         const cyclesSinceLastAdl = adlNeeded
@@ -274,7 +279,7 @@ export class MonitorService {
         this._adlStalenessResults.set(slabAddress, adlResult);
 
         if (stale) {
-          logger.warn("ADL needed but no ADL tx sent recently", {
+          logger.warn("ADL conditions met — admin/multisig action required", {
             slabAddress,
             pnlPosTot: pnlPosTot.toString(),
             maxPnlCap: maxPnlCap.toString(),

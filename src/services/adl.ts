@@ -1,61 +1,43 @@
 /**
- * ADL Service — PERC-8293 (T11): Auto-Deleverage crank loop
+ * ADL Service — OBSERVABILITY ONLY.
  *
- * Originally scaffolded as PERC-8276. Updated in T11 to add:
- *   - Insurance fund utilization BPS threshold check
- *   - Two-phase dispatch comments / scaffolding for T5 (PERC-8270)
+ * Alignment with dcccrypto/percolator-prog `main` (verified against src/percolator.rs):
+ *   `ExecuteAdl` (tag 50) is ADMIN-GATED on-chain. `handle_execute_adl`:
+ *     - percolator.rs:14537  require_admin(header.admin, accounts[0])     → signer MUST be the market admin (else EngineUnauthorized 0xf)
+ *     - percolator.rs:14590  if insurance_fund.balance != 0 → InsuranceFundNotDepleted (0x2f)
+ *     - percolator.rs:14604  if max_pnl_cap > 0 && pnl_pos_tot <= cap → InvalidArgument
  *
- * Feature-flagged via env var `ADL_ENABLED=true` so it can run alongside
- * the existing crank service without affecting production behaviour until
- * the on-chain instruction is live.
+ *   The keeper's crank key is an unprivileged operational hot wallet, NOT the market
+ *   admin — so the keeper MUST NOT send ExecuteAdl (every send would revert), and we
+ *   will NOT put an admin key on the keeper (admin also controls pause / withdraw-insurance
+ *   / resolve — unacceptable blast radius on an always-online process).
  *
- * Responsibilities:
- *  1. Per-market: fetch slab data, check `pnl_pos_tot > max_pnl_cap` OR
- *     insurance fund utilization BPS > ADL_INSURANCE_UTIL_THRESHOLD_BPS
- *  2. When ADL is needed: rank all profitable positions by PnL%
- *  3. Call ExecuteAdl (tag 50) on the top-ranked position
- *  4. Repeat until pnl_pos_tot ≤ max_pnl_cap or no profitable positions remain
+ *   Routine, protective deleveraging already happens PERMISSIONLESSLY inside
+ *   `KeeperCrank` (tag 5 → permissionless_progress_not_atomic) and `LiquidateAtOracle`
+ *   (tag 7), both already sent by the keeper. Targeted ExecuteAdl is an admin / multisig
+ *   governance action and is intentionally NOT automated here.
  *
- * Two-phase crank note (T5/PERC-8270):
- *  The on-chain two-phase split (prepare + execute) lives in the Rust program.
- *  From the keeper's perspective the call signature is unchanged — we send a
- *  single KeeperCrank transaction. When T5 lands, update the
- *  `PrepareAdlResult` / `PhaseOneKeeperArgs` types in crank-types.ts and wire
- *  the prepare step here before the ExecuteAdl dispatch.
+ * Responsibilities (read-only):
+ *  1. Per-market: fetch slab, evaluate whether the on-chain ADL preconditions are met
+ *     (insurance fully depleted AND profit above the PnL cap).
+ *  2. Expose that state + a PnL%-ranked deleverage list via getAdlState()/getStats()
+ *     for the /api/adl/rankings endpoint and the MonitorService alert.
+ *  This service sends NO transactions. Feature-flagged via `ADL_ENABLED=true`.
  *
  * Dependency surface:
- *  - @percolator/sdk:  fetchSlab, parseEngine, parseConfig, parseAllAccounts,
- *                      encodeExecuteAdl, ACCOUNTS_EXECUTE_ADL, buildAccountMetas,
- *                      buildIx, derivePythPushOraclePDA
- *  - @percolatorct/shared: getConnection, loadKeypair, sendWithRetryKeeper,
- *                        createLogger, sendWarningAlert, sendCriticalAlert
+ *  - @percolatorct/sdk:  fetchSlab, parseEngine, parseConfig, parseAllAccounts
+ *  - @percolatorct/shared: getConnection, createLogger, sendWarningAlert
  */
 
-import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   fetchSlab,
   parseEngine,
   parseConfig,
   parseAllAccounts,
-  encodeExecuteAdl,
-  ACCOUNTS_EXECUTE_ADL,
-  buildAccountMetas,
-  buildIx,
-  derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import {
-  getConnection,
-  loadKeypair,
-  createLogger,
-  sendWarningAlert,
-  sendCriticalAlert,
-} from "@percolatorct/shared";
+import { getConnection, createLogger, sendWarningAlert } from "@percolatorct/shared";
 import type { MarketCrankState } from "./crank-types.js";
-import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
-import { txSentTotal, solSpentLamportsTotal, txLandTimeSeconds } from "../lib/metrics.js";
-import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
-import { sharedTxQueue } from "../lib/tx-queue.js";
 
 const logger = createLogger("keeper:adl");
 
@@ -85,54 +67,35 @@ function parseBigIntEnv(name: string, fallback: string): bigint {
 }
 
 /**
- * How often to run the ADL scan loop in milliseconds.
- * Default 10 s — fast enough to clear excess PnL promptly; slow enough to
- * avoid hammering RPC on quiet markets.
+ * How often to run the ADL observation loop in milliseconds.
+ * Default 10 s.
  */
 const ADL_INTERVAL_MS = parseIntEnv("ADL_INTERVAL_MS", 10_000, 1000);
 
 /**
- * Maximum number of ExecuteAdl transactions sent per market per ADL scan.
- * Guards against runaway loops if on-chain state is not updating between cycles.
- */
-const ADL_MAX_TX_PER_SCAN = parseIntEnv("ADL_MAX_TX_PER_SCAN", 10, 1);
-
-/**
- * Insurance fund balance threshold below which ADL kicks in (raw lamports).
- * Set to 0 to rely solely on pnl_pos_tot > max_pnl_cap.
+ * Insurance fund utilization BPS threshold — INFORMATIONAL ONLY.
  *
- * Per PERC-305 spec: ADL is triggered when pnl_pos_tot > max_pnl_cap,
- * which is itself a proxy for insurance fund stress.  This extra guard
- * allows ops to tune ADL sensitivity independently.
+ * utilization_bps = (fee_revenue - balance) * 10_000 / max(fee_revenue, 1)
  *
- * Unit: raw lamports (bigint).  Default 0 = disabled.
- */
-const ADL_INSURANCE_THRESHOLD = parseBigIntEnv(
-  "ADL_INSURANCE_THRESHOLD_LAMPORTS", "0"
-);
-
-/**
- * PERC-8293 (T11): Insurance fund utilization BPS threshold.
- *
- * ADL also triggers when the insurance fund is sufficiently drawn down,
- * measured as:
- *   utilization_bps = (fee_revenue - balance) * 10_000 / max(fee_revenue, 1)
- *
- * This captures the fraction of lifetime fee revenue that has been consumed
- * by socialised losses.  When fee_revenue == 0 (fresh market), utilization is
- * treated as 0 (not triggered).
- *
- * Default 8000 BPS = 80% utilization triggers ADL even before pnl_pos_tot
- * exceeds max_pnl_cap.  Set to 0 to disable the utilization gate.
+ * The on-chain ADL gate is `balance == 0` (full depletion), NOT a utilization
+ * ratio, so this is exposed for dashboards/early-warning but is NOT part of the
+ * adlNeeded decision. Default 8000 BPS = 80%.
  */
 const ADL_INSURANCE_UTIL_THRESHOLD_BPS = parseBigIntEnv(
   "ADL_INSURANCE_UTIL_THRESHOLD_BPS", "8000"
 );
 
+/**
+ * Minimum gap between repeated "ADL conditions met" warning alerts per market.
+ * Avoids alert spam while conditions persist (admin/multisig action is manual).
+ */
+const ADL_ALERT_COOLDOWN_MS = parseIntEnv("ADL_ALERT_COOLDOWN_MS", 30 * 60_000, 1000);
+
 // ─── types ─────────────────────────────────────────────────────────────────
 
 interface RankedPosition {
   idx: number;
+  pnlPct: bigint;   // PnL as % of capital × 1_000_000 (fixed-point)
   pnlAbs: bigint;   // Absolute positive PnL (raw)
   capital: bigint;
 }
@@ -140,6 +103,9 @@ interface RankedPosition {
 /**
  * Result of the ADL trigger-check for a market.
  * Exposed on the /api/adl/rankings endpoint for observability.
+ *
+ * `adlNeeded` mirrors the program's ExecuteAdl preconditions: insurance fully
+ * depleted (balance == 0) AND (cap disabled with profit to shed, or pnl > cap).
  */
 export interface AdlTriggerState {
   slabAddress: string;
@@ -149,7 +115,9 @@ export interface AdlTriggerState {
   insuranceFundFeeRevenue: string;
   insuranceUtilizationBps: number;
   capExceeded: boolean;
+  /** True iff insurance_fund.balance == 0 (the program's hard ADL precondition). */
   insuranceDepleted: boolean;
+  /** Informational only — utilization >= threshold. NOT part of adlNeeded. */
   utilizationTriggered: boolean;
   adlNeeded: boolean;
   rankings: Array<{
@@ -163,8 +131,12 @@ export interface AdlTriggerState {
 
 interface AdlMarketState {
   lastScanTime: number;
-  adlTxSent: number;
-  consecutiveErrors: number;
+  /** Whether the on-chain ADL preconditions were met at the last scan. */
+  adlNeeded: boolean;
+  /** Last time (ms) adlNeeded was observed true. */
+  lastAdlNeededTime: number;
+  /** Last time (ms) an "ADL conditions met" alert was emitted for this market. */
+  lastAlertTime: number;
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -186,39 +158,43 @@ function computeInsuranceUtilizationBps(
   return bps > 10_000n ? 10_000n : bps;
 }
 
-/** Returns a structured trigger state for a market. */
+/**
+ * Evaluate the program's ExecuteAdl preconditions for a market.
+ *
+ * Mirrors handle_execute_adl (percolator.rs:14588-14612):
+ *   adlNeeded ⇔ insurance_fund.balance == 0
+ *               AND (max_pnl_cap == 0 ? pnl_pos_tot > 0 : pnl_pos_tot > max_pnl_cap)
+ */
 function checkAdlTrigger(
   pnlPosTot: bigint,
   maxPnlCap: bigint,
   insuranceFundBalance: bigint,
   insuranceFundFeeRevenue: bigint,
   slabAddress: string,
-  data: Uint8Array
 ): Omit<AdlTriggerState, "rankings"> & { excess: bigint } {
+  // Program gate (percolator.rs:14590): insurance must be FULLY depleted.
+  const insuranceDepleted = insuranceFundBalance === 0n;
+  // Program cap pre-check (percolator.rs:14604): with a cap set, pnl must exceed it.
   const capExceeded = maxPnlCap > 0n && pnlPosTot > maxPnlCap;
-  const insuranceDepleted =
-    ADL_INSURANCE_THRESHOLD > 0n &&
-    insuranceFundBalance < ADL_INSURANCE_THRESHOLD;
+
   const utilizationBps = computeInsuranceUtilizationBps(
     insuranceFundBalance,
     insuranceFundFeeRevenue
   );
+  // Informational only — the program keys off balance == 0, not a ratio.
   const utilizationTriggered =
     ADL_INSURANCE_UTIL_THRESHOLD_BPS > 0n &&
     utilizationBps >= ADL_INSURANCE_UTIL_THRESHOLD_BPS;
 
-  // ADL disabled when max_pnl_cap == 0 (matches isAdlNeeded semantics)
+  // ADL is admissible on-chain only when insurance is fully depleted AND either
+  // the cap is disabled (any profit can be shed) or profit exceeds the cap.
   const adlNeeded =
-    maxPnlCap > 0n && (capExceeded || insuranceDepleted || utilizationTriggered);
+    insuranceDepleted && (maxPnlCap === 0n ? pnlPosTot > 0n : capExceeded);
 
-  // When cap is exceeded, deleverage the overshoot.
-  // When triggered by insurance alone (cap not exceeded), deleverage 20%
-  // of pnlPosTot per scan — conservative ramp-down that lets multiple
-  // scans gradually reduce exposure without over-deleveraging.
   const excess =
-    capExceeded && maxPnlCap > 0n
-      ? pnlPosTot - maxPnlCap
-      : pnlPosTot / 5n;
+    maxPnlCap > 0n
+      ? (pnlPosTot > maxPnlCap ? pnlPosTot - maxPnlCap : 0n)
+      : pnlPosTot;
 
   return {
     slabAddress,
@@ -236,34 +212,11 @@ function checkAdlTrigger(
 }
 
 /**
- * @deprecated Use checkAdlTrigger instead.
- * Returns true when ADL should run for this market given engine state.
- */
-function isAdlNeeded(
-  pnlPosTot: bigint,
-  maxPnlCap: bigint,
-  insuranceFundBalance: bigint
-): boolean {
-  if (maxPnlCap === 0n) return false; // ADL disabled on market (max_pnl_cap=0)
-
-  const capExceeded = pnlPosTot > maxPnlCap;
-
-  // Optional insurance fund gate (operator configurable)
-  const insuranceDepleted =
-    ADL_INSURANCE_THRESHOLD > 0n &&
-    insuranceFundBalance < ADL_INSURANCE_THRESHOLD;
-
-  return capExceeded || insuranceDepleted;
-}
-
-/**
- * Rank all profitable positions by PnL% (descending).
+ * Rank all profitable positions by PnL% (descending) — the order an admin/multisig
+ * would deleverage in. Read-only; exposed via getAdlState() for tooling.
  * Uses capital as denominator; positions with zero capital are excluded.
  */
-function rankProfitablePositions(
-  data: Uint8Array,
-  excess: bigint
-): RankedPosition[] {
+function rankProfitablePositions(data: Uint8Array): RankedPosition[] {
   const allAccounts = parseAllAccounts(data);
   const profitable: RankedPosition[] = [];
 
@@ -273,36 +226,23 @@ function rankProfitablePositions(
 
     const capital = account.capital > 0n ? account.capital : 1n; // guard div-by-zero
     const pnlAbs = account.pnl;
+    // pnlPct = pnl * 1_000_000 / capital  (fixed-point, 6 decimal places)
+    const pnlPct = (pnlAbs * 1_000_000n) / capital;
 
-    profitable.push({ idx, pnlAbs, capital });
+    profitable.push({ idx, pnlPct, pnlAbs, capital });
   }
 
-  // H1: rank by exact cross-multiplied PnL ratio — no precision loss.
-  //
-  // The previous implementation computed pnlPct = (pnlAbs * 1_000_000) / capital
-  // with BigInt floor division, then sorted descending by pnlPct with a
-  // pnlAbs-descending tie-break. Two positions with materially different
-  // true ratios could share the same truncated pnlPct, and the tie-break
-  // then placed the position with the larger pnlAbs first — potentially
-  // ranking an honest counterparty ahead of an attacker who tuned their
-  // position to collide on the truncated bucket. Cross-multiplication
-  // compares a.pnl/a.cap vs b.pnl/b.cap with exact BigInt arithmetic, so
-  // every position with a higher true ratio strictly outranks every
-  // position with a lower true ratio. We tie-break on pnlAbs descending
-  // (preserved from the original behavior), then on idx ascending so the
-  // final order is fully deterministic.
+  // Sort descending by PnL%: highest earner deleveraged first.
+  // Tie-break by absolute PnL descending.
   profitable.sort((a, b) => {
-    const lhs = a.pnlAbs * b.capital;
-    const rhs = b.pnlAbs * a.capital;
-    if (lhs !== rhs) return rhs > lhs ? 1 : -1;
-    if (b.pnlAbs !== a.pnlAbs) return b.pnlAbs > a.pnlAbs ? 1 : -1;
-    return a.idx - b.idx;
+    if (b.pnlPct !== a.pnlPct) return b.pnlPct > a.pnlPct ? 1 : -1;
+    return b.pnlAbs > a.pnlAbs ? 1 : -1;
   });
 
   return profitable;
 }
 
-// ─── ADL service class ─────────────────────────────────────────────────────
+// ─── ADL service class (observe-only) ────────────────────────────────────────
 
 export class AdlService {
   private markets = new Map<string, AdlMarketState>();
@@ -310,31 +250,11 @@ export class AdlService {
   private _getMarkets: (() => Map<string, MarketCrankState>) | null = null;
   private _isRunning = false;
   private _cycling = false;
-  // Cache keypair at construction — avoids re-parsing from env on every scanMarket() call
-  private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
   private _cycleStartedAt = 0;
-  // M3: optional callback fired after each successful ExecuteAdl tx so the
-  // MonitorService can update its invariant gauges (cycleCountAtLastAdl,
-  // adlTxCounts). Mirrors CrankService.setOnCrankCycle's hook pattern.
-  // Until this is wired, MonitorService.notifyAdlTx() — exposed but never
-  // invoked — leaves ADL activity invisible on invariant dashboards.
-  private _onAdlTx?: (slabAddress: string) => void;
 
   /** Inject the crank service's market map so ADL can iterate tracked markets. */
   setMarketSource(fn: () => Map<string, MarketCrankState>): void {
     this._getMarkets = fn;
-  }
-
-  /**
-   * M3: register a callback fired by scanMarket() after each successful
-   * ExecuteAdl tx. Wired from index.ts to MonitorService.notifyAdlTx so
-   * the invariant layer can record ADL activity per market.
-   *
-   * Safe to call multiple times — the most recent callback wins. No-op if
-   * the callback throws (logged at warn).
-   */
-  setOnAdlTx(fn: (slabAddress: string) => void): void {
-    this._onAdlTx = fn;
   }
 
   get isRunning(): boolean {
@@ -342,10 +262,8 @@ export class AdlService {
   }
 
   /**
-   * PERC-8293 (T11): Fetch on-chain state and return ADL trigger info + position
-   * rankings for a single market without sending any transactions.
-   *
-   * Used by the /api/adl/rankings API endpoint.
+   * Fetch on-chain state and return ADL trigger info + position rankings for a
+   * single market. Read-only — sends nothing. Used by /api/adl/rankings.
    */
   async getAdlState(slabAddress: string, market: DiscoveredMarket): Promise<AdlTriggerState> {
     const connection = getConnection();
@@ -366,41 +284,35 @@ export class AdlService {
       engine.insuranceFund.balance,
       engine.insuranceFund.feeRevenue,
       slabAddress,
-      data
     );
 
     let rankings: AdlTriggerState["rankings"] = [];
     if (trigger.adlNeeded) {
-      const ranked = rankProfitablePositions(data, trigger.excess);
+      const ranked = rankProfitablePositions(data);
       rankings = ranked.map((r, i) => ({
         rank: i + 1,
         idx: r.idx,
         pnlAbs: r.pnlAbs.toString(),
         capital: r.capital.toString(),
-        // pnlPct is no longer stored on RankedPosition (H1 — ranking is via
-        // exact cross-multiplication). The API contract for observability
-        // still surfaces a millionths value computed on the fly.
-        pnlPctMillionths: ((r.pnlAbs * 1_000_000n) / r.capital).toString(),
+        pnlPctMillionths: r.pnlPct.toString(),
       }));
     }
 
-    return { ...trigger, rankings };
+    // Drop the internal-only `excess` field from the public shape.
+    const { excess: _excess, ...publicTrigger } = trigger;
+    return { ...publicTrigger, rankings };
   }
 
   /**
-   * Scan one market for ADL conditions.
-   * Returns number of ExecuteAdl transactions sent (0 if ADL not needed).
+   * Observe one market: evaluate the on-chain ADL preconditions and record state.
+   * Sends NO transactions (ExecuteAdl is admin/multisig-gated — see file header).
+   * Returns 1 if the market currently meets ADL preconditions, else 0.
    */
   async scanMarket(slabAddress: string, market: DiscoveredMarket): Promise<number> {
-    // B17: stamp lastScanTime on every scan so /status reports activity even
-    // when the trigger conditions are false. Without this the field stays at 0
-    // and looks like the ADL service has never run — operators can't tell
-    // "ADL is off" from "ADL is hung".
-    this._getOrCreateState(slabAddress).lastScanTime = Date.now();
+    const state = this._getOrCreateState(slabAddress);
+    state.lastScanTime = Date.now();
 
     const connection = getConnection();
-    const keypair = this._keypair;
-    const programId = market.programId;
 
     let data: Uint8Array;
     try {
@@ -422,198 +334,46 @@ export class AdlService {
       engine.insuranceFund.balance,
       engine.insuranceFund.feeRevenue,
       slabAddress,
-      data
     );
+
+    state.adlNeeded = trigger.adlNeeded;
 
     if (!trigger.adlNeeded) {
       return 0;
     }
 
-    const { excess } = trigger;
-    logger.info("ADL triggered for market", {
+    state.lastAdlNeededTime = Date.now();
+    logger.info("ADL conditions met (observe-only — ExecuteAdl is admin/multisig-gated)", {
       slabAddress,
       pnlPosTot: trigger.pnlPosTot,
       maxPnlCap: trigger.maxPnlCap,
-      excess: excess.toString(),
+      excess: trigger.excess.toString(),
       insuranceFundBalance: trigger.insuranceFundBalance,
       insuranceUtilizationBps: trigger.insuranceUtilizationBps,
-      capExceeded: trigger.capExceeded,
-      utilizationTriggered: trigger.utilizationTriggered,
     });
 
-    // ── T5 two-phase hook (PERC-8270) ─────────────────────────────────────
-    // When anchor T5 lands, add a PrepareAdl instruction dispatch here before
-    // executing ExecuteAdl. The prepare phase reads oracle/price state and
-    // writes a PrepareAdlResult PDA that the execute phase consumes.
-    //
-    // Pseudocode for when T5 is live:
-    //   const prepareData = encodePrepareAdl({ ...args });
-    //   const prepareSig = await sendWithRetryKeeper(conn, [buildIx(...)], [keypair]);
-    //   const prepareResult = await fetchPrepareAdlResult(conn, prepareResultPda);
-    //
-    // See crank-types.ts → PrepareAdlArgs / PrepareAdlResult for the scaffold.
-    // ──────────────────────────────────────────────────────────────────────
-
-    // Derive oracle key (same logic as crank.ts)
-    const pConfig = cfg;
-
-    // Rank profitable positions (reuse trigger.excess calculated above)
-    const ranked = rankProfitablePositions(data, excess);
-    if (ranked.length === 0) {
-      logger.warn("ADL: pnl_pos_tot exceeds cap but no profitable positions found — stale state?", {
-        slabAddress,
-      });
-      return 0;
+    // Rate-limited operator alert — the actual ExecuteAdl is a manual admin/multisig action.
+    const now = Date.now();
+    if (now - state.lastAlertTime > ADL_ALERT_COOLDOWN_MS) {
+      state.lastAlertTime = now;
+      sendWarningAlert("ADL conditions met — admin/multisig action required", [
+        { name: "Market", value: slabAddress.slice(0, 16) + "...", inline: false },
+        { name: "pnl_pos_tot", value: trigger.pnlPosTot, inline: true },
+        { name: "max_pnl_cap", value: trigger.maxPnlCap, inline: true },
+        { name: "insurance_balance", value: trigger.insuranceFundBalance, inline: true },
+      ])?.catch(() => {});
     }
 
-    // Determine oracle key (same logic as crank.ts)
-    const feedBytes = pConfig.indexFeedId.toBytes();
-    const isZeroFeed = feedBytes.every((b: number) => b === 0);
-    const isAdminOracle = !pConfig.oracleAuthority.equals(PublicKey.default);
-
-    let oracleKey: PublicKey;
-    if (isAdminOracle || isZeroFeed) {
-      // Admin-oracle or HYPERP mode: oracle account is the slab itself
-      oracleKey = market.slabAddress;
-    } else {
-      const feedHex = Array.from(feedBytes)
-        .map((b: number) => b.toString(16).padStart(2, "0"))
-        .join("");
-      oracleKey = derivePythPushOraclePDA(feedHex)[0];
-    }
-
-    let sent = 0;
-    let remainingExcess = excess;
-
-    for (const pos of ranked) {
-      if (sent >= ADL_MAX_TX_PER_SCAN) {
-        logger.warn("ADL: reached max tx cap per scan", {
-          slabAddress,
-          maxTxPerScan: ADL_MAX_TX_PER_SCAN,
-          remainingExcess: remainingExcess.toString(),
-        });
-        break;
-      }
-      if (remainingExcess <= 0n) break;
-
-      try {
-        const adlData = encodeExecuteAdl({ targetIdx: pos.idx });
-        const adlKeys = buildAccountMetas(ACCOUNTS_EXECUTE_ADL, [
-          keypair.publicKey,
-          market.slabAddress,
-          SYSVAR_CLOCK_PUBKEY,
-          oracleKey,
-        ]);
-        const ix = buildIx({ programId, keys: adlKeys, data: adlData });
-
-        const __t0 = Date.now();
-        recordAttempt();
-        let sig: string;
-        try {
-          // A.9: route ADL through the budget+priority-fee+CU pipeline. ADL
-          // was the only send-path that bypassed KeeperBudget; the cap that
-          // protects the keeper wallet from a runaway crank or liquidation
-          // loop did nothing for ADL until this fix.
-          // ADL is liquidation-priority — always dispatched from the liquidation lane.
-          const result = await sharedTxQueue.enqueue("liquidation", () =>
-            keeperSend(connection, [ix], [keypair], "adl", sharedBudget),
-          );
-          if (!result) {
-            logger.warn("ADL: budget gate refused send — skipping target", {
-              slabAddress,
-              targetIdx: pos.idx,
-              stats: sharedBudget.getStats(),
-            });
-            recordFailed();
-            break;
-          }
-          sig = result.signature;
-          const __tip = process.env.USE_HELIUS_SENDER === "true"
-            ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
-            : 0;
-          const __elapsed = Date.now() - __t0;
-          recordLanded(__elapsed, __tip);
-          txSentTotal.inc({ result: "success", type: "liquidation" });
-          txLandTimeSeconds.observe({ type: "liquidation", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
-          if (__tip > 0) solSpentLamportsTotal.inc({ type: "liquidation" }, __tip);
-        } catch (err) {
-          recordFailed();
-          txSentTotal.inc({ result: "fail", type: "liquidation" });
-          throw err;
-        }
-
-        logger.info("ADL tx sent", {
-          slabAddress,
-          targetIdx: pos.idx,
-          pnlPct: (Number((pos.pnlAbs * 1_000_000n) / pos.capital) / 1_000_000).toFixed(4) + "%",
-          sig,
-        });
-
-        // M3: notify the MonitorService (or any other observer) that an
-        // ExecuteAdl tx landed for this market. Pre-fix, this hook was
-        // exposed on MonitorService.notifyAdlTx() but never called — ADL
-        // success was invisible to the invariant layer's per-market gauges.
-        if (this._onAdlTx) {
-          try {
-            this._onAdlTx(slabAddress);
-          } catch (err) {
-            logger.warn("ADL onAdlTx callback threw", {
-              slabAddress,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-
-        sent++;
-        // Optimistic: reduce remaining excess by the position's PnL.
-        // On next cycle we re-fetch fresh state anyway.
-        remainingExcess =
-          remainingExcess > pos.pnlAbs ? remainingExcess - pos.pnlAbs : 0n;
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        logger.error("ADL tx failed", {
-          slabAddress,
-          targetIdx: pos.idx,
-          error: errMsg,
-        });
-
-        const state = this._getOrCreateState(slabAddress);
-        state.consecutiveErrors++;
-
-        if (state.consecutiveErrors >= 3) {
-          await sendWarningAlert("ADL consecutive failures", [
-            { name: "Market", value: slabAddress.slice(0, 12), inline: true },
-            {
-              name: "Consecutive Errors",
-              value: state.consecutiveErrors.toString(),
-              inline: true,
-            },
-            { name: "Error", value: errMsg.slice(0, 100), inline: false },
-          ]).catch(() => {});
-        }
-        // Continue to next position — one failure shouldn't abort the whole run.
-      }
-    }
-
-    if (sent > 0) {
-      const state = this._getOrCreateState(slabAddress);
-      state.adlTxSent += sent;
-      state.consecutiveErrors = 0;
-    }
-
-    return sent;
+    return 1;
   }
 
-  /** Run ADL scan across all tracked markets. */
-  async scanAll(): Promise<{ scanned: number; triggered: number; txSent: number }> {
-    if (!this._getMarkets) return { scanned: 0, triggered: 0, txSent: 0 };
+  /** Observe all tracked markets for ADL conditions. */
+  async scanAll(): Promise<{ scanned: number; needingAdl: number }> {
+    if (!this._getMarkets) return { scanned: 0, needingAdl: 0 };
 
-    // H6: Snapshot the markets Map to avoid concurrent mutation during async iteration.
-    // CrankService.discover() can add/delete markets while this loop is running.
-    const markets = new Map(this._getMarkets());
+    const markets = this._getMarkets();
     let scanned = 0;
-    let triggered = 0;
-    let txSent = 0;
+    let needingAdl = 0;
 
     for (const [slabAddress, crankState] of markets) {
       // Skip permanently-skipped markets
@@ -621,12 +381,9 @@ export class AdlService {
       if (crankState.foreignOracleSkipped) continue;
 
       try {
-        const sent = await this.scanMarket(slabAddress, crankState.market);
+        const r = await this.scanMarket(slabAddress, crankState.market);
         scanned++;
-        if (sent > 0) {
-          triggered++;
-          txSent += sent;
-        }
+        if (r > 0) needingAdl++;
       } catch (err) {
         logger.error("ADL scanMarket threw unexpectedly", {
           slabAddress,
@@ -635,7 +392,7 @@ export class AdlService {
       }
     }
 
-    return { scanned, triggered, txSent };
+    return { scanned, needingAdl };
   }
 
   start(getMarkets: () => Map<string, MarketCrankState>): void {
@@ -643,7 +400,7 @@ export class AdlService {
     this._getMarkets = getMarkets;
     this._isRunning = true;
 
-    logger.info("ADL service starting", { intervalMs: ADL_INTERVAL_MS });
+    logger.info("ADL service starting (observe-only)", { intervalMs: ADL_INTERVAL_MS });
 
     const MAX_CYCLE_MS = ADL_INTERVAL_MS * 5;
 
@@ -667,8 +424,8 @@ export class AdlService {
       this._cycleStartedAt = Date.now();
       try {
         const result = await this.scanAll();
-        if (result.triggered > 0) {
-          logger.info("ADL scan complete", result);
+        if (result.needingAdl > 0) {
+          logger.info("ADL observation complete", result);
         }
       } catch (err) {
         logger.error("ADL scan cycle error", {
@@ -693,8 +450,9 @@ export class AdlService {
     if (!this.markets.has(slabAddress)) {
       this.markets.set(slabAddress, {
         lastScanTime: 0,
-        adlTxSent: 0,
-        consecutiveErrors: 0,
+        adlNeeded: false,
+        lastAdlNeededTime: 0,
+        lastAlertTime: 0,
       });
     }
     return this.markets.get(slabAddress)!;
