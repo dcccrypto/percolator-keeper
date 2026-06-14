@@ -39,6 +39,7 @@ vi.mock('@percolatorct/shared', () => ({
     return String(err);
   }),
   sendWarningAlert: vi.fn(),
+  sendCriticalAlert: vi.fn(),
 }));
 
 import { OracleService } from '../../src/services/oracle.js';
@@ -337,6 +338,90 @@ describe('OracleService', () => {
   // Rate-limiting tests for pushPrice were removed after Phase G — admin-push
   // oracle is no longer a keeper responsibility. Pyth/Chainlink handle their
   // own rate limits upstream and Hyperp reads the DEX directly.
+
+  // M6: dual-source outage circuit breaker.
+  describe('M6: dual-null circuit breaker', () => {
+    const DUAL_NULL_THRESHOLD = 5;
+
+    function mockBothSourcesDown() {
+      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 503 } as any);
+    }
+
+    function mockBothSourcesUp() {
+      vi.mocked(fetch).mockImplementation(async (url) => {
+        const u = typeof url === 'string' ? url : (url as Request).toString();
+        if (u.includes('dexscreener')) {
+          return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }) } as any;
+        }
+        const m = u.match(/ids=([^&]+)/);
+        const mint = m ? decodeURIComponent(m[1]!) : 'UNKNOWN';
+        return { ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as any;
+      });
+    }
+
+    it('M6: does NOT fire critical alert below threshold', async () => {
+      mockBothSourcesDown();
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      for (let i = 0; i < DUAL_NULL_THRESHOLD - 1; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_BELOW', 'SLAB_M6_BELOW');
+      }
+
+      expect(criticalSpy).not.toHaveBeenCalled();
+    });
+
+    it('M6: fires critical alert exactly once at threshold (no spam on repeated outages)', async () => {
+      mockBothSourcesDown();
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      for (let i = 0; i < DUAL_NULL_THRESHOLD * 2; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_FIRE', 'SLAB_M6_FIRE');
+      }
+
+      expect(criticalSpy).toHaveBeenCalledTimes(1);
+      const [title] = criticalSpy.mock.calls[0]!;
+      expect(title).toContain('outage');
+    });
+
+    it('M6: dual-null state recovers cleanly on first successful fetch', async () => {
+      mockBothSourcesDown();
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      for (let i = 0; i < 6; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
+      }
+      expect(criticalSpy).toHaveBeenCalledTimes(1);
+
+      mockBothSourcesUp();
+      const recovered = await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
+      expect(recovered).not.toBeNull();
+      expect(recovered?.priceE6).toBe(1_000_000n);
+
+      const followUp = await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
+      expect(followUp).not.toBeNull();
+
+      expect(criticalSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('M6: does NOT fire critical alert when fresh history cache covers the gap', async () => {
+      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
+      criticalSpy.mockClear();
+
+      mockBothSourcesUp();
+      const seed = await oracleService.fetchPrice('TESTMINT_M6_CACHE', 'SLAB_M6_CACHE');
+      expect(seed).not.toBeNull();
+
+      mockBothSourcesDown();
+      for (let i = 0; i < DUAL_NULL_THRESHOLD * 2; i++) {
+        await oracleService.fetchPrice('TESTMINT_M6_CACHE', 'SLAB_M6_CACHE');
+      }
+
+      expect(criticalSpy).not.toHaveBeenCalled();
+    });
+  });
 
   describe('price history tracking', () => {
     it('should track price history up to max entries per market', async () => {
