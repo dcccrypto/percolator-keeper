@@ -89,6 +89,27 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
     }
   }
 
+  // Validate JITO_TIP_LAMPORTS at boot. It feeds estimatedCost in keeper-send
+  // (and crank/liquidation/adl) via parseInt(... ?? "200000", 10), which the
+  // KeeperBudget circuit breaker gates on. A malformed value (e.g. "abc")
+  // parses to NaN; before the canSpend NaN guard that silently disabled the
+  // breaker, and even with it the keeper would halt on first send. Reject a
+  // set-but-malformed value at boot (a clean supervisor restart) rather than
+  // discover it mid-incident. Unset/empty is fine — the read sites default to
+  // 200000. Validate with Number() (not parseInt) so "200000abc" is rejected
+  // rather than silently truncated.
+  const jitoTipRaw = env.JITO_TIP_LAMPORTS?.trim();
+  if (jitoTipRaw !== undefined && jitoTipRaw !== "") {
+    const tip = Number(jitoTipRaw);
+    if (!Number.isFinite(tip) || !Number.isInteger(tip) || tip < 0) {
+      throw new Error(
+        `JITO_TIP_LAMPORTS='${jitoTipRaw.slice(0, 20)}' is invalid — expected a ` +
+          `non-negative integer (lamports). A malformed value makes the tx-cost ` +
+          `estimate NaN and would trip the keeper spend circuit breaker.`,
+      );
+    }
+  }
+
   const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
   // K-2 (HIGH): hard-reject SUPABASE_SERVICE_ROLE_KEY being present at all.

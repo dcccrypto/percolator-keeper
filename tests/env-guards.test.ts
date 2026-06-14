@@ -454,4 +454,33 @@ describe("validateKeeperEnvGuards", () => {
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
   });
+
+  // A malformed JITO_TIP_LAMPORTS makes the tx-cost estimate NaN, which slips
+  // the budget circuit breaker's cap checks. Reject it at boot.
+  it("throws on non-numeric JITO_TIP_LAMPORTS", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "abc" } as NodeJS.ProcessEnv),
+    ).toThrow(/JITO_TIP_LAMPORTS/);
+  });
+
+  it("throws on negative JITO_TIP_LAMPORTS", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "-1" } as NodeJS.ProcessEnv),
+    ).toThrow(/JITO_TIP_LAMPORTS/);
+  });
+
+  it("throws on non-integer / trailing-garbage JITO_TIP_LAMPORTS (e.g. 200000abc)", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "200000abc" } as NodeJS.ProcessEnv),
+    ).toThrow(/JITO_TIP_LAMPORTS/);
+  });
+
+  it("accepts a valid integer JITO_TIP_LAMPORTS and accepts unset", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "200000" } as NodeJS.ProcessEnv),
+    ).not.toThrow();
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv),
+    ).not.toThrow();
+  });
 });

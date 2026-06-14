@@ -448,3 +448,107 @@ describe("KeeperBudget — counter consistency under sequential ops", () => {
     expect(stats.hourSpend).toBeLessThanOrEqual(stats.daySpend);
   });
 });
+
+describe("KeeperBudget — non-finite cost guard", () => {
+  it("canSpend(NaN) refuses and halts (fail-safe), requiring resume()", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(NaN, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("non-finite-cost");
+    // stays halted for subsequent finite sends until resume()
+    expect(b.canSpend(1, "crank")).toBe(false);
+    b.resume("op");
+    expect(b.canSpend(1, "crank")).toBe(true);
+  });
+
+  it("canSpend(Infinity) refuses and halts (defense in depth)", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(Infinity, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("non-finite-cost");
+  });
+
+  it("fires onHalt with kind=non-finite-cost", () => {
+    const onHalt = vi.fn();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now, onHalt });
+    b.canSpend(NaN, "crank");
+    expect(onHalt).toHaveBeenCalledWith("non-finite-cost", expect.any(String));
+  });
+
+  it("a NaN canSpend does not corrupt the reservation tallies", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    b.canSpend(NaN, "crank");
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.getStats().reservedTxCount).toBe(0);
+  });
+});
+
+describe("KeeperBudget — reservation / TOCTOU", () => {
+  it("a second in-flight send that only the reservation pushes over the cap is REFUSED, not halted", () => {
+    // cycle cap 1000; two 600-lamport sends in flight, neither recorded yet.
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true); // reserves 600
+    expect(b.canSpend(600, "crank")).toBe(false); // 0 + 600 reserved + 600 > 1000
+    // Concurrency back-pressure must NOT latch the breaker — nothing overspent.
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("a settled-spend breach still HALTS (unchanged semantics)", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true);
+    b.recordTx(600, "crank", "success"); // settled cycleSpend = 600, reservation released
+    // Next send's settled spend alone (600 + 600 = 1200) breaches the 1000 cap →
+    // this is a real overspend signal, so it HALTS (not mere back-pressure).
+    expect(b.canSpend(600, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("cycle-spend-cap");
+  });
+
+  it("reservation released on success: cycleSpend equals recorded amount, budget re-admits", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true);
+    b.recordTx(600, "crank", "success");
+    expect(b.getStats().cycleSpend).toBe(600);
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.canSpend(400, "crank")).toBe(true); // 600 + 0 + 400 == 1000, not > cap
+  });
+
+  it("reservation released on drop: nothing booked, reserve cleared, full budget free", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(900, "crank")).toBe(true);
+    b.recordTx(900, "crank", "drop");
+    expect(b.getStats().cycleSpend).toBe(0); // drop books nothing
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.getStats().cycleTxCount).toBe(1); // still an attempt
+    expect(b.canSpend(1_000, "crank")).toBe(true);
+  });
+
+  it("recordTx without a prior canSpend never drives the reserve negative", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    b.recordTx(500, "crank", "success"); // no reservation existed
+    expect(b.getStats().cycleSpend).toBe(500);
+    expect(b.getStats().reservedLamports).toBe(0);
+  });
+
+  it("reserved tx-count prevents concurrent overshoot of maxTxPerCycle without halting", () => {
+    // maxTxPerCycle = 5; wide spend caps so only the count matters.
+    const b = new KeeperBudget(
+      { ...TIGHT_CONFIG, maxSolPerCycle: 1_000_000, maxSolPerHour: 1_000_000, maxSolPerDay: 1_000_000 },
+      { now: makeClock().now },
+    );
+    for (let i = 0; i < 5; i++) expect(b.canSpend(1, "crank")).toBe(true); // reserve 5 tx
+    expect(b.canSpend(1, "crank")).toBe(false); // 0 + 5 reserved + 1 > 5 → refuse
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("beginCycle does not orphan in-flight reservations", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true); // reserve 600 (in flight)
+    b.beginCycle(); // a new cycle starts while the send is still on the wire
+    expect(b.getStats().reservedLamports).toBe(600); // reservation survives
+    // the in-flight send settles into the new cycle and releases its reservation
+    b.recordTx(600, "crank", "success");
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.getStats().cycleSpend).toBe(600);
+  });
+});

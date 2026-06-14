@@ -54,6 +54,10 @@ export interface BudgetStats {
   hourSpend: number;
   daySpend: number;
   cycleTxCount: number;
+  /** Lamports reserved by in-flight canSpend()s not yet settled by recordTx(). */
+  reservedLamports: number;
+  /** Count of in-flight canSpend()s not yet settled by recordTx(). */
+  reservedTxCount: number;
   txSuccessRate: number | null;
   txWindowSize: number;
   halted: boolean;
@@ -68,6 +72,7 @@ export type HaltKind =
   | "day-spend-cap"
   | "cycle-tx-count-cap"
   | "tx-success-rate"
+  | "non-finite-cost"
   | "operator";
 
 export interface KeeperBudgetDeps {
@@ -153,6 +158,17 @@ export class KeeperBudget {
   private _txWindowSuccesses = 0;
   private _txWindowFailures = 0;
 
+  // In-flight reservations. canSpend() reserves the proposed cost (and one tx
+  // slot) when it admits a send; recordTx() releases it when the send settles.
+  // The cap checks count reservations so concurrent in-flight sends — booked by
+  // recordTx only AFTER their network await — cannot all clear the same
+  // pre-send snapshot and collectively overshoot a cap (TOCTOU). Reservations
+  // are kept entirely separate from _cycleSpend/_hourSpendSum/etc., so
+  // getStats().cycleSpend still equals the sum of booked (non-drop) recordTx
+  // calls — the recordTx-only accounting and its property tests are unchanged.
+  private _reservedLamports = 0;
+  private _reservedTxCount = 0;
+
   private _isHalted = false;
   private _haltKind: HaltKind | undefined;
   private _haltReason: string | undefined;
@@ -176,10 +192,29 @@ export class KeeperBudget {
   canSpend(lamports: number, txType: TxType): boolean {
     if (this._isHalted) return false;
 
+    // A non-finite or negative cost means the fee/CU/tip math produced NaN or
+    // Infinity — almost always a malformed numeric env (e.g. JITO_TIP_LAMPORTS).
+    // NaN slips every `x > cap` comparison below (NaN > cap === false), so it
+    // would otherwise be admitted, silently disabling the breaker. Treat it as a
+    // hard fault: refuse and halt so an operator fixes the config and resume()s.
+    // Checked first so the bad value never enters a comparison and never reserves.
+    if (!Number.isFinite(lamports) || lamports < 0) {
+      this._halt(
+        "non-finite-cost",
+        `proposed cost ${lamports} is not a finite non-negative number — likely a malformed fee env (txType=${txType})`,
+      );
+      return false;
+    }
+
     const nowMs = this._now();
     this._rollCycleIfElapsed(nowMs);
     this._pruneOld(nowMs);
 
+    // ── Settled-spend breaches HALT (latching, manual-resume) ──────────────
+    // These mirror the historical behavior exactly: if the ALREADY-BOOKED spend
+    // plus this one cost would breach a cap, that is a real overspend signal and
+    // the breaker latches. Reservations are intentionally excluded here so the
+    // halt semantics (and the existing cap tests) are unchanged.
     if (this._cycleSpend + lamports > this.config.maxSolPerCycle) {
       this._halt(
         "cycle-spend-cap",
@@ -218,6 +253,26 @@ export class KeeperBudget {
       return false;
     }
 
+    // ── Reservation back-pressure: REFUSE without halting ──────────────────
+    // The settled spend alone is within every cap, but in-flight (reserved)
+    // sends would push this one over. That is concurrency back-pressure, not
+    // overspend — nothing has been over-spent yet, and capacity returns as the
+    // in-flight sends settle and release. Refuse this send (the caller skips it
+    // and retries next cycle) rather than latching the breaker, which would
+    // stall the keeper during exactly the bursts it exists to handle.
+    if (
+      this._cycleSpend + this._reservedLamports + lamports > this.config.maxSolPerCycle ||
+      this._hourSpendSum + this._reservedLamports + lamports > this.config.maxSolPerHour ||
+      this._daySpendSum + this._reservedLamports + lamports > this.config.maxSolPerDay ||
+      this._cycleTxCount + this._reservedTxCount + 1 > this.config.maxTxPerCycle
+    ) {
+      return false;
+    }
+
+    // All checks passed — reserve before returning true so a concurrent
+    // canSpend() sees this in-flight cost. recordTx() releases the reservation.
+    this._reservedLamports += lamports;
+    this._reservedTxCount += 1;
     return true;
   }
 
@@ -243,6 +298,16 @@ export class KeeperBudget {
     const nowMs = this._now();
     // Roll before counting so this tx lands in the current window.
     this._rollCycleIfElapsed(nowMs);
+
+    // Release the reservation taken by the matching canSpend() (keeperSend
+    // passes the same estimatedCost to both, and guarantees exactly one
+    // recordTx per reserving canSpend via try/finally). Clamped at >= 0 so
+    // recordTx-only callers (tests, or a settled tx that was never reserved)
+    // cannot drive the tally negative — this is what keeps the cycleSpend-sum
+    // invariant exact: reservations never touch the booked spend below.
+    this._reservedLamports = Math.max(0, this._reservedLamports - lamports);
+    this._reservedTxCount = Math.max(0, this._reservedTxCount - 1);
+
     this._cycleTxCount++;
 
     if (result !== "drop") {
@@ -286,6 +351,11 @@ export class KeeperBudget {
     this._cycleSpend = 0;
     this._cycleTxCount = 0;
     this._cycleStartMs = this._now();
+    // Intentionally does NOT reset _reservedLamports / _reservedTxCount:
+    // reservations track sends that are still in flight and may straddle a cycle
+    // boundary (canSpend in cycle N, recordTx in cycle N+1). Clearing them here
+    // would orphan the pending release and let the new cycle over-admit by the
+    // number of in-flight sends. They self-clear as each in-flight recordTx lands.
   }
 
   getStats(): BudgetStats {
@@ -297,6 +367,8 @@ export class KeeperBudget {
       hourSpend: this._hourSpendSum,
       daySpend: this._daySpendSum,
       cycleTxCount: this._cycleTxCount,
+      reservedLamports: this._reservedLamports,
+      reservedTxCount: this._reservedTxCount,
       txSuccessRate: this._computeSuccessRate(),
       txWindowSize: this._txWindow.length,
       halted: this._isHalted,

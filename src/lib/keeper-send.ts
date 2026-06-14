@@ -200,83 +200,99 @@ export async function keeperSend(
       estimatedCost,
       stats: budget.getStats(),
     });
-    return null;
+    return null; // canSpend returned false → no reservation was taken
   }
 
-  // A.10 (HIGH): DRY_RUN intercepts before the real send. The shadow-keeper
-  // harness compares would-have-fired decisions against the live keeper's
-  // tx history; that comparison needs the full ix payload + accounts +
-  // estimated cost recorded against the same budget so runaway-fire is also
-  // detectable in dry runs. Logged at info so the harness can ingest it.
-  if (process.env.DRY_RUN === "true") {
-    const signature = `dry_run_${randomUUID()}`;
-    const accountKeys = instructions.flatMap((ix) =>
-      ix.keys.map((k) => k.pubkey.toBase58()),
-    );
-    logger.info("DRY_RUN: intercepted send", {
-      txType,
-      signature,
-      estimatedCost,
-      simulatedCu,
-      instructions: instructions.map((ix) => ({
-        programId: ix.programId.toBase58(),
-        accountKeys: ix.keys.map((k) => ({
-          pubkey: k.pubkey.toBase58(),
-          isSigner: k.isSigner,
-          isWritable: k.isWritable,
-        })),
-        dataBase64: Buffer.from(ix.data).toString("base64"),
-      })),
-      uniqueAccounts: Array.from(new Set(accountKeys)),
-    });
-
-    // When the shadow harness is enabled, log the decision for the comparison
-    // loop. Errors are swallowed inside DecisionLog.append() — they must never
-    // propagate here. When SHADOW_HARNESS_ENABLED is false, this branch still
-    // runs but the append is still called; the decisionLog.append itself is a
-    // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
-    // inside append() rather than here to keep this path readable.
-    if (process.env.SHADOW_HARNESS_ENABLED === "true") {
-      const firstIx = instructions[0];
-      // The market is the first non-system account from the first instruction.
-      // For crank/liquidation/adl ixs the slab address is always at index 0.
-      const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
-      const instructionData =
-        firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
-      void sharedDecisionLog.append({
-        timestamp: new Date().toISOString(),
-        txType,
-        market,
-        accounts: Array.from(new Set(accountKeys)),
-        instructionData,
-        estimatedCost,
-        reasonChain: [],
-      });
-    }
-
-    budget.recordTx(estimatedCost, txType, "success");
-    return { signature, estimatedCost, simulatedCu };
-  }
-
-  const opts: KeeperSendOptions = {
-    ...keeperOpts,
-    // Saves ~20-50ms on mainnet when Helius Sender runs its own preflight downstream.
-    ...(isMainnetSender() ? { skipPreflight: true } : {}),
+  // canSpend() reserved `estimatedCost` (and one tx slot). We MUST release it
+  // with exactly one recordTx() on every exit path — a reservation that is
+  // never released leaks, silently shrinking the budget's effective cap until
+  // it wedges (worse than the TOCTOU it fixes). The idempotent `release` plus
+  // the outer try/finally guarantee the reservation is freed exactly once even
+  // on an unexpected throw between here and the send.
+  let recorded = false;
+  const release = (result: TxResult): void => {
+    if (recorded) return;
+    recorded = true;
+    budget.recordTx(estimatedCost, txType, result);
   };
 
-  let result: TxResult = "fail";
-  let signature = "";
   try {
-    signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
-    result = "success";
-    return { signature, estimatedCost, simulatedCu };
-  } catch (err) {
-    // A landed-but-reverted tx ("Transaction failed: ...") is recorded as
-    // "reverted" so it doesn't poison the success-rate breaker; genuine
-    // never-landed failures stay "fail". The error is rethrown unchanged.
-    result = classifySendError(err);
-    throw err;
+    // A.10 (HIGH): DRY_RUN intercepts before the real send. The shadow-keeper
+    // harness compares would-have-fired decisions against the live keeper's
+    // tx history; that comparison needs the full ix payload + accounts +
+    // estimated cost recorded against the same budget so runaway-fire is also
+    // detectable in dry runs. Logged at info so the harness can ingest it.
+    if (process.env.DRY_RUN === "true") {
+      const signature = `dry_run_${randomUUID()}`;
+      const accountKeys = instructions.flatMap((ix) =>
+        ix.keys.map((k) => k.pubkey.toBase58()),
+      );
+      logger.info("DRY_RUN: intercepted send", {
+        txType,
+        signature,
+        estimatedCost,
+        simulatedCu,
+        instructions: instructions.map((ix) => ({
+          programId: ix.programId.toBase58(),
+          accountKeys: ix.keys.map((k) => ({
+            pubkey: k.pubkey.toBase58(),
+            isSigner: k.isSigner,
+            isWritable: k.isWritable,
+          })),
+          dataBase64: Buffer.from(ix.data).toString("base64"),
+        })),
+        uniqueAccounts: Array.from(new Set(accountKeys)),
+      });
+
+      // When the shadow harness is enabled, log the decision for the comparison
+      // loop. Errors are swallowed inside DecisionLog.append() — they must never
+      // propagate here. When SHADOW_HARNESS_ENABLED is false, this branch still
+      // runs but the append is still called; the decisionLog.append itself is a
+      // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
+      // inside append() rather than here to keep this path readable.
+      if (process.env.SHADOW_HARNESS_ENABLED === "true") {
+        const firstIx = instructions[0];
+        // The market is the first non-system account from the first instruction.
+        // For crank/liquidation/adl ixs the slab address is always at index 0.
+        const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
+        const instructionData =
+          firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
+        void sharedDecisionLog.append({
+          timestamp: new Date().toISOString(),
+          txType,
+          market,
+          accounts: Array.from(new Set(accountKeys)),
+          instructionData,
+          estimatedCost,
+          reasonChain: [],
+        });
+      }
+
+      release("success");
+      return { signature, estimatedCost, simulatedCu };
+    }
+
+    const opts: KeeperSendOptions = {
+      ...keeperOpts,
+      // Saves ~20-50ms on mainnet when Helius Sender runs its own preflight downstream.
+      ...(isMainnetSender() ? { skipPreflight: true } : {}),
+    };
+
+    try {
+      const signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
+      release("success");
+      return { signature, estimatedCost, simulatedCu };
+    } catch (err) {
+      // A landed-but-reverted tx ("Transaction failed: ...") is recorded as
+      // "reverted" so it doesn't poison the success-rate breaker; genuine
+      // never-landed failures stay "fail". The error is rethrown unchanged.
+      release(classifySendError(err));
+      throw err;
+    }
   } finally {
-    budget.recordTx(estimatedCost, txType, result);
+    // Safety net: if a path above reserved but never recorded (an unexpected
+    // throw before release ran), free the reservation as a drop — no spend is
+    // booked because nothing reached the chain. No-op if already released.
+    release("drop");
   }
 }
