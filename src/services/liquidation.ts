@@ -137,9 +137,36 @@ function detectOracleMode(cfg: { oracleAuthority: PublicKey; indexFeedId: Public
 }
 
 /**
+ * H3: Read the current cluster Unix time from the Solana Clock sysvar.
+ * Using cluster time avoids false-positive staleness verdicts when the
+ * keeper host clock drifts (skew, leap-second, VM pause). Falls back to
+ * Date.now()/1000 on RPC error so a failing RPC doesn't break liquidation.
+ */
+async function fetchClusterUnixTimeSec(connection: import("@solana/web3.js").Connection): Promise<bigint> {
+  try {
+    const info = await connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY);
+    if (info && info.data.length >= 40) {
+      // Clock sysvar layout: slot(u64,8) + epoch_start_timestamp(i64,8) +
+      //   epoch(u64,8) + leader_schedule_epoch(u64,8) + unix_timestamp(i64,8)
+      const buf = Buffer.from(info.data);
+      const ts = buf.readBigInt64LE(32);
+      return ts > 0n ? ts : BigInt(Math.floor(Date.now() / 1000));
+    }
+  } catch (err) {
+    logger.warn("fetchClusterUnixTimeSec: RPC error, falling back to Date.now()", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return BigInt(Math.floor(Date.now() / 1000));
+}
+
+/**
  * Resolve the effective price for a market based on its oracle mode.
  * Both scanMarket and liquidate call this to ensure identical price selection
  * logic, including the staleness fallback for admin-oracle markets.
+ *
+ * nowSec: current cluster Unix timestamp (from fetchClusterUnixTimeSec).
+ * Using cluster time rather than Date.now() avoids false staleness on clock skew.
  *
  * Returns 0n if no valid price is available.
  */
@@ -152,6 +179,7 @@ function resolveMarketPrice(
     authorityTimestamp: bigint;
   },
   mode: OracleMode,
+  nowSec: bigint,
 ): { price: bigint; stale: boolean } {
   if (mode === "pyth-pinned") {
     return { price: cfg.lastEffectivePriceE6, stale: false };
@@ -160,8 +188,7 @@ function resolveMarketPrice(
     return { price: cfg.lastEffectivePriceE6, stale: false };
   }
   // Admin oracle: try authorityPriceE6 with off-chain staleness check
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
+  const priceAge = cfg.authorityTimestamp > 0n ? nowSec - cfg.authorityTimestamp : nowSec;
   const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
 
   if (authorityFresh) {
@@ -267,9 +294,14 @@ export class LiquidationService {
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
 
+      // H3: Use cluster clock for admin-oracle staleness to avoid false positives
+      // from keeper host clock drift.
+      const connection = getConnection();
+      const nowSec = await fetchClusterUnixTimeSec(connection);
+
       // Determine oracle mode and resolve price via shared helpers
       const oracleMode = detectOracleMode(cfg);
-      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode);
+      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode, nowSec);
 
       let price: bigint;
       if (oracleMode === "pyth-pinned") {
@@ -454,8 +486,10 @@ export class LiquidationService {
 
         // Use the same price source as scanMarket via shared helpers
         // (fixes bug where admin-oracle staleness fallback was missing here)
+        // H3: Use cluster clock for staleness to match scanMarket behavior.
+        const freshNowSec = await fetchClusterUnixTimeSec(connection);
         const freshMode = detectOracleMode(freshCfg);
-        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
+        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode, freshNowSec);
 
         // H2: fail-safe when no usable price is available. The previous
         // `if (freshPrice > 0n) { ...recheck... }` envelope silently skipped
