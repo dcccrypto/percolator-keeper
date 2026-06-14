@@ -767,20 +767,163 @@ describe('CrankService', () => {
       }
     });
 
-    it('PERC-1254: should crank Hyperp market once fetchPrice returns a valid price', async () => {
+    it('PoC: a seedable HYPERP market (DEX pool configured, zero mark, keeper is authority) is wrongly skipped by crankAll before UpdateHyperpMark can seed it', async () => {
+      // The wedge: crankAll's pre-filter skips HYPERP markets where the keeper is
+      // the (now-vestigial) oracle authority and the mark is still 0 — BEFORE
+      // crankMarket runs. But crankMarket is where the permissionless
+      // UpdateHyperpMark (which seeds hyperp_mark_e6 from the DEX pool) lives. A
+      // market with a configured DEX pool is seedable in exactly one crank, yet
+      // it is skipped forever: mark stays 0 → skipped again next cycle. It never
+      // cranks and never liquidates.
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000, simulatedCu: 10000 } as any);
+
+      const slab = 'HyperpWedge11111111111111111111111111111';
+      const ZERO = new Uint8Array(32);
+      const KEEPER = '11111111111111111111111111111112';
+      const POOL = 'So11111111111111111111111111111111111111112';
+
+      vi.mocked(shared.loadKeypair).mockReturnValue({
+        publicKey: { toBase58: () => KEEPER, equals: (o: any) => o?.toBase58?.() === KEEPER },
+        secretKey: new Uint8Array(64),
+      } as any);
+
+      const localCrank = new CrankService(mockOracleService);
+
+      const market = {
+        slabAddress: { toBase58: () => slab, equals: (_o: any) => false },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'MintWedge11111111111111111111111111111' },
+          indexFeedId: { toBytes: () => ZERO, equals: (_o: any) => false }, // HYPERP
+          // Keeper IS the (vestigial) oracle authority — the condition that pre-fix forces the skip.
+          oracleAuthority: { toBase58: () => KEEPER, equals: (o: any) => o?.toBase58?.() === KEEPER },
+          authorityPriceE6: BigInt(0), // mark not yet seeded
+          lastEffectivePriceE6: BigInt(0),
+          dexPool: { toBase58: () => POOL }, // a DEX pool IS pinned → seedable via UpdateHyperpMark
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminWedge1111111111111111111111111111' } },
+      };
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
+
+      try {
+        await localCrank.discover();
+        // Pre-cache pool metadata so crankMarket's UpdateHyperpMark build skips RPC.
+        const state = localCrank.getMarkets().get(slab)!;
+        state.dexPoolResolvedAddress = POOL;
+        state.dexPoolRemainingAccounts = [];
+
+        const result = await localCrank.crankAll();
+
+        // Seedable market must reach crankMarket so UpdateHyperpMark can seed it.
+        expect(keeperSendModule.keeperSend).toHaveBeenCalled(); // FAILS on main: skipped before crankMarket
+        expect(result.success).toBe(1);
+        expect(result.skipped).toBe(0);
+      } finally {
+        localCrank.stop();
+      }
+    });
+
+    it('still skips a zero-mark HYPERP market with NO DEX pool, regardless of authority (foreign authority)', async () => {
+      // Guards that the fix NARROWED the skip (now keyed on no-DEX-pool), not removed it.
+      // On main this foreign-authority case was NOT skipped (the gate required
+      // keeper==authority) → it flowed to a crank-only tx that reverts 0xc every cycle.
+      // Post-fix it is an honest skip — an improvement, not a regression.
+      const slab = 'HyperpNoPoolFA11111111111111111111111111';
+      const ZERO = new Uint8Array(32);
+      const KEEPER = '11111111111111111111111111111112';
+
+      vi.mocked(shared.loadKeypair).mockReturnValue({
+        publicKey: { toBase58: () => KEEPER, equals: (o: any) => o?.toBase58?.() === KEEPER },
+        secretKey: new Uint8Array(64),
+      } as any);
+      const localCrank = new CrankService(mockOracleService);
+
+      const market = {
+        slabAddress: { toBase58: () => slab, equals: (_o: any) => false },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'MintNoPoolFA111111111111111111111111111' },
+          indexFeedId: { toBytes: () => ZERO, equals: (_o: any) => false }, // HYPERP
+          // Foreign authority — NOT the keeper.
+          oracleAuthority: { toBase58: () => 'ForeignAuthNP11111111111111111111111111', equals: (_o: any) => false },
+          authorityPriceE6: BigInt(0), // unseeded
+          lastEffectivePriceE6: BigInt(0),
+          // no dexPool, and no Supabase fallback set → genuinely un-seedable
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminNoPoolFA1111111111111111111111111' } },
+      };
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
+      try {
+        await localCrank.discover();
+        const result = await localCrank.crankAll();
+        expect(result.skipped).toBe(1);
+        expect(result.failed).toBe(0);
+        expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
+        expect(localCrank.getMarkets().get(slab)!.hyperpNoPriceSkipped).toBe(true);
+      } finally {
+        localCrank.stop();
+      }
+    });
+
+    it('cranks a zero-mark HYPERP market seedable only via the Supabase DEX-pool fallback (OR over both pool sources)', async () => {
+      // Exercises the second arm of hasDexPoolToSeed: on-chain config.dexPool is
+      // null but state.dexPoolAddress (Supabase) is set. An AND check would
+      // re-wedge this market; the OR check correctly routes it to crankMarket.
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000, simulatedCu: 10000 } as any);
+      const slab = 'HyperpSupabasePool1111111111111111111111';
+      const ZERO = new Uint8Array(32);
+      const KEEPER = '11111111111111111111111111111112';
+      const POOL = 'So11111111111111111111111111111111111111112';
+
+      vi.mocked(shared.loadKeypair).mockReturnValue({
+        publicKey: { toBase58: () => KEEPER, equals: (o: any) => o?.toBase58?.() === KEEPER },
+        secretKey: new Uint8Array(64),
+      } as any);
+      const localCrank = new CrankService(mockOracleService);
+
+      const market = {
+        slabAddress: { toBase58: () => slab, equals: (_o: any) => false },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'MintSupaPool11111111111111111111111111' },
+          indexFeedId: { toBytes: () => ZERO, equals: (_o: any) => false }, // HYPERP
+          oracleAuthority: { toBase58: () => KEEPER, equals: (o: any) => o?.toBase58?.() === KEEPER },
+          authorityPriceE6: BigInt(0), // unseeded
+          lastEffectivePriceE6: BigInt(0),
+          dexPool: null, // no on-chain pinned pool ...
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminSupaPool1111111111111111111111111' } },
+      };
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
+      try {
+        await localCrank.discover();
+        const state = localCrank.getMarkets().get(slab)!;
+        state.dexPoolAddress = POOL; // ... only the Supabase fallback is available
+        state.dexPoolResolvedAddress = POOL; // pre-cache so crankMarket skips RPC
+        state.dexPoolRemainingAccounts = [];
+
+        const result = await localCrank.crankAll();
+        expect(keeperSendModule.keeperSend).toHaveBeenCalled();
+        expect(result.skipped).toBe(0);
+        expect(result.success).toBe(1);
+      } finally {
+        localCrank.stop();
+      }
+    });
+
+    it('PERC-1254: skips an unseeded HYPERP market with no DEX pool, then cranks it once a pool is configured', async () => {
       vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000 } as any);
 
       const slabHyperp = 'HyperpWithPrice111111111111111111111111';
       const ZERO_BYTES = new Uint8Array(32);
       const KEEPER_PUBKEY_STR2 = '11111111111111111111111111111112';
-
-      const keeperOracleAuth2 = {
-        toBase58: () => KEEPER_PUBKEY_STR2,
-        equals: (other: any) => {
-          if (other?.toBase58) return other.toBase58() === KEEPER_PUBKEY_STR2;
-          return false;
-        },
-      };
+      const POOL = 'So11111111111111111111111111111111111111112';
 
       // Set mock BEFORE constructing the local service so _keypair cache picks it up.
       vi.mocked(shared.loadKeypair).mockReturnValue({
@@ -800,12 +943,15 @@ describe('CrankService', () => {
         config: {
           collateralMint: { toBase58: () => 'Mint3111111111111111111111111111111111' },
           indexFeedId: { toBytes: () => ZERO_BYTES, equals: (o: any) => false },
-          oracleAuthority: keeperOracleAuth2,
-          authorityPriceE6: BigInt(0),
+          // Keeper is the (vestigial) authority — under the old code this forced a
+          // skip even once a pool was available; it must not anymore.
+          oracleAuthority: {
+            toBase58: () => KEEPER_PUBKEY_STR2,
+            equals: (other: any) => other?.toBase58?.() === KEEPER_PUBKEY_STR2,
+          },
+          authorityPriceE6: BigInt(0), // unseeded
           lastEffectivePriceE6: BigInt(1_000_000),
-          // New model: a HYPERP market refreshes its mark from a pinned DEX pool
-          // (UpdateHyperpMark), not an off-chain fetchPrice.
-          dexPool: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          dexPool: null, // no pinned DEX pool yet → genuinely un-seedable this cycle
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: { toBase58: () => 'Admin311111111111111111111111111111111' } },
@@ -814,19 +960,21 @@ describe('CrankService', () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([hyperpMarket as any]);
 
       try {
-        // First cycle: no price
-        mockOracleService.fetchPrice = vi.fn().mockResolvedValue(null);
+        // First cycle: zero mark AND no DEX pool → un-seedable → skipped (not failed).
         await localCrank.discover();
         const result1 = await localCrank.crankAll();
         expect(result1.failed).toBe(0);
-        const stateAfterSkip = localCrank.getMarkets().get(slabHyperp)!;
-        expect(stateAfterSkip.hyperpNoPriceSkipped).toBe(true);
+        expect(result1.skipped).toBe(1);
+        const state = localCrank.getMarkets().get(slabHyperp)!;
+        expect(state.hyperpNoPriceSkipped).toBe(true);
 
-        // Second cycle: the pinned DEX pool is now resolved (cached), so
-        // UpdateHyperpMark can refresh the mark. Simulate discovery resetting the flag.
-        stateAfterSkip.hyperpNoPriceSkipped = false;
-        stateAfterSkip.dexPoolResolvedAddress = 'So11111111111111111111111111111111111111112';
-        stateAfterSkip.dexPoolRemainingAccounts = [];
+        // A DEX pool is now configured (admin SetDexPool / Supabase). The market
+        // becomes seedable, so crankMarket sends UpdateHyperpMark + crank. Pre-cache
+        // the resolved pool metadata so the build skips the RPC vault lookup.
+        state.hyperpNoPriceSkipped = false;
+        state.dexPoolAddress = POOL;
+        state.dexPoolResolvedAddress = POOL;
+        state.dexPoolRemainingAccounts = [];
 
         const result2 = await localCrank.crankMarket(slabHyperp);
         expect(result2).toBe(true);

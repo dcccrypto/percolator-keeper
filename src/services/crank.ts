@@ -1027,13 +1027,6 @@ export class CrankService {
 
   const MAX_CONSECUTIVE_FAILURES = 10;
 
-  // GH#1251: Load the keeper key once here so we can check authority live.
-  // We re-evaluate foreign oracle authority at crankAll time rather than relying on
-  // state.foreignOracleSkipped.  After discover() resets the flag, crankMarket() would
-  // return false (and set failed++) instead of skipped.  Checking here means those markets
-  // are categorised as skipped before they even enter the crank queue.
-  const keeperKey = this._keypair.publicKey;
-
   const toCrank: string[] = [];
 
   for (const [slabAddress, state] of this.markets) {
@@ -1049,23 +1042,31 @@ export class CrankService {
     // Skipping markets whose keeper != hyperp_authority false-skipped crankable
     // markets, so the check is gone. (skippedForeignOracle stays 0.)
 
-    // PERC-1254: Live Hyperp-no-price check.
-    // Condition: admin-oracle market where keeper IS the authority, indexFeedId=all-zeros
-    // (Hyperp mode), and on-chain authority_price_e6 is still 0.  Sending KeeperCrank in
-    // this state causes OracleInvalid (0xc).  Skip eagerly — crankMarket() would return
-    // false and the batch counts it as failed rather than skipped.
-    // The flag (state.hyperpNoPriceSkipped) is set here for the first time on new markets
-    // so crankMarket's guard also short-circuits on subsequent calls.
+    // PERC-1254: Live HYPERP-no-mark check.
+    // Skip a HYPERP market (index_feed_id == [0;32]) ONLY when it is genuinely
+    // un-seedable this cycle: its on-chain mark is still 0 AND there is no DEX
+    // pool to seed it from. A zero-mark HYPERP KeeperCrank reverts with
+    // OracleInvalid (0xc) on-chain (the engine's oracle read errors when the
+    // mark is 0), so skipping such a market avoids per-cycle failure spam.
+    //
+    // crankMarket() seeds hyperp_mark_e6 via the PERMISSIONLESS UpdateHyperpMark
+    // instruction whenever a DEX pool resolves (on-chain config.dexPool, else the
+    // Supabase fallback state.dexPoolAddress — same order crankMarket uses). So a
+    // market WITH a pool is seedable in one cycle and MUST reach crankMarket;
+    // skipping it here wedges it forever (mark stays 0 → skipped again → never
+    // cranks or liquidates). The old `isAdminOracle && keeper == oracleAuthority`
+    // gating was a pre-Phase-G artifact (oracle_authority is now the vestigial
+    // hyperp_authority and does NOT gate cranking) and was exactly what wedged
+    // keeper-authority markets — dropped here to match isHyperpOracle/crankMarket.
     {
-      const isHyperpAdminOwner =
-        this.isAdminOracle(state.market) &&
-        keeperKey.equals(state.market.config.oracleAuthority) &&
-        state.market.config.indexFeedId.toBytes().every((b: number) => b === 0);
-      const onChainPriceZero = (state.market.config.authorityPriceE6 ?? BigInt(0)) === BigInt(0);
-      if (isHyperpAdminOwner && onChainPriceZero) {
+      const isHyperp = this.isHyperpOracle(state.market);
+      const onChainMarkZero = (state.market.config.authorityPriceE6 ?? BigInt(0)) === BigInt(0);
+      const hasDexPoolToSeed =
+        state.market.config.dexPool != null || state.dexPoolAddress != null;
+      if (isHyperp && onChainMarkZero && !hasDexPoolToSeed) {
         if (!state.hyperpNoPriceSkipped) {
           state.hyperpNoPriceSkipped = true;
-          logger.debug("crankAll: Hyperp-mode market with zero authority_price_e6 — skipping to prevent OracleInvalid (0xc)", { slabAddress });
+          logger.debug("crankAll: HYPERP market with zero mark and no DEX pool to seed from — skipping to prevent OracleInvalid (0xc). Admin must call SetDexPool.", { slabAddress });
         }
         skippedHyperpNoPrice++;
         continue;
