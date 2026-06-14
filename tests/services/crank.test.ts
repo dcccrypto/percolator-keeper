@@ -318,6 +318,53 @@ describe('CrankService', () => {
       expect(isDueAt121s).toBe(true);
     });
 
+    // M9: lastCrankTime must advance on FAILURE too, not just success. Pre-fix,
+    // a market failing every cycle had a stale lastCrankTime, so the isDue
+    // back-off (from 30s active → 120s inactive after 10 failures) never
+    // actually fired — the keeper kept cranking the dead market every 30s.
+    it('M9: lastCrankTime advances on failure (inactive back-off interval is honored)', async () => {
+      const slabAddress = 'MarketM9LastCrankAaaaaaaaaaaaaaaaaaaaaaa';
+      const mockMarket = {
+        slabAddress: { toBase58: () => slabAddress },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'MintM9111111111111111111111111111111111' },
+          oracleAuthority: { toBase58: () => '11111111111111111111111111111111', equals: () => true },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminM9Last1111111111111111111111111111' } },
+      };
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
+      await crankService.discover();
+
+      // Anchor time. A fresh market has lastCrankTime=0 (never cranked).
+      const t0 = 1_700_000_000_000;
+      vi.setSystemTime(t0);
+
+      const stateBefore = crankService.getMarkets().get(slabAddress)!;
+      expect(stateBefore.lastCrankTime).toBe(0);
+
+      // First crankMarket attempt fails. lastCrankTime must advance.
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('rpc error'));
+      const result = await crankService.crankMarket(slabAddress);
+      expect(result).toBe(false);
+
+      const stateAfterOneFailure = crankService.getMarkets().get(slabAddress)!;
+      expect(stateAfterOneFailure.consecutiveFailures).toBe(1);
+      expect(stateAfterOneFailure.lastCrankTime).toBe(t0);
+      //                                        ↑ pre-fix this would be 0 (never updated)
+
+      // Move time forward 15s and fail again. lastCrankTime must advance to t0+15s.
+      vi.setSystemTime(t0 + 15_000);
+      await crankService.crankMarket(slabAddress);
+      const stateAfterTwoFailures = crankService.getMarkets().get(slabAddress)!;
+      expect(stateAfterTwoFailures.lastCrankTime).toBe(t0 + 15_000);
+
+      vi.useRealTimers();
+    });
+
     it('should mark market inactive after 10 consecutive failures', async () => {
       const slabAddress = 'Market611111111111111111111111111111111';
       const mockMarket = {

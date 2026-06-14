@@ -968,6 +968,17 @@ export class CrankService {
           consecutiveFailures: state.consecutiveFailures,
         });
       }
+      // M9: advance lastCrankTime on FAILURE too, not just success. Pre-fix,
+      // `isDue` checks `Date.now() - state.lastCrankTime >= interval`. With
+      // lastCrankTime only updated on success, a market that's been failing
+      // every cycle had a stale lastCrankTime (or 0 if it never succeeded),
+      // so isDue was always true. After 10 consecutive failures isActive
+      // flips to false and the keeper SHOULD back off from intervalMs (30s)
+      // to inactiveIntervalMs (120s) — but since lastCrankTime was stale,
+      // the back-off never fired. Advancing here makes the inactive interval
+      // honored: active-failing markets still retry every intervalMs (30s);
+      // deactivated markets retry every inactiveIntervalMs (120s) as designed.
+      state.lastCrankTime = Date.now();
 
       // P1 FIX: Detect InsufficientDexLiquidity (error 0x33 = 51) specifically.
       // This is the program's PercolatorError ordinal for the MIN_DEX_QUOTE_LIQUIDITY
