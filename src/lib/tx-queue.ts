@@ -168,6 +168,20 @@ export class TxQueue {
     }
   }
 
+  /**
+   * Drop all queued (not-yet-started) tasks from every lane. In-flight tasks
+   * (already executing) are unaffected — they run to completion.
+   *
+   * Called on demotion so a node that loses leadership does not process a
+   * backlog of sends it queued while still leader.
+   */
+  clearPending(): void {
+    for (const lane of ALL_LANES) {
+      this._lanes[lane].clear();
+    }
+    logger.info("TxQueue: cleared all pending tasks from every lane (post-demote)");
+  }
+
   getStats(): Record<TxLane, TxLaneStats> {
     const result = {} as Record<TxLane, TxLaneStats>;
     for (const lane of ALL_LANES) {

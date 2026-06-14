@@ -13,6 +13,22 @@ import { isMainnetNetwork } from "../network.js";
 
 const logger = createLogger("keeper:send");
 
+// Single-writer guard. In HA mode the keeper must only land on-chain txs while it
+// holds leadership; the on-chain programs are permissionless, so this host-local
+// gate is the actual barrier against a demoted node double-sending. Wired from
+// index.ts to read the live LeaderLock role. Defaults to always-leader so the
+// standalone (no-HA) path is unchanged.
+let _isLeader: () => boolean = () => true;
+
+/**
+ * Wire the leadership check into keeperSend. Call once at startup with a
+ * function that returns true iff this node currently holds the HA leader lock
+ * (or always-true for standalone/no-HA deployments).
+ */
+export function setLeaderCheck(fn: () => boolean): void {
+  _isLeader = fn;
+}
+
 export const BASE_FEE_LAMPORTS = 5_000;
 
 const TIER_MAP: Record<TxType, PriorityFeeTier> = {
@@ -167,6 +183,15 @@ export async function keeperSend(
   maxRetries = 3,
   keeperOpts?: KeeperSendOptions,
 ): Promise<KeeperSendResult | null> {
+  // Single-writer guard: abort before any RPC if this node has lost leadership.
+  // The guard is checked here — before estimateCost, sendWithRetry, or any
+  // external call — so a demoted node cannot land transactions it queued while
+  // still leader but only now processes.
+  if (!_isLeader()) {
+    logger.warn("keeperSend: not leader — skipping send", { txType });
+    return null;
+  }
+
   const { estimatedCost, simulatedCu } = await estimateCost(connection, instructions, signers, txType);
 
   if (!budget.canSpend(estimatedCost, txType)) {
