@@ -917,11 +917,35 @@ export class CrankService {
       eventBus.publish("crank.success", slabAddress, { signature: sig });
       return true;
     } catch (err) {
-      state.failureCount++;
-      state.consecutiveFailures++;
-      txSentTotal.inc({ result: "fail", type: "crank" });
-
       const errMsg = err instanceof Error ? err.message : String(err);
+      const errLower = errMsg.toLowerCase();
+
+      // N2: Classify transient RPC/network errors — these should not count toward
+      // the consecutiveFailures threshold that deactivates markets. A burst of 429s
+      // during RPC congestion should not disable a healthy market.
+      const isTransient =
+        errLower.includes("429") ||
+        errLower.includes("too many requests") ||
+        errLower.includes("rate limit") ||
+        errLower.includes("timeout") ||
+        errLower.includes("socket") ||
+        errLower.includes("econnrefused") ||
+        errLower.includes("econnreset") ||
+        errLower.includes("502") ||
+        errLower.includes("503") ||
+        errLower.includes("block height exceeded");
+
+      state.failureCount++;
+      txSentTotal.inc({ result: "fail", type: "crank" });
+      if (!isTransient) {
+        state.consecutiveFailures++;
+      } else {
+        logger.warn("Crank transient error — not counting toward deactivation", {
+          slabAddress,
+          error: errMsg.slice(0, 120),
+          consecutiveFailures: state.consecutiveFailures,
+        });
+      }
 
       // P1 FIX: Detect InsufficientDexLiquidity (error 0x33 = 51) specifically.
       // This is the program's PercolatorError ordinal for the MIN_DEX_QUOTE_LIQUIDITY
