@@ -88,6 +88,17 @@ async function fetchSlabWithRetry(
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
 
+// Oracle-drift guard: abort liquidation if the oracle price drifts more than
+// this between scan-time candidacy and pre-submit re-verification.
+// The on-chain Liquidate instruction carries no price bound, so keeper-side
+// drift detection is the only available mitigation.
+// Default 150 bps (1.5%) — wider than typical intra-minute moves on SOL/BTC/ETH
+// but tight enough to cap keeper-wallet exposure on a 60s scan interval.
+// Set to 0 to disable.
+const MAX_LIQUIDATION_DRIFT_BPS = BigInt(
+  parseInt(process.env.LIQUIDATION_MAX_ORACLE_DRIFT_BPS ?? "150", 10),
+);
+
 // N4: Minimum notional value (in collateral token base units) below which
 // liquidation is skipped — tx cost exceeds the reward for dust positions.
 // Default 0 = no filter (preserve existing behavior). Override via env var.
@@ -207,6 +218,9 @@ interface LiquidationCandidate {
   pnl: bigint;
   marginRatio: number;  // as percentage
   maintenanceMarginBps: bigint;
+  // Oracle price (E6) at candidacy decision time. Used by liquidate() to detect
+  // oracle drift between scan and submit and abort if it exceeds MAX_LIQUIDATION_DRIFT_BPS.
+  scanPriceE6: bigint;
 }
 
 export class LiquidationService {
@@ -369,6 +383,7 @@ export class LiquidationService {
               pnl: markPnl,
               marginRatio: Number(marginRatioBps) / 100,
               maintenanceMarginBps,
+              scanPriceE6: price,
             });
           }
         } catch (err) {
@@ -418,6 +433,7 @@ export class LiquidationService {
   async liquidate(
     market: DiscoveredMarket,
     accountIdx: number,
+    scanPriceE6: bigint = 0n,
   ): Promise<string | null> {
     const slabAddress = market.slabAddress;
 
@@ -503,6 +519,28 @@ export class LiquidationService {
             { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), oracleMode: freshMode },
           );
           return null;
+        }
+
+        // Oracle-drift guard: the on-chain Liquidate instruction carries no
+        // price bound. If the oracle has moved more than MAX_LIQUIDATION_DRIFT_BPS
+        // since candidacy, the on-chain execution price may differ enough to
+        // flip the liquidation's P&L. Abort rather than absorb that drift.
+        if (MAX_LIQUIDATION_DRIFT_BPS > 0n && scanPriceE6 > 0n && freshPrice > 0n) {
+          const delta = freshPrice > scanPriceE6
+            ? freshPrice - scanPriceE6
+            : scanPriceE6 - freshPrice;
+          const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
+          if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+            logger.warn("Aborting liquidation: oracle drift exceeds limit", {
+              accountIndex: accountIdx,
+              slabAddress: slabAddress.toBase58(),
+              scanPriceE6: scanPriceE6.toString(),
+              freshPriceE6: freshPrice.toString(),
+              driftBps: driftBps.toString(),
+              limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+            });
+            return null;
+          }
         }
 
         const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
@@ -685,7 +723,7 @@ export class LiquidationService {
           }
           this._cycleSeenPositions.add(positionKey);
           this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
-          const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx);
+          const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx, candidate.scanPriceE6);
           if (sig) liquidated++;
         }
       }
@@ -791,7 +829,7 @@ export class LiquidationService {
             // Single-market scan — fire-and-forget; errors logged inside scanMarket.
             this.scanMarket(market.market).then(async (candidates) => {
               for (const c of candidates) {
-                const sig = await this.liquidate(market.market, c.accountIdx);
+                const sig = await this.liquidate(market.market, c.accountIdx, c.scanPriceE6);
                 if (sig) {
                   logger.info("Event-driven liquidation complete", {
                     slabAddress: slabKey,
