@@ -552,3 +552,83 @@ describe("KeeperBudget — reservation / TOCTOU", () => {
     expect(b.getStats().cycleSpend).toBe(600);
   });
 });
+
+describe("KeeperBudget — M12 adjustForRealizedCost", () => {
+  it("under-estimate (realized > estimated) bumps cycle/hour/day spend by the delta", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(100, "crank", "success");
+    let s = b.getStats();
+    expect(s.cycleSpend).toBe(100);
+    expect(s.realizedCostSamples).toBe(0);
+
+    b.adjustForRealizedCost(100, 150, "crank");
+    s = b.getStats();
+    expect(s.cycleSpend).toBe(150);
+    expect(s.hourSpend).toBe(150);
+    expect(s.daySpend).toBe(150);
+    expect(s.realizedCostDriftLamports).toBe(50);
+    expect(s.realizedCostSamples).toBe(1);
+  });
+
+  it("over-estimate (realized < estimated) decrements spend toward (but not below) zero", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(100, "crank", "success");
+    b.adjustForRealizedCost(100, 60, "crank");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(60);
+    expect(s.realizedCostDriftLamports).toBe(-40);
+    expect(s.realizedCostSamples).toBe(1);
+  });
+
+  it("clamps cycle/hour/day spend at 0 when a negative delta exceeds recorded spend", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(50, "crank", "success");
+    // Realized way smaller than estimated — delta = -200, spend was only 50.
+    b.adjustForRealizedCost(250, 50, "crank");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(0);
+    expect(s.hourSpend).toBe(0);
+    expect(s.daySpend).toBe(0);
+    // Drift telemetry still records the true (negative) signed delta.
+    expect(s.realizedCostDriftLamports).toBe(-200);
+    expect(s.realizedCostSamples).toBe(1);
+  });
+
+  it("ignores NaN / non-finite / negative inputs without bumping samples", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(100, "crank", "success");
+    b.adjustForRealizedCost(Number.NaN, 200, "crank");
+    b.adjustForRealizedCost(100, Number.POSITIVE_INFINITY, "crank");
+    b.adjustForRealizedCost(-1, 200, "crank");
+    b.adjustForRealizedCost(100, -50, "crank");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(100);
+    expect(s.realizedCostSamples).toBe(0);
+    expect(s.realizedCostDriftLamports).toBe(0);
+  });
+
+  it("accumulates drift across many tx — net positive drift surfaces under-estimation", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    for (let i = 0; i < 10; i++) {
+      b.recordTx(100, "crank", "success");
+      // Consistently under-estimate by 10 lamports each tx.
+      b.adjustForRealizedCost(100, 110, "crank");
+    }
+    const s = b.getStats();
+    expect(s.realizedCostSamples).toBe(10);
+    expect(s.realizedCostDriftLamports).toBe(100); // 10 tx × 10 lamports
+    // cycleSpend = 10*100 recorded + 10*10 drift = 1100
+    expect(s.cycleSpend).toBe(1100);
+  });
+
+  it("never trips the cycle gate from realized adjustment alone if the recorded estimate fit", () => {
+    // Reproduces the M12 motivation: the canSpend gate already passed at estimatedCost.
+    // A small under-estimate should not retroactively halt the keeper for this tx — it
+    // just consumes more budget headroom for the next call.
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, maxSolPerCycle: 200 });
+    b.recordTx(150, "crank", "success");
+    expect(b.canSpend(40, "crank")).toBe(true); // 150 + 40 = 190 < 200
+    b.adjustForRealizedCost(150, 170, "crank"); // now cycleSpend = 170
+    expect(b.canSpend(40, "crank")).toBe(false); // 170 + 40 = 210 > 200
+  });
+});

@@ -280,6 +280,14 @@ export async function keeperSend(
 
     try {
       const signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
+      // M12: after the tx confirms, fetch the actual on-chain cost and
+      // reconcile the budget. estimatedCost is what the gate checked, but
+      // the realized cost (meta.fee) differs because the actual priority fee
+      // depends on CU consumed × microLamports, and the keeper may have
+      // under- or over-estimated the CU. Fire-and-forget so the send return
+      // is not blocked. Errors are caught internally so a flaky getTransaction
+      // never propagates here.
+      void scheduleRealizedCostReconciliation(connection, signature, estimatedCost, txType, budget);
       release("success");
       return { signature, estimatedCost, simulatedCu };
     } catch (err) {
@@ -295,4 +303,62 @@ export async function keeperSend(
     // booked because nothing reached the chain. No-op if already released.
     release("drop");
   }
+}
+
+/**
+ * M12: schedule an async fetch of the tx receipt + budget reconciliation.
+ *
+ * Sampling: env-configurable via KEEPER_REALIZED_COST_SAMPLE_PCT (default 100
+ * = reconcile every tx). Lower values reduce RPC load on busy keepers at the
+ * cost of less accurate drift telemetry. Set to 0 to disable.
+ *
+ * Errors are swallowed — reconciliation is best-effort observability.
+ */
+function scheduleRealizedCostReconciliation(
+  connection: Connection,
+  signature: string,
+  estimatedCost: number,
+  txType: TxType,
+  budget: KeeperBudget,
+): void {
+  const samplePct = parseInt(process.env.KEEPER_REALIZED_COST_SAMPLE_PCT ?? "100", 10);
+  if (!Number.isFinite(samplePct) || samplePct <= 0) return;
+  // Deterministic sampling on signature so the same tx isn't double-sampled
+  // by a future caller — and so tests can pin behaviour with a known sig.
+  const sigHashByte = signature.charCodeAt(0) || 0;
+  if (samplePct < 100 && (sigHashByte % 100) >= samplePct) return;
+
+  // We deliberately don't await this — the send return must not block on
+  // getTransaction. Promise rejections are swallowed inside the body.
+  void (async () => {
+    try {
+      // Helius confirmed slot lag is usually < 2s; give it 5s before fetching.
+      await new Promise((r) => setTimeout(r, 5_000));
+      const tx = await connection.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      const realizedFee = tx?.meta?.fee;
+      if (typeof realizedFee !== "number" || !Number.isFinite(realizedFee) || realizedFee < 0) {
+        return;
+      }
+      // getTransaction's meta.fee is base + priority fee, but it does NOT
+      // include the Jito tip (which is a separate transfer). When the
+      // sender used Helius Sender with a jito tip, add it so realized total
+      // is comparable to estimatedCost (which includes the tip too).
+      const jitoTip = process.env.USE_HELIUS_SENDER === "true"
+        ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
+        : 0;
+      const realizedTotal = realizedFee + (Number.isFinite(jitoTip) ? jitoTip : 0);
+      budget.adjustForRealizedCost(estimatedCost, realizedTotal, txType);
+    } catch (err) {
+      // Best-effort only. A failed reconciliation just means the drift
+      // metric won't update for this tx — the budget gate already passed
+      // and the recorded estimatedCost is conservative.
+      logger.debug("realized-cost reconciliation failed", {
+        signature: signature.slice(0, 12),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
 }
