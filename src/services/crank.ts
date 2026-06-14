@@ -177,9 +177,6 @@ export class CrankService {
   private readonly oracleService: OracleService;
   private lastCycleResult = { success: 0, failed: 0, skipped: 0 };
   private lastDiscoveryTime = 0;
-  // BC1: Signature replay protection
-  private recentSignatures = new Map<string, number>(); // signature -> timestamp
-  private readonly signatureTTLMs = 60_000; // 60 seconds
   private _isRunning = false;
   private _cycling = false;
   private _cycleStartedAt = 0;
@@ -910,9 +907,6 @@ export class CrankService {
         throw err;
       }
 
-      // BC1: Track signature to prevent replay attacks
-      this.recentSignatures.set(sig, Date.now());
-
       state.lastCrankTime = Date.now();
       state.successCount++;
       state.consecutiveFailures = 0;
@@ -1132,12 +1126,6 @@ export class CrankService {
       for (const [slab, error] of batchResult.errors) {
         logger.error("Batch error detail", { slabAddress: slab, error: error.message });
       }
-    }
-
-    // P2 FIX: Clean up stale signatures every cycle (was only on success path)
-    const now = Date.now();
-    for (const [oldSig, ts] of this.recentSignatures.entries()) {
-      if (now - ts > this.signatureTTLMs) this.recentSignatures.delete(oldSig);
     }
 
     // P0 FIX: Always log cycle result with skip breakdown. Previously only logged

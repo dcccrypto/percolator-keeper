@@ -226,9 +226,6 @@ export class LiquidationService {
   // supervisor restart) already act on.
   private _inFlight: Promise<void> | null = null;
   private _scanStartedAt = 0; // start of the in-flight scan — for the watchdog WARN log only
-  // BC1: Signature replay protection
-  private recentSignatures = new Map<string, number>(); // signature -> timestamp
-  private readonly signatureTTLMs = 60_000; // 60 seconds
   // PERC-134: Exponential backoff on consecutive scan failures
   private consecutiveFailures = 0;
   private readonly maxBackoffMs = 300_000; // 5 minutes max backoff
@@ -556,16 +553,6 @@ export class LiquidationService {
         recordFailed();
         txSentTotal.inc({ result: "fail", type: "liquidation" });
         throw err;
-      }
-
-      // BC1: Track signature to prevent replay attacks
-      const now = Date.now();
-      this.recentSignatures.set(sig, now);
-      // Clean up signatures older than TTL
-      for (const [oldSig, timestamp] of this.recentSignatures.entries()) {
-        if (now - timestamp > this.signatureTTLMs) {
-          this.recentSignatures.delete(oldSig);
-        }
       }
 
       this.liquidationCount++;
