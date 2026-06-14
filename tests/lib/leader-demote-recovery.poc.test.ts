@@ -32,21 +32,13 @@ describe("LeaderLock demote recovery (PoC)", () => {
 
   it("re-acquires leadership after a transient renew failure once Redis recovers", async () => {
     const store = new Map<string, string>();
-    // Toggled true while we want the periodic RENEW (xx) to fail, simulating a
+    // Toggled true while we want the periodic RENEW (eval) to fail, simulating a
     // transient Redis outage that costs the leader its lock.
     let renewShouldFail = true;
 
     const redis: RedisLike = {
       async set(key: string, value: string, opts: SetOpts): Promise<"OK" | null> {
         const hasNx = "nx" in opts && opts.nx === true;
-        const hasXx = "xx" in opts && (opts as { xx?: true }).xx === true;
-        if (hasXx) {
-          if (renewShouldFail) throw new Error("Redis connection refused");
-          if (!store.has(key)) return null;
-          store.set(key, value);
-          return "OK";
-        }
-        // nx acquire
         if (hasNx && store.has(key)) return null;
         store.set(key, value);
         return "OK";
@@ -58,6 +50,16 @@ describe("LeaderLock demote recovery (PoC)", () => {
         let n = 0;
         for (const k of keys) if (store.delete(k)) n++;
         return n;
+      },
+      async eval<T>(_script: string, keys: string[], _args: (string | number)[]): Promise<T> {
+        // Simulate transient Redis failure during renew (CAS eval).
+        if (renewShouldFail) throw new Error("Redis connection refused");
+        // CAS: return 1 if we still own the lock, 0 otherwise.
+        const current = store.get(keys[0] ?? "");
+        if (current === _args[0]) {
+          return 1 as unknown as T;
+        }
+        return 0 as unknown as T;
       },
     };
 
@@ -99,22 +101,13 @@ describe("LeaderLock demote recovery (PoC)", () => {
 
   it("re-acquires after a stolen-lock demotion (renew returns null) once the lock frees", async () => {
     const store = new Map<string, string>();
-    store.set(KEY, "node-a"); // we hold it after acquire (set below)
-    store.delete(KEY);
-    // renew (xx) returns null while the lock is considered lost; flip to allow
+    // renew (eval CAS) returns 0 while the lock is considered lost; flip to allow
     // a fresh nx acquire on recovery.
     let lockLost = false;
 
     const redis: RedisLike = {
       async set(key: string, value: string, opts: SetOpts): Promise<"OK" | null> {
         const hasNx = "nx" in opts && opts.nx === true;
-        const hasXx = "xx" in opts && (opts as { xx?: true }).xx === true;
-        if (hasXx) {
-          if (lockLost) return null; // renew finds the key gone → lock-lost demote
-          if (!store.has(key)) return null;
-          store.set(key, value);
-          return "OK";
-        }
         if (hasNx && store.has(key)) return null;
         store.set(key, value);
         return "OK";
@@ -126,6 +119,13 @@ describe("LeaderLock demote recovery (PoC)", () => {
         let n = 0;
         for (const k of keys) if (store.delete(k)) n++;
         return n;
+      },
+      async eval<T>(_script: string, keys: string[], args: (string | number)[]): Promise<T> {
+        // CAS renew: return 0 when lock is considered lost (identity mismatch/gone).
+        if (lockLost) return 0 as unknown as T;
+        const current = store.get(keys[0] ?? "");
+        if (current === args[0]) return 1 as unknown as T;
+        return 0 as unknown as T;
       },
     };
 
@@ -159,13 +159,6 @@ describe("LeaderLock demote recovery (PoC)", () => {
     const redis: RedisLike = {
       async set(key: string, value: string, opts: SetOpts): Promise<"OK" | null> {
         const hasNx = "nx" in opts && opts.nx === true;
-        const hasXx = "xx" in opts && (opts as { xx?: true }).xx === true;
-        if (hasXx) {
-          if (renewShouldFail) throw new Error("Redis connection refused");
-          if (!store.has(key)) return null;
-          store.set(key, value);
-          return "OK";
-        }
         if (hasNx && store.has(key)) return null;
         store.set(key, value);
         return "OK";
@@ -177,6 +170,12 @@ describe("LeaderLock demote recovery (PoC)", () => {
         let n = 0;
         for (const k of keys) if (store.delete(k)) n++;
         return n;
+      },
+      async eval<T>(_script: string, keys: string[], args: (string | number)[]): Promise<T> {
+        if (renewShouldFail) throw new Error("Redis connection refused");
+        const current = store.get(keys[0] ?? "");
+        if (current === args[0]) return 1 as unknown as T;
+        return 0 as unknown as T;
       },
     };
 
@@ -227,6 +226,10 @@ describe("LeaderLock demote recovery (PoC)", () => {
           let n = 0;
           for (const k of keys) if (store.delete(k)) n++;
           return n;
+        },
+        async eval<T>(): Promise<T> {
+          // This test starts in standby — renew (eval) is never called.
+          throw new Error("eval should not be called in this test");
         },
       },
       "node-a",
