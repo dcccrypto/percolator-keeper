@@ -13,7 +13,6 @@ import {
   encodeKeeperCrank,
   ACCOUNTS_LIQUIDATE_AT_ORACLE,
   ACCOUNTS_KEEPER_CRANK,
-  derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
@@ -27,6 +26,7 @@ import {
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
+import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
 
@@ -403,14 +403,14 @@ export class LiquidationService {
       const instructions: TransactionInstruction[] = [];
 
       // N1: Determine oracle account using detectOracleMode to match crank/ADL logic.
-      // Admin-oracle markets use slabAddress regardless of indexFeedId; only
-      // pyth-pinned markets derive a Pyth PDA from the feed ID.
+      // Admin-oracle and HYPERP markets use slabAddress; pyth-pinned markets use
+      // resolveExternalOracleAccount which checks the on-chain account owner to
+      // distinguish Pyth Push PDA derivation from Chainlink (where index_feed_id
+      // IS the aggregator account and must be passed directly).
       const oracleMode = detectOracleMode(market.config);
       let oracleAccount: PublicKey;
       if (oracleMode === "pyth-pinned") {
-        const feedHex = Array.from(market.config.indexFeedId.toBytes())
-          .map(b => b.toString(16).padStart(2, "0")).join("");
-        oracleAccount = derivePythPushOraclePDA(feedHex)[0];
+        oracleAccount = await resolveExternalOracleAccount(market.config.indexFeedId, connection);
       } else {
         oracleAccount = slabAddress;
       }
