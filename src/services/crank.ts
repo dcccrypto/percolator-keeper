@@ -38,6 +38,16 @@ const logger = createLogger("keeper:crank");
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
 const RPC_TIMEOUT_MS = 15_000;
 
+// M10: refresh interval for HYPERP slab config (specifically `config.dexPool`).
+// On-chain SetDexPool changes the pool but the keeper's parsed config is only
+// refreshed in discover() (default 5 min). 60s is a balanced choice — picks up
+// admin SetDexPool within 60s, costs at most one extra getAccountInfo per
+// HYPERP market per minute. Configurable via env for ops experiments.
+const HYPERP_CONFIG_REFRESH_MS = parseInt(
+  process.env.KEEPER_HYPERP_CONFIG_REFRESH_MS ?? "60000",
+  10,
+);
+
 const KEEPER_SEND_OPTS = {
   skipPreflight: true,
   multiRpcBroadcast: true,
@@ -110,6 +120,15 @@ interface MarketCrankState {
   dexPoolResolvedAddress?: string;
   dexPoolType?: DexType | "unknown";
   dexPoolRemainingAccounts?: PublicKey[];
+  /**
+   * M10: wall-clock ms of the last on-chain config refresh for this market.
+   * The slab `config.dexPool` field is only refreshed during the discover()
+   * cycle (~5 min). After an admin calls SetDexPool, the keeper would otherwise
+   * send UpdateHyperpMark against the OLD pool for up to 5 min, getting
+   * rejected on-chain with OracleInvalid and burning priority fees. A shorter
+   * (60s default) per-market refresh in the HYPERP branch closes this gap.
+   */
+  lastHyperpConfigRefreshMs?: number;
 }
 
 /** Process items in batches with delay between batches.
@@ -741,6 +760,63 @@ export class CrankService {
       // UpdateHyperpMark to read DEX pool state directly on-chain. No off-chain
       // price push needed — the instruction reads Raydium/PumpSwap/Meteora pools.
       if (this.isHyperpOracle(market)) {
+        // M10: refresh slab config (specifically config.dexPool) on a shorter
+        // TTL than the 5-min discover() cycle. Without this, an admin
+        // SetDexPool change wouldn't reach the keeper for up to 5 min, during
+        // which UpdateHyperpMark txs target the OLD pool and get rejected
+        // on-chain with OracleInvalid (burning priority fees + RPC quota).
+        const now = Date.now();
+        if (
+          state.lastHyperpConfigRefreshMs === undefined ||
+          now - state.lastHyperpConfigRefreshMs >= HYPERP_CONFIG_REFRESH_MS
+        ) {
+          try {
+            const freshSlab = await withTimeout(
+              fetchSlab(connection, market.slabAddress),
+              RPC_TIMEOUT_MS,
+              `fetchSlab(M10 refresh, ${slabAddress})`,
+            );
+            const freshConfig = freshSlab ? parseConfig(freshSlab) : undefined;
+            // Defensive: if fetchSlab or parseConfig returned a falsy value
+            // (RPC blip, mock in tests), keep the cached config. The next
+            // cycle will retry. This avoids overwriting good config with
+            // undefined which would NPE on the dexPool read below.
+            if (!freshConfig) {
+              throw new Error("freshConfig was undefined after parseConfig");
+            }
+            const prevDexPool = state.market.config?.dexPool?.toBase58();
+            // Replace just the config — header/engine/params aren't oracle-
+            // routing-critical for HYPERP and discover() will refresh the
+            // rest on its normal cadence.
+            state.market.config = freshConfig;
+            state.lastHyperpConfigRefreshMs = now;
+
+            const newDexPool = state.market.config.dexPool?.toBase58();
+            if (prevDexPool !== newDexPool) {
+              logger.info("HYPERP: on-chain dexPool changed; invalidating remaining-accounts cache", {
+                slabAddress,
+                previousDexPool: prevDexPool ?? "<unset>",
+                newDexPool: newDexPool ?? "<unset>",
+              });
+              // Drop the cached remaining-accounts so the next call to
+              // resolveHyperpPoolRemainingAccounts re-fetches for the new pool.
+              state.dexPoolResolvedAddress = undefined;
+              state.dexPoolType = undefined;
+              state.dexPoolRemainingAccounts = undefined;
+              // Reset the no-price-skip flag so a previously-unconfigured pool
+              // gets a fresh chance after admin sets it.
+              state.hyperpNoPriceSkipped = false;
+            }
+          } catch (err) {
+            // Refresh failure is non-fatal — fall through with the existing
+            // cached config and let the next cycle retry.
+            logger.warn("HYPERP: failed to refresh slab config (M10) — using cached value", {
+              slabAddress,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         const instructions: TransactionInstruction[] = [];
 
         // UpdateHyperpMark: accounts = [slab(writable), dex_pool, clock, ...remaining]
