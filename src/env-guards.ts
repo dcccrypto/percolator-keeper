@@ -121,6 +121,18 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   // http:// and ws:// transmit signed transactions and account data unencrypted,
   // enabling MITM attacks on the network path.
   const allowInsecure = env.ALLOW_INSECURE_RPC === "true";
+
+  // H9: ALLOW_INSECURE_RPC=true on mainnet exposes signed transactions to MITM.
+  // The localhost sub-case is caught by rejectLocalRpcUrl, but a remote plaintext
+  // HTTP URL (e.g. http://some-rpc.helius.xyz) with ALLOW_INSECURE_RPC=true is
+  // not caught. Reject unconditionally when NETWORK=mainnet.
+  if (allowInsecure && isMainnetEnv(env)) {
+    throw new Error(
+      "ALLOW_INSECURE_RPC=true is not permitted when NETWORK=mainnet. " +
+      "Plaintext RPC connections expose signed transactions to MITM attacks. " +
+      "Use an https:// or wss:// RPC endpoint on mainnet.",
+    );
+  }
   // A.3 (HIGH): HA leader election pins the Redis lock key to NETWORK. Legacy
   // index.ts fell back to `?? "devnet"` when NETWORK was unset, which meant a
   // mainnet keeper without NETWORK would silently share a lock with devnet

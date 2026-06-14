@@ -62,7 +62,11 @@ describe("regression: all NETWORK readers agree via the canonical resolver", () 
   });
 
   it("FIXED: with NETWORK='Mainnet' (and ' mainnet '), a localhost RPC now refuses to boot", () => {
-    const base = { SOLANA_RPC_URL: "http://127.0.0.1:8899", ALLOW_INSECURE_RPC: "true" } as NodeJS.ProcessEnv;
+    // Use https:// so the http-scheme guard is not in play; the localhost guard
+    // ("refusing to boot") fires independently. ALLOW_INSECURE_RPC is omitted
+    // because H9 now blocks that flag on mainnet entirely — both are refusals,
+    // but the localhost guard's "refusing to boot" message is what this test asserts.
+    const base = { SOLANA_RPC_URL: "https://127.0.0.1:8899" } as NodeJS.ProcessEnv;
     for (const net of ["Mainnet", " mainnet ", "MAINNET"]) {
       expect(() => validateKeeperEnvGuards({ ...base, NETWORK: net }), `NETWORK=${JSON.stringify(net)}`).toThrow(
         /refusing to boot/i,

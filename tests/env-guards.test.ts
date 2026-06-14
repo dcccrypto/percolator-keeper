@@ -53,7 +53,7 @@ describe("validateKeeperEnvGuards", () => {
     expect(() => validateKeeperEnvGuards(env)).toThrow("must use wss://");
   });
 
-  it("allows insecure URLs when ALLOW_INSECURE_RPC=true", () => {
+  it("allows insecure URLs when ALLOW_INSECURE_RPC=true (non-mainnet)", () => {
     const env = {
       SOLANA_RPC_URL: "http://localhost:8899",
       SOLANA_RPC_WS_URL: "ws://localhost:8900",
@@ -61,6 +61,40 @@ describe("validateKeeperEnvGuards", () => {
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  // H9: ALLOW_INSECURE_RPC=true on mainnet exposes signed txs to MITM.
+  describe("H9: ALLOW_INSECURE_RPC=true rejected on mainnet", () => {
+    it("throws when ALLOW_INSECURE_RPC=true with NETWORK=mainnet", () => {
+      const env = {
+        SOLANA_RPC_URL: "http://some-rpc.helius.xyz",
+        ALLOW_INSECURE_RPC: "true",
+        NETWORK: "mainnet",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /ALLOW_INSECURE_RPC.*not permitted.*mainnet/i,
+      );
+    });
+
+    it("throws when ALLOW_INSECURE_RPC=true with NETWORK=mainnet (via network.ts normalization)", () => {
+      const env = {
+        ALLOW_INSECURE_RPC: "true",
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: "https://mainnet.rpc.example.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /ALLOW_INSECURE_RPC.*not permitted.*mainnet/i,
+      );
+    });
+
+    it("allows ALLOW_INSECURE_RPC=true on devnet", () => {
+      const env = {
+        ALLOW_INSECURE_RPC: "true",
+        NETWORK: "devnet",
+        SOLANA_RPC_URL: "http://localhost:8899",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
   });
 
   it("does not throw for https:// and wss:// URLs", () => {
@@ -202,12 +236,12 @@ describe("validateKeeperEnvGuards", () => {
       );
     });
 
-    it("rejects mainnet+localhost even when ALLOW_INSECURE_RPC=true (separate guard)", () => {
-      // ALLOW_INSECURE_RPC bypasses the http:// guard but NOT the mainnet+localhost guard
+    it("rejects mainnet+localhost regardless of ALLOW_INSECURE_RPC (separate guard)", () => {
+      // H9 blocks ALLOW_INSECURE_RPC=true on mainnet entirely; the localhost guard
+      // independently fires when ALLOW_INSECURE_RPC is absent. Both paths reject.
       const env = {
         NETWORK: "mainnet",
-        SOLANA_RPC_URL: "http://localhost:8899",
-        ALLOW_INSECURE_RPC: "true",
+        SOLANA_RPC_URL: "https://localhost:8899",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).toThrow(
         /SOLANA_RPC_URL points at .* but NETWORK=mainnet/,
@@ -393,14 +427,14 @@ describe("validateKeeperEnvGuards", () => {
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
 
-    // The guard is independent of ALLOW_INSECURE_RPC (which only gates http/https).
-    it("rejects a devnet fallback on mainnet even when ALLOW_INSECURE_RPC=true", () => {
+    // The guard is independent of ALLOW_INSECURE_RPC (H9 blocks ALLOW_INSECURE_RPC=true
+    // on mainnet entirely; this test verifies the devnet-host guard fires on its own).
+    it("rejects a devnet fallback on mainnet (guard is independent of ALLOW_INSECURE_RPC)", () => {
       const env = {
         NETWORK: "mainnet",
         SOLANA_RPC_URL: MAINNET,
         RPC_URL: MAINNET,
         FALLBACK_RPC_URL: "https://api.devnet.solana.com",
-        ALLOW_INSECURE_RPC: "true",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).toThrow(
         /FALLBACK_RPC_URL points at devnet\/testnet host/,
