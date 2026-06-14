@@ -45,6 +45,15 @@ export class LeaderLock {
   private _renewFailures = 0;
   private _lockKey = "";
   private _onDemote: ((reason: string) => void) | null = null;
+  // Captured at start() so _demote() can re-enter the standby poll loop — it is
+  // the one transition that needs StartOptions but isn't handed them.
+  private _opts: StartOptions | null = null;
+  // Terminal kill-switch. Set true at the top of stop() BEFORE any await so an
+  // already-queued _poll/_renew callback (a timer that fired into the event
+  // loop microseconds before _clearTimers ran) cannot re-arm a timer or promote
+  // a node the operator has shut down. Role alone can't express this: stop()
+  // leaves the role as "standby", indistinguishable from a live standby.
+  private _stopped = false;
 
   constructor(redis: RedisLike, identity: string, opts: LeaderLockOptions = {}) {
     this.redis = redis;
@@ -61,6 +70,8 @@ export class LeaderLock {
   start(opts: StartOptions): void {
     this._lockKey = `keeper:leader:${opts.network}`;
     this._onDemote = opts.onDemote;
+    this._opts = opts;
+    this._stopped = false;
 
     logger.info("LeaderLock starting", {
       identity: this.identity,
@@ -74,6 +85,9 @@ export class LeaderLock {
   }
 
   async stop(): Promise<void> {
+    // Latch BEFORE _clearTimers() and before any await: a poll/renew callback
+    // already past clearTimeout's reach will observe this and abort.
+    this._stopped = true;
     this._clearTimers();
 
     if (this._role === "leader") {
@@ -112,6 +126,7 @@ export class LeaderLock {
   }
 
   private _promote(opts: StartOptions): void {
+    if (this._stopped) return;
     this._role = "leader";
     this._renewFailures = 0;
     logger.info("LeaderLock promoted to leader", { identity: this.identity });
@@ -127,7 +142,7 @@ export class LeaderLock {
   }
 
   private async _renew(opts: StartOptions): Promise<void> {
-    if (this._role !== "leader") return;
+    if (this._stopped || this._role !== "leader") return;
 
     try {
       // C2 (CRITICAL): fenced renewal via Lua EVAL. The script atomically
@@ -194,6 +209,7 @@ export class LeaderLock {
   }
 
   private _enterStandby(opts: StartOptions): void {
+    if (this._stopped) return;
     this._role = "standby";
     logger.info("LeaderLock entering standby", { identity: this.identity });
     this._schedulePoll(opts);
@@ -207,14 +223,18 @@ export class LeaderLock {
   }
 
   private async _poll(opts: StartOptions): Promise<void> {
-    if (this._role !== "standby") return;
+    if (this._stopped || this._role !== "standby") return;
 
     try {
       const current = await this.redis.get(this._lockKey);
+      // stop() may have run while we were awaiting Redis — never promote or
+      // re-arm a timer on a stopped node.
+      if (this._stopped || this._role !== "standby") return;
 
       if (current === null) {
         const ttlSec = Math.ceil(this.ttlMs / 1000);
         const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, nx: true } as { ex: number; nx: true });
+        if (this._stopped || this._role !== "standby") return;
         if (result === "OK") {
           this._promote(opts);
           return;
@@ -227,6 +247,7 @@ export class LeaderLock {
         identity: this.identity,
         error: err instanceof Error ? err.message : String(err),
       });
+      if (this._stopped) return;
       this._schedulePoll(opts);
     }
   }
@@ -236,6 +257,14 @@ export class LeaderLock {
     this._role = "standby";
     this._clearTimers();
     logger.warn("LeaderLock demoted", { identity: this.identity, reason });
+    // Re-arm the standby poll so the node rejoins the election and re-acquires
+    // once Redis recovers and the lock frees — without this, a transient blip
+    // parks the node forever (services stopped via onDemote, never restarted).
+    // Scheduled BEFORE firing onDemote so recovery is armed even if the handler
+    // throws; _clearTimers() above guarantees no timer is live (no double-arm),
+    // and stop() (incl. one invoked from onDemote) latches _stopped and clears
+    // this poll. Mirrors _enterStandby()'s initial-standby behavior.
+    if (this._opts) this._schedulePoll(this._opts);
     this._onDemote?.(reason);
   }
 
