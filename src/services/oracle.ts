@@ -172,18 +172,9 @@ export class OracleService {
       if (!res.ok) return null;
       
       const json = (await res.json()) as DexScreenerResponse;
-      // BH7: Use captured timestamp for atomicity.
-      // Delete before set so refreshed entries move to the end of Map
-      // iteration order — ensures eviction targets the least-recently-used
-      // entry, not a frequently-refreshed one stuck at its insertion position.
-      dexScreenerCache.delete(mint);
-      dexScreenerCache.set(mint, { data: json, fetchedAt: now });
-      // Evict oldest entry when cache exceeds size cap
-      if (dexScreenerCache.size > DEX_SCREENER_CACHE_MAX_SIZE) {
-        const oldestKey = dexScreenerCache.keys().next().value;
-        if (oldestKey !== undefined) dexScreenerCache.delete(oldestKey);
-      }
 
+      // M7: Validate BEFORE caching — don't cache bad responses that would
+      // suppress fresh fetches for the full TTL window.
       const pair = sortPairsByLiquidity(json.pairs)?.[0];
       if (!pair?.priceUsd) return null;
       if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY_USD) return null;
@@ -192,6 +183,18 @@ export class OracleService {
       // B8: see cache-hit branch above.
       const priceE6 = BigInt(Math.round(parsed * PRICE_E6_MULTIPLIER));
       if (priceE6 === 0n) return null;
+
+      // Only cache validated responses with a usable price.
+      // BH7: Delete before set so refreshed entries move to the end of Map
+      // iteration order — ensures eviction targets the least-recently-used
+      // entry, not a frequently-refreshed one stuck at its insertion position.
+      dexScreenerCache.delete(mint);
+      dexScreenerCache.set(mint, { data: json, fetchedAt: now });
+      if (dexScreenerCache.size > DEX_SCREENER_CACHE_MAX_SIZE) {
+        const oldestKey = dexScreenerCache.keys().next().value;
+        if (oldestKey !== undefined) dexScreenerCache.delete(oldestKey);
+      }
+
       return priceE6;
     } catch (err) {
       // B9: log instead of silently swallowing — a sustained DexScreener outage
