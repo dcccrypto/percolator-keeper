@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   assertMainnetProgramId,
+  assertProgramIdAllowList,
   MAINNET_PROGRAM_ID,
 } from "../../src/lib/boot-assertions.js";
 
@@ -59,5 +60,31 @@ describe("assertMainnetProgramId", () => {
       "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
     );
     expect(MAINNET_PROGRAM_ID).toMatch(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+  });
+});
+
+describe("assertProgramIdAllowList", () => {
+  const WRONG = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
+
+  it("throws on an empty list on ANY network (silent zero-program scan)", () => {
+    expect(() => assertProgramIdAllowList({ isMainnet: false, allProgramIds: [] })).toThrow(/empty program set/);
+    // Mainnet-empty too — the length check must precede the per-entry check so
+    // [] does NOT pass the vacuously-true .every/.filter (regression guard).
+    expect(() => assertProgramIdAllowList({ isMainnet: true, allProgramIds: [] })).toThrow(/empty program set/);
+  });
+
+  it("allows a non-canonical id off mainnet (devnet uses its own program)", () => {
+    expect(() => assertProgramIdAllowList({ isMainnet: false, allProgramIds: [WRONG] })).not.toThrow();
+    expect(() => assertProgramIdAllowList({ isMainnet: false, allProgramIds: [WRONG, "AnotherDevProg1111111111111111111111111111"] })).not.toThrow();
+  });
+
+  it("allows a mainnet list that is exactly the canonical id (incl. dupes)", () => {
+    expect(() => assertProgramIdAllowList({ isMainnet: true, allProgramIds: [MAINNET_PROGRAM_ID] })).not.toThrow();
+    expect(() => assertProgramIdAllowList({ isMainnet: true, allProgramIds: [MAINNET_PROGRAM_ID, MAINNET_PROGRAM_ID] })).not.toThrow();
+  });
+
+  it("throws on mainnet when any entry is non-canonical, naming the offender", () => {
+    expect(() => assertProgramIdAllowList({ isMainnet: true, allProgramIds: [WRONG] })).toThrow(/non-canonical/);
+    expect(() => assertProgramIdAllowList({ isMainnet: true, allProgramIds: [MAINNET_PROGRAM_ID, WRONG] })).toThrow(new RegExp(WRONG));
   });
 });

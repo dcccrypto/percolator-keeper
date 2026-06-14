@@ -11,7 +11,7 @@ import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { CURRENT_NETWORK } from "./network.js";
-import { assertMainnetProgramId } from "./lib/boot-assertions.js";
+import { assertMainnetProgramId, assertProgramIdAllowList } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
 import * as metricsServer from "./lib/metrics-server.js";
@@ -78,6 +78,9 @@ const keeperKeypair = loadKeypair(process.env.CRANK_KEYPAIR!);
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
 // and price lookups use mainnet mints directly (no mainnetCA override needed).
 assertMainnetProgramId({ isMainnet: isMainnet(), programId: config.programId });
+// Validate the full discovery/signing program set (config.allProgramIds), not
+// just the single config.programId — discovery scans and signs against every entry.
+assertProgramIdAllowList({ isMainnet: isMainnet(), allProgramIds: config.allProgramIds });
 if (isMainnet()) {
   logger.info("Running in MAINNET mode", { programId: config.programId });
 }

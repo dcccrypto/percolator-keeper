@@ -313,6 +313,10 @@ export class CrankService {
       // top of this file — drop the redundant dynamic import that used to run on every call.
       // B15: batch via getMultipleAccountsInfo with a per-call timeout on the fallback RPC.
       const conn = getFallbackConnection();
+      // Mirror registerMarket()'s owner allow-list (crank.ts: knownIds check):
+      // only track slabs owned by an allow-listed Percolator program, so the
+      // keeper never signs txs against an account owned by an arbitrary program.
+      const knownIds = new Set(config.allProgramIds);
       const pubkeys: Array<PublicKey | null> = slabAddresses.map((addr) => {
         try {
           return new PublicKey(addr);
@@ -344,6 +348,16 @@ export class CrankService {
           const info = infos[j];
           if (!info?.data) {
             logger.warn("MARKETS_FILTER: slab not found on-chain", { slab: pubkey.toBase58().slice(0, 8) });
+            continue;
+          }
+          // Reject slabs owned by a non-allow-listed program before parsing or
+          // tracking them — mirrors registerMarket. Prevents the keeper from
+          // signing crank/liquidate txs against an arbitrary (hostile) program.
+          if (!knownIds.has(info.owner.toBase58())) {
+            logger.warn("MARKETS_FILTER: slab owned by non-allow-listed program — skipping", {
+              slab: pubkey.toBase58().slice(0, 8),
+              owner: info.owner.toBase58(),
+            });
             continue;
           }
           try {
