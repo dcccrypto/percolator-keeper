@@ -190,6 +190,16 @@ export class CrankService {
   // doubled funding accrual + RPC storms. Cleared on natural cycle recovery
   // (the finally block) so transient slow cycles don't kill the process.
   private _watchdogArmedAt = 0;
+  // M8: per-market in-flight guard. `_cycling` is a process-wide flag for
+  // the timer-driven crankAll cycle, but other entry points (registerMarket
+  // from the /register HTTP endpoint, and potentially LaserStream debounce
+  // handlers) can call crankMarket directly — bypassing `_cycling`. Without
+  // this guard, a /register HTTP arriving mid-cycle could fire crankMarket
+  // concurrently with crankAll's fan-out on the same slab, producing
+  // duplicate KeeperCrank txs for the same market. Set/delete at crankMarket
+  // entry/exit so every code path that reaches crankMarket honors the same
+  // in-flight invariant.
+  private _inflightMarkets = new Set<string>();
   private _stalePauseCheck?: (slabAddress: string) => boolean;
   // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
@@ -701,6 +711,17 @@ export class CrankService {
   }
 
   async crankMarket(slabAddress: string): Promise<boolean> {
+    // M8: per-market in-flight guard. Bail immediately if another caller is
+    // already running crankMarket for this slab. Closes the race where the
+    // /register HTTP endpoint and the timer-driven crankAll fan-out both
+    // dispatch crankMarket for the same market — pre-fix this could produce
+    // duplicate KeeperCrank txs since `_cycling` only gates the overall
+    // crankAll loop, not the per-market work.
+    if (this._inflightMarkets.has(slabAddress)) {
+      logger.debug("crankMarket: in-flight for slab, skipping concurrent call", { slabAddress });
+      return false;
+    }
+
     const state = this.markets.get(slabAddress);
     if (!state) {
       logger.warn("Market not found", { slabAddress });
@@ -709,6 +730,7 @@ export class CrankService {
 
     const { market } = state;
 
+    this._inflightMarkets.add(slabAddress);
     try {
       const connection = getConnection();
       const keypair = this._keypair;
@@ -1009,6 +1031,11 @@ export class CrankService {
         error: err instanceof Error ? err.message : String(err),
       });
       return false;
+    } finally {
+      // M8: always release the per-market guard, even if the body throws or
+      // returns early. JavaScript runs finally after `return` in the try/catch
+      // above, so this fires on every code path.
+      this._inflightMarkets.delete(slabAddress);
     }
   }
 

@@ -395,6 +395,74 @@ describe('CrankService', () => {
         }),
       );
     });
+
+    // M8: per-market in-flight guard. The /register HTTP endpoint and the
+    // timer-driven crankAll fan-out both call crankMarket directly. Pre-fix,
+    // a /register HTTP arriving mid-cycle could fire a duplicate KeeperCrank
+    // tx for the same slab. The guard makes concurrent crankMarket calls for
+    // the same slab a no-op (second call returns false immediately).
+    //
+    // We test the contract directly via the private `_inflightMarkets` set
+    // rather than racing async timing — the latter proved fragile across
+    // machines.
+    it('M8: crankMarket bails when slab is already in _inflightMarkets (no send)', async () => {
+      const slabAddress = 'MarketM8GuardAaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      vi.mocked(core.discoverMarkets).mockResolvedValue([{
+        slabAddress: { toBase58: () => slabAddress },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          indexFeedId: { toBytes: () => new Uint8Array(32).fill(1) },
+          oracleAuthority: { toBase58: () => 'NonZeroAuth1111111111111111111111111111111' },
+          authorityPriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminM8G11111111111111111111111111111111' } },
+      }] as any);
+      await crankService.discover();
+
+      const sendSpy = vi.mocked(keeperSendModule.keeperSend);
+      sendSpy.mockClear();
+
+      // Simulate "another caller is already in flight" by pre-populating the set.
+      const inflight: Set<string> = (crankService as any)._inflightMarkets;
+      inflight.add(slabAddress);
+
+      const result = await crankService.crankMarket(slabAddress);
+
+      expect(result).toBe(false);
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      // Clean up so this test doesn't pollute later tests in the suite.
+      inflight.delete(slabAddress);
+    });
+
+    it('M8: _inflightMarkets is empty before AND after a crankMarket call (released by finally)', async () => {
+      const slabAddress = 'MarketM8ReleaseAaaaaaaaaaaaaaaaaaaaaaaaa';
+      vi.mocked(core.discoverMarkets).mockResolvedValue([{
+        slabAddress: { toBase58: () => slabAddress },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          indexFeedId: { toBytes: () => new Uint8Array(32).fill(1) },
+          oracleAuthority: { toBase58: () => 'NonZeroAuth1111111111111111111111111111111' },
+          authorityPriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminM8R11111111111111111111111111111111' } },
+      }] as any);
+      await crankService.discover();
+
+      const inflight: Set<string> = (crankService as any)._inflightMarkets;
+      expect(inflight.has(slabAddress)).toBe(false);
+
+      await crankService.crankMarket(slabAddress);
+
+      // Whether the body succeeded or failed, the finally clause must release.
+      expect(inflight.has(slabAddress)).toBe(false);
+    });
   });
 
   describe('PERC-381: permanent skip cooldown', () => {
