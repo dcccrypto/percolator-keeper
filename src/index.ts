@@ -287,6 +287,13 @@ crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 // Health endpoint
 const startupTime = Date.now();
 const healthPort = Number(process.env.KEEPER_HEALTH_PORT ?? 8081);
+// L4: reject non-integer or out-of-range port values early so misconfiguration
+// is a startup failure rather than a confusing EACCES/EADDRINUSE at listen time.
+if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) {
+  throw new Error(
+    `Invalid KEEPER_HEALTH_PORT: "${process.env.KEEPER_HEALTH_PORT}" — must be an integer 1..65535`,
+  );
+}
 
 // Rate limiter for /register: max 5 failed auth attempts per IP per 60 seconds.
 // Prevents brute-force attacks against the shared secret.
@@ -812,6 +819,13 @@ async function start() {
   // B13: bind the health port only after every service is wired up. Wrapped in
   // a Promise so start() awaits the bind callback before resolving — otherwise
   // a concurrent /health probe could land between this call and start() resolving.
+  // L3: HTTP server hardening — prevent slowloris and resource exhaustion.
+  // These must be set before listen() so they take effect on the first connection.
+  healthServer.requestTimeout = 10_000;  // 10s max for entire request
+  healthServer.headersTimeout = 5_000;   // 5s max to receive all headers
+  healthServer.keepAliveTimeout = 5_000; // 5s keep-alive idle timeout
+  healthServer.maxConnections = 50;      // cap concurrent connections
+
   // In HA mode the health port still binds here; startupTracker reports
   // "starting" until services actually wire up via onPromote.
   await new Promise<void>((resolve, reject) => {
