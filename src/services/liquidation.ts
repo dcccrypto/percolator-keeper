@@ -366,7 +366,12 @@ export class LiquidationService {
           // v12.17: entryPrice is always 0n (removed from on-chain struct).
           // Use account.pnl directly — it is always populated and accurate.
           const markPnl = account.pnl;
-          const equity = account.capital + markPnl;
+          // Mirror the on-chain maintenance equity: account_equity_maint_raw_wide =
+          // capital + pnl − fee_debt, where fee_debt = -feeCredits when feeCredits < 0
+          // (fee_debt_u128_checked). Omitting it overstated equity for fee-indebted
+          // accounts and silently skipped liquidating them.
+          const feeDebt = account.feeCredits < 0n ? -account.feeCredits : 0n;
+          const equity = account.capital + markPnl - feeDebt;
           const marginRatioBps = computeMarginRatioBps(equity, notional);
 
           // If margin ratio < maintenance margin, this account is liquidatable.
@@ -550,7 +555,9 @@ export class LiquidationService {
         // skipped the re-check entirely on underwater equity, missing
         // the same liquidation case the scanMarket path catches.
         const freshMarkPnl = freshAccount.pnl;
-        const equity = freshAccount.capital + freshMarkPnl;
+        // Same fee-debt correction as the scan path (mirror account_equity_maint_raw_wide).
+        const freshFeeDebt = freshAccount.feeCredits < 0n ? -freshAccount.feeCredits : 0n;
+        const equity = freshAccount.capital + freshMarkPnl - freshFeeDebt;
         const marginRatioBps = computeMarginRatioBps(equity, notional);
         if (
           notional > 0n &&
