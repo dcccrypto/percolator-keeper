@@ -278,6 +278,19 @@ export async function keeperSend(
       ...(isMainnetSender() ? { skipPreflight: true } : {}),
     };
 
+    // M13: re-check leadership IMMEDIATELY before the actual send. The entry
+    // gate at line 190 fired before `await estimateCost(...)`, which can take
+    // 100-500ms for the priority-fee fetch + CU simulation. A Redis renew blip
+    // during that window can demote this node — without this second check, the
+    // demoted node still lands the tx, defeating the single-writer barrier
+    // PR #191 was designed to provide. On demotion, release the reservation as
+    // "drop" so no spend is booked and the budget stays sane.
+    if (!_isLeader()) {
+      logger.warn("keeperSend: lost leadership during estimateCost — aborting before send", { txType });
+      release("drop");
+      return null;
+    }
+
     try {
       const signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
       release("success");
