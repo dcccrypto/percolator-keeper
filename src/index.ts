@@ -287,6 +287,13 @@ crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 // Health endpoint
 const startupTime = Date.now();
 const healthPort = Number(process.env.KEEPER_HEALTH_PORT ?? 8081);
+// SECURITY: bind the health server to loopback by default (mirrors the metrics
+// server's A.8 fix). /health, /pause-status, and /shadow/report expose wallet
+// balance, HA role, budget circuit-breaker state, stale-oracle markets, and shadow
+// decision data; the legacy 2-arg listen(port, cb) defaulted to 0.0.0.0 (publicly
+// visible on any deploy without a firewall). Operators needing remote access must
+// set KEEPER_HEALTH_BIND_ADDR explicitly (and front it with auth/a proxy).
+const healthBindAddr = process.env.KEEPER_HEALTH_BIND_ADDR ?? "127.0.0.1";
 // L4: reject non-integer or out-of-range port values early so misconfiguration
 // is a startup failure rather than a confusing EACCES/EADDRINUSE at listen time.
 if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) {
@@ -830,9 +837,9 @@ async function start() {
   // "starting" until services actually wire up via onPromote.
   await new Promise<void>((resolve, reject) => {
     healthServer.once("error", reject);
-    healthServer.listen(healthPort, () => {
+    healthServer.listen(healthPort, healthBindAddr, () => {
       healthServer.off("error", reject);
-      logger.info("Health endpoint started", { port: healthPort });
+      logger.info("Health endpoint started", { port: healthPort, host: healthBindAddr });
       resolve();
     });
   });
