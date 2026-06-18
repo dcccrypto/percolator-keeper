@@ -30,9 +30,14 @@ export async function resolveV17OracleTail(
   connection: Connection,
 ): Promise<PublicKey[]> {
   const feeds = getV17OracleTailFeeds(market, fallbackOracle);
+  const fallbackKey = fallbackOracle.toBase58();
   return Promise.all(
     feeds.map((feed) => (
-      feed.equals(fallbackOracle)
+      // Compare by base58 (not PublicKey.equals) so the single-oracle fallback
+      // path resolves to the fallback without dereferencing .equals — keeps the
+      // hot path allocation-free AND matches how keys are compared elsewhere in
+      // the keeper (toBase58), which the test fixtures rely on.
+      feed.toBase58() === fallbackKey
         ? fallbackOracle
         : resolveExternalOracleAccount(feed, connection)
     )),
