@@ -173,7 +173,11 @@ async function scanV17Portfolios(
         const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
         const notional = absPos * price / PRICE_E6_DIVISOR;
         if (notional === 0n) continue;
-        const equity = pf.capital + pf.pnl;
+        // #230: subtract fee debt from equity (matches the v12 scan path + the on-chain
+        // liquidation check). fee_debt = -feeCredits when feeCredits < 0. Omitting it
+        // OVERSTATES equity for fee-indebted portfolios → the scanner misses liquidatable ones.
+        const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
+        const equity = pf.capital + pf.pnl - feeDebt;
         const marginRatioBps = computeMarginRatioBps(equity, notional);
         if (marginRatioBps < maintenanceMarginBps) {
           candidates.push({
@@ -729,6 +733,34 @@ export class LiquidationService {
               portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
             });
             return null;
+          }
+          // #229: re-verify the portfolio is STILL undercollateralized at pre-submit, not just
+          // that a leg is active. The owner may have topped up capital between scan and submit;
+          // without this the keeper submits a liquidation the on-chain program then rejects
+          // (wasted fee). Mirrors the v12.x recheck below and uses the same fee-debt-aware
+          // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
+          // unavailable (0) we keep the leg-active check + rely on the on-chain program.
+          const reMmBps = market.params.maintenanceMarginBps;
+          if (scanPriceE6 > 0n && reMmBps > 0n) {
+            const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
+            const equity = pf.capital + pf.pnl - feeDebt;
+            let stillLiquidatable = false;
+            for (const leg of pf.legs) {
+              if (!leg.active || leg.basisPosQ === 0n) continue;
+              const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
+              const notional = absPos * scanPriceE6 / PRICE_E6_DIVISOR;
+              if (notional === 0n) continue;
+              if (computeMarginRatioBps(equity, notional) < reMmBps) {
+                stillLiquidatable = true;
+                break;
+              }
+            }
+            if (!stillLiquidatable) {
+              logger.debug("v17 liquidate: race condition — portfolio no longer undercollateralized at pre-submit", {
+                portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+              });
+              return null;
+            }
           }
         } catch {
           // If we can't re-verify, proceed cautiously — the on-chain program
