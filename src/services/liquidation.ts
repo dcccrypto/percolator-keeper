@@ -367,8 +367,10 @@ export class LiquidationService {
   private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly _DEBOUNCE_MS = 1_000;
   private _unsubLoader?: () => void;
-  // C1 (post-mainnet-audit): per-cycle dedup keyed on (slabAddress, accountIdx)
-  // — the unique on-chain identifier of a User sub-account in Percolator. The
+  // C1 (post-mainnet-audit): per-cycle dedup keyed on the unique on-chain
+  // liquidation target. Legacy slabs use (slabAddress, accountIdx); v17 markets
+  // use (slabAddress, portfolioPubkey) because assetIndex is not a unique
+  // portfolio identifier and is commonly 0 for single-asset markets. The
   // previous "B4" key was the owner pubkey, which silently dropped liquidations
   // of every additional sub-account belonging to the same owner; with multiple
   // sub-accounts per owner being normal usage on a perp DEX, owner-keyed dedup
@@ -600,7 +602,9 @@ export class LiquidationService {
       scanPriceE6: bigint;
     },
   ): Promise<string | null> {
-    const positionKey = `${candidate.slabAddress}:${candidate.accountIdx}`;
+    const positionKey = candidate.v17PortfolioPubkey
+      ? `${candidate.slabAddress}:v17:${candidate.v17PortfolioPubkey.toBase58()}`
+      : `${candidate.slabAddress}:v12:${candidate.accountIdx}`;
     if (this._cycleSeenPositions.has(positionKey)) {
       logger.debug("Skipping position already targeted this cycle", {
         positionKey,
