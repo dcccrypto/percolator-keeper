@@ -29,6 +29,7 @@ import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
+import { parseV17RiskParams } from "../lib/v17-risk.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -419,7 +420,8 @@ export class LiquidationService {
       if (isV17Account(data)) {
         // Resolve price from the v17 config (markEwmaE6 acts as lastEffectivePriceE6)
         const price = market.config.lastEffectivePriceE6 ?? market.config.authorityPriceE6 ?? 0n;
-        const maintenanceMarginBps = market.params.maintenanceMarginBps;
+        const v17Params = parseV17RiskParams(data);
+        const maintenanceMarginBps = v17Params.maintenanceMarginBps;
         const connection = getConnection();
         const v17Candidates = await scanV17Portfolios(
           connection,
@@ -740,7 +742,8 @@ export class LiquidationService {
           // (wasted fee). Mirrors the v12.x recheck below and uses the same fee-debt-aware
           // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
           // unavailable (0) we keep the leg-active check + rely on the on-chain program.
-          const reMmBps = market.params.maintenanceMarginBps;
+          const freshMarketData = await fetchSlabWithRetry(slabAddress);
+          const reMmBps = parseV17RiskParams(freshMarketData).maintenanceMarginBps;
           if (scanPriceE6 > 0n && reMmBps > 0n) {
             const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
             const equity = pf.capital + pf.pnl - feeDebt;

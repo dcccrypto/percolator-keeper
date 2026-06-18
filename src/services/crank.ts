@@ -35,6 +35,7 @@ import {
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
+import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -223,7 +224,7 @@ async function discoverV17Markets(
             },
           },
         ],
-        dataSlice: { offset: 0, length: 512 }, // Enough for header(16) + config(432) + some market group
+        dataSlice: { offset: 0, length: V17_RISK_PARAMS_MIN_DATA_LEN },
       }),
       RPC_TIMEOUT_MS * 2,
       `discoverV17Markets(${programId.toBase58().slice(0, 8)})`,
@@ -246,9 +247,10 @@ async function discoverV17Markets(
       const wrapperCfg = parseWrapperConfigV17(data);
       const marketConfig = wrapperConfigV17ToMarketConfig(wrapperCfg);
 
-      // Stub engine/params/header with zero values — these fields are read from
-      // the market group account's dynamic section (beyond the 512-byte slice).
-      // For crank purposes (oracle resolution, discovery) only config is needed.
+      // Stub engine/header with zero values — these fields are read from
+      // the market group account's dynamic section. Risk params are parsed
+      // from the v17 market-group header below, because liquidation logic
+      // must not assume every market uses the 500 bps default.
       const stubEngine = {
         vault: 0n, insuranceFund: { balance: 0n, feeRevenue: 0n, isolatedBalance: 0n, isolationBps: 0 },
         currentSlot: 0n, fundingIndexQpbE6: 0n, lastFundingSlot: 0n,
@@ -264,12 +266,7 @@ async function discoverV17Markets(
         resolvedKLongTerminalDelta: 0n, resolvedKShortTerminalDelta: 0n, resolvedLivePrice: 0n,
         numUsedAccounts: 0, nextAccountId: 0n,
       };
-      const stubParams = {
-        warmupPeriodSlots: 0n, maintenanceMarginBps: 500n, // 5% maintenance margin default
-        hMin: 0n, hMax: 0n, openInterestCap: 0n,
-        maintenanceFeePerSlot: 0n, liquidationFeeShareBps: 0n,
-        adlFillCapBps: 0n, minPositionSize: 0n,
-      };
+      const v17Params = parseV17RiskParams(data);
       const stubHeader = {
         magic: 0n, version: 16, kind: 1,
         marketCreatedSlot: 0n, resolvedSlot: 0n,
@@ -281,7 +278,7 @@ async function discoverV17Markets(
         header: stubHeader as never,
         config: marketConfig,
         engine: stubEngine as never,
-        params: stubParams as never,
+        params: v17Params as never,
       };
       // Attach raw v17 config for multi-leg HYBRID_AFTER_HOURS oracle tail construction.
       market._rawV17Config = wrapperCfg;
@@ -328,19 +325,14 @@ function parseMarketFromAccountData(
         resolvedKLongTerminalDelta: 0n, resolvedKShortTerminalDelta: 0n, resolvedLivePrice: 0n,
         numUsedAccounts: 0, nextAccountId: 0n,
       };
-      const stubParams = {
-        warmupPeriodSlots: 0n, maintenanceMarginBps: 500n,
-        hMin: 0n, hMax: 0n, openInterestCap: 0n,
-        maintenanceFeePerSlot: 0n, liquidationFeeShareBps: 0n,
-        adlFillCapBps: 0n, minPositionSize: 0n,
-      };
+      const v17Params = parseV17RiskParams(data);
       const stubHeader = { magic: 0n, version: 16, kind: 1, marketCreatedSlot: 0n, resolvedSlot: 0n };
       const market: DiscoveredMarket & { _rawV17Config?: ReturnType<typeof parseWrapperConfigV17> } = {
         slabAddress: pubkey, programId,
         header: stubHeader as never,
         config: marketConfig,
         engine: stubEngine as never,
-        params: stubParams as never,
+        params: v17Params as never,
       };
       market._rawV17Config = wrapperCfg;
       return market;
