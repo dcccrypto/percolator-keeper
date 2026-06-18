@@ -579,6 +579,50 @@ export class LiquidationService {
   }
 
   /**
+   * #218: shared liquidation gate — dedup by (slab, accountIdx) and enforce the per-owner
+   * cap (MAX_LIQ_PER_OWNER_PER_CYCLE) across the cycle BEFORE liquidating. Used by BOTH the
+   * polling path AND the LaserStream event path, so the event path can no longer bypass the
+   * dedup/rate-cap (which previously let a position be liquidated twice — once by each path —
+   * and let one owner be hammered past the cap). Returns the tx signature if sent, else null.
+   * The dedup state is cleared per polling cycle (start of runCycle), which bounds the window.
+   */
+  private async gatedLiquidate(
+    market: DiscoveredMarket,
+    candidate: {
+      slabAddress: string;
+      accountIdx: number;
+      owner: string;
+      v17PortfolioPubkey?: PublicKey;
+      scanPriceE6: bigint;
+    },
+  ): Promise<string | null> {
+    const positionKey = `${candidate.slabAddress}:${candidate.accountIdx}`;
+    if (this._cycleSeenPositions.has(positionKey)) {
+      logger.debug("Skipping position already targeted this cycle", {
+        positionKey,
+        owner: candidate.owner.slice(0, 8),
+      });
+      return null;
+    }
+    const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
+    if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
+      logger.debug("Owner hit per-cycle liquidation cap", {
+        owner: candidate.owner.slice(0, 8),
+        cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
+      });
+      return null;
+    }
+    this._cycleSeenPositions.add(positionKey);
+    this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
+    return (await this.liquidate(
+      market,
+      candidate.accountIdx,
+      candidate.v17PortfolioPubkey,
+      candidate.scanPriceE6,
+    )) ?? null;
+  }
+
+  /**
    * Execute liquidation for an undercollateralized account.
    * Prepends oracle price push + crank (to ensure fresh state) then liquidates.
    *
@@ -925,32 +969,10 @@ export class LiquidationService {
         // C1: dedup per on-chain (slab, accountIdx) position; rate-limit per
         // owner across the cycle.
         for (const candidate of candidates) {
-          const positionKey = `${candidate.slabAddress}:${candidate.accountIdx}`;
-          if (this._cycleSeenPositions.has(positionKey)) {
-            logger.debug("Skipping position already targeted this cycle", {
-              positionKey,
-              owner: candidate.owner.slice(0, 8),
-            });
-            continue;
-          }
-          // Main hardening: rate-limit per owner across the cycle (prevents hammering one wallet).
-          const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
-          if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
-            logger.debug("Owner hit per-cycle liquidation cap", {
-              owner: candidate.owner.slice(0, 8),
-              cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
-            });
-            continue;
-          }
-          this._cycleSeenPositions.add(positionKey);
-          this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
-          // v17: pass portfolioPubkey for DESYNC-3; scanPriceE6 for drift guard (main hardening).
-          const sig = await this.liquidate(
-            filteredBatch[j]!.market,
-            candidate.accountIdx,
-            candidate.v17PortfolioPubkey,
-            candidate.scanPriceE6,
-          );
+          // C1/#218: dedup by (slab, accountIdx) + per-owner cap are enforced inside the
+          // shared gate, which the LaserStream event path also uses — so neither path can
+          // bypass it.
+          const sig = await this.gatedLiquidate(filteredBatch[j]!.market, candidate);
           if (sig) liquidated++;
         }
       }
@@ -1056,7 +1078,9 @@ export class LiquidationService {
             // Single-market scan — fire-and-forget; errors logged inside scanMarket.
             this.scanMarket(market.market).then(async (candidates) => {
               for (const c of candidates) {
-                const sig = await this.liquidate(market.market, c.accountIdx, c.v17PortfolioPubkey, c.scanPriceE6);
+                // #218: route through the shared gate so the event path honors the same
+                // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
+                const sig = await this.gatedLiquidate(market.market, c);
                 if (sig) {
                   logger.info("Event-driven liquidation complete", {
                     slabAddress: slabKey,
