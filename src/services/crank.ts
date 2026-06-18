@@ -6,7 +6,6 @@ import {
   encodeRestartAssetOracle,
   CrankAction,
   buildIx,
-  derivePythPushOraclePDA,
   fetchSlab,
   parseHeader,
   parseConfig,
@@ -25,6 +24,7 @@ import {
 } from "@percolatorct/sdk";
 import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
+import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -1226,7 +1226,7 @@ export class CrankService {
    * Returns the slab address itself for admin-oracle or zero-feed markets
    * (HYPERP oracle mode was removed in v17 — tag 34 is now ConfigureHybridOracle).
    */
-  private resolveOracleKey(market: DiscoveredMarket): PublicKey {
+  private async resolveOracleKey(market: DiscoveredMarket): Promise<PublicKey> {
     if (this.isAdminOracle(market)) {
       return market.slabAddress;
     }
@@ -1236,10 +1236,12 @@ export class CrankService {
       // Zero feed — use slab as oracle placeholder (no separate oracle account).
       return market.slabAddress;
     }
-    const feedHex = Array.from(feedBytes)
-      .map((b: number) => b.toString(16).padStart(2, "0"))
-      .join("");
-    return derivePythPushOraclePDA(feedHex)[0];
+    // #179: Pyth vs Chainlink is indistinguishable from config alone — resolve by the
+    // on-chain feed account OWNER so a Chainlink market gets index_feed_id (the aggregator
+    // account itself) rather than a wrong derived Pyth PDA, which would make it never
+    // crank/liquidate. resolveExternalOracleAccount caches per feed and falls back to the
+    // Pyth PDA on lookup failure, so Pyth markets are unaffected.
+    return resolveExternalOracleAccount(market.config.indexFeedId, getConnection());
   }
 
   /**
@@ -1262,12 +1264,12 @@ export class CrankService {
    * in order so the program can read each leg's price.
    * For MANUAL/EWMA_MARK/AUTH_MARK the single oracleKey (slab placeholder) is used.
    */
-  private buildPermissionlessCrankKeys(
+  private async buildPermissionlessCrankKeys(
     owner: PublicKey,
     market: DiscoveredMarket,
     portfolio: PublicKey,
     oracleKey: PublicKey,
-  ): { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] {
+  ): Promise<{ pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[]> {
     const fixed: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
       { pubkey: owner,                isSigner: true,  isWritable: true  },
       { pubkey: market.slabAddress,   isSigner: false, isWritable: true  },
@@ -1283,10 +1285,9 @@ export class CrankService {
       for (let i = 0; i < rawCfg.oracleLegCount; i++) {
         const feed = rawCfg.oracleLegFeeds[i];
         if (feed) {
-          const feedHex = Array.from(feed.toBytes())
-            .map((b: number) => b.toString(16).padStart(2, "0"))
-            .join("");
-          const [legOracle] = derivePythPushOraclePDA(feedHex);
+          // #179: resolve each leg feed by on-chain owner too (a Chainlink leg gets the
+          // aggregator account; a Pyth leg gets its push-oracle PDA).
+          const legOracle = await resolveExternalOracleAccount(feed, getConnection());
           fixed.push({ pubkey: legOracle, isSigner: false, isWritable: false });
         } else {
           fixed.push({ pubkey: oracleKey, isSigner: false, isWritable: false });
@@ -1421,7 +1422,7 @@ export class CrankService {
         return false;
       }
 
-      const oracleKey = this.resolveOracleKey(market);
+      const oracleKey = await this.resolveOracleKey(market);
 
       // Fetch current slot for nowSlot arg (crank freshness check).
       let nowSlot: bigint;
@@ -1448,7 +1449,7 @@ export class CrankService {
         recoveryReason: 0,
       });
 
-      const crankKeys = this.buildPermissionlessCrankKeys(
+      const crankKeys = await this.buildPermissionlessCrankKeys(
         keypair.publicKey,
         market,
         state.keeperPortfolio,

@@ -10,7 +10,6 @@ import {
   buildIx,
   encodePermissionlessCrank,
   CrankAction,
-  derivePythPushOraclePDA,
   // v17 portfolio scanning (DESYNC-3 / DESYNC-4 fixes)
   isV17Account,
   parsePortfolioV17,
@@ -18,6 +17,7 @@ import {
 } from "@percolatorct/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
+import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -614,7 +614,11 @@ export class LiquidationService {
       const feedIdBytes = market.config.indexFeedId.toBytes();
       const feedHex = Array.from(feedIdBytes).map(b => b.toString(16).padStart(2, "0")).join("");
       const isAllZeros = feedHex === "0".repeat(64);
-      const oracleAccount = isAllZeros ? slabAddress : derivePythPushOraclePDA(feedHex)[0];
+      // #179: resolve by on-chain feed owner so a Chainlink market gets index_feed_id
+      // (the aggregator) instead of a wrong Pyth PDA — otherwise it never liquidates.
+      const oracleAccount = isAllZeros
+        ? slabAddress
+        : await resolveExternalOracleAccount(market.config.indexFeedId, connection);
 
       // Fetch current slot for nowSlot arg.
       let nowSlot: bigint;
