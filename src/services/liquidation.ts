@@ -30,6 +30,7 @@ import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
 import { parseV17RiskParams } from "../lib/v17-risk.js";
+import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 
 const logger = createLogger("keeper:liquidation");
 
@@ -702,12 +703,18 @@ export class LiquidationService {
       // For v12.x markets, keep the legacy placeholder (slabAddress).
       const portfolioAccount = v17PortfolioPubkey ?? slabAddress;
 
-      // v17 layout: [owner(s,w), market(w), portfolio(w), oracle(r)]
+      const oracleTail = await resolveV17OracleTail(
+        market as unknown as Parameters<typeof resolveV17OracleTail>[0],
+        oracleAccount,
+        connection,
+      );
+
+      // v17 layout: [owner(s,w), market(w), portfolio(w), ...oracleTail(r)]
       const crankKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
         { pubkey: keypair.publicKey, isSigner: true,  isWritable: true  },
         { pubkey: slabAddress,       isSigner: false, isWritable: true  },
         { pubkey: portfolioAccount,  isSigner: false, isWritable: true  },
-        { pubkey: oracleAccount,     isSigner: false, isWritable: false },
+        ...oracleTail.map((pubkey) => ({ pubkey, isSigner: false, isWritable: false })),
       ];
 
       const instructions: TransactionInstruction[] = [

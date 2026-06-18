@@ -36,6 +36,7 @@ import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
+import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 
 const logger = createLogger("keeper:crank");
 
@@ -1268,25 +1269,13 @@ export class CrankService {
       { pubkey: portfolio,            isSigner: false, isWritable: true  },
     ];
 
-    // For HYBRID_AFTER_HOURS (oracle_mode=1) with multiple oracle legs, derive a Pyth
-    // push-oracle PDA for each leg feed and append them all in order.
-    // oracle_leg_count is available via the raw config; fall back to single oracleKey
-    // for all other modes (MANUAL=0, EWMA_MARK=2, AUTH_MARK=3).
-    const rawCfg = (market as unknown as { _rawV17Config?: ReturnType<typeof parseWrapperConfigV17> })._rawV17Config;
-    if (rawCfg && rawCfg.oracleMode === 1 && rawCfg.oracleLegCount > 1) {
-      for (let i = 0; i < rawCfg.oracleLegCount; i++) {
-        const feed = rawCfg.oracleLegFeeds[i];
-        if (feed) {
-          // #179: resolve each leg feed by on-chain owner too (a Chainlink leg gets the
-          // aggregator account; a Pyth leg gets its push-oracle PDA).
-          const legOracle = await resolveExternalOracleAccount(feed, getConnection());
-          fixed.push({ pubkey: legOracle, isSigner: false, isWritable: false });
-        } else {
-          fixed.push({ pubkey: oracleKey, isSigner: false, isWritable: false });
-        }
-      }
-    } else {
-      fixed.push({ pubkey: oracleKey, isSigner: false, isWritable: false });
+    const oracleTail = await resolveV17OracleTail(
+      market as unknown as Parameters<typeof resolveV17OracleTail>[0],
+      oracleKey,
+      getConnection(),
+    );
+    for (const pubkey of oracleTail) {
+      fixed.push({ pubkey, isSigner: false, isWritable: false });
     }
 
     return fixed;
