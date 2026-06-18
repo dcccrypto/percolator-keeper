@@ -185,19 +185,15 @@ describe("@percolatorct/sdk exports — encodeLiquidateAtOracle (keeper)", () =>
     expect(typeof encodeLiquidateAtOracle).toBe("function");
   });
 
-  it("encodeLiquidateAtOracle({targetIdx:0}) returns a 3-byte Uint8Array", () => {
-    const data = encodeLiquidateAtOracle({ targetIdx: 0 });
-    expect(data).toBeInstanceOf(Uint8Array);
-    // 1 byte tag + 2 bytes targetIdx = 3 bytes
-    expect(data.length).toBe(3);
+  // v17: LiquidateAtOracle (v12 tag 7) is NOT in the v17 wrapper — replaced by
+  // PermissionlessCrank (tag 5). encodeLiquidateAtOracle() throws removedInstruction()
+  // so it can't be accidentally used against a v17 program.
+  it("encodeLiquidateAtOracle throws at runtime in v17 — replaced by PermissionlessCrank", () => {
+    expect(() => encodeLiquidateAtOracle({ targetIdx: 0 })).toThrow();
   });
 
-  it("encodeLiquidateAtOracle tag byte is IX_TAG.LiquidateAtOracle (7)", () => {
-    const data = encodeLiquidateAtOracle({ targetIdx: 42 });
-    expect(data[0]).toBe(7);
-    // targetIdx=42 in LE u16 = 0x2a 0x00
-    expect(data[1]).toBe(42);
-    expect(data[2]).toBe(0);
+  it("encodeLiquidateAtOracle throws for any targetIdx", () => {
+    expect(() => encodeLiquidateAtOracle({ targetIdx: 42 })).toThrow();
   });
 });
 
@@ -227,11 +223,11 @@ describe("@percolatorct/sdk exports — encodeUpdateHyperpMark (keeper/crank)", 
     expect(typeof encodeUpdateHyperpMark).toBe("function");
   });
 
-  it("encodeUpdateHyperpMark() returns a 1-byte Uint8Array with value 34", () => {
-    const data = encodeUpdateHyperpMark();
-    expect(data).toBeInstanceOf(Uint8Array);
-    expect(data.length).toBe(1);
-    expect(data[0]).toBe(34);
+  // v17: UpdateHyperpMark (v12 DEX-pool mark crank, tag 34) is removed — tag 34 is
+  // ConfigureHybridOracle in v17. encodeUpdateHyperpMark() throws removedInstruction();
+  // mark refresh now goes through PermissionlessCrank (tag 5) / ConfigureEwmaMark (tag 35).
+  it("encodeUpdateHyperpMark throws at runtime in v17 — tag 34 is now ConfigureHybridOracle", () => {
+    expect(() => encodeUpdateHyperpMark()).toThrow();
   });
 });
 
