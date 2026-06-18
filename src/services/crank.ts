@@ -831,6 +831,42 @@ export class CrankService {
   }
 
   /**
+   * v17 markets need a keeper-owned portfolio before PermissionlessCrank can run.
+   * Provisioning can fail transiently, so discovery calls this on first insert and
+   * again on rediscovery while keeperPortfolio is still null.
+   */
+  private ensureKeeperPortfolio(key: string, market: DiscoveredMarket): void {
+    void (async () => {
+      try {
+        const connection = getConnection();
+        const keypair = this._keypair;
+        const portfolio = await provisionKeeperPortfolio(
+          connection,
+          market.programId,
+          market.slabAddress,
+          keypair.publicKey,
+          keypair,
+        );
+        const state = this.markets.get(key);
+        if (state) {
+          state.keeperPortfolio = portfolio;
+          if (portfolio) {
+            logger.info("Keeper portfolio provisioned", {
+              market: key.slice(0, 8),
+              portfolio: portfolio.toBase58().slice(0, 8),
+            });
+          }
+        }
+      } catch (provErr) {
+        logger.debug("Portfolio provisioning deferred", {
+          market: key.slice(0, 8),
+          error: provErr instanceof Error ? provErr.message : String(provErr),
+        });
+      }
+    })();
+  }
+
+  /**
    * PERC-1650: Per-program 429 retry backoff for discoverMarkets calls.
    * Escalating delays: 3s → 9s → 27s → 81s before giving up.
    * Applied at the program level (outer loop).
@@ -1104,37 +1140,13 @@ export class CrankService {
         // The provisioning result updates state.keeperPortfolio in place.
         // If provisioning fails (network error or portfolio already being created),
         // the market will be skipped this cycle and retried on next discovery.
-        (async () => {
-          try {
-            const connection = getConnection();
-            const keypair = this._keypair;
-            const portfolio = await provisionKeeperPortfolio(
-              connection,
-              market.programId,
-              market.slabAddress,
-              keypair.publicKey,
-              keypair,
-            );
-            const state = this.markets.get(key);
-            if (state) {
-              state.keeperPortfolio = portfolio;
-              if (portfolio) {
-                logger.info("Keeper portfolio provisioned", {
-                  market: key.slice(0, 8),
-                  portfolio: portfolio.toBase58().slice(0, 8),
-                });
-              }
-            }
-          } catch (provErr) {
-            logger.debug("Portfolio provisioning deferred", {
-              market: key.slice(0, 8),
-              error: provErr instanceof Error ? provErr.message : String(provErr),
-            });
-          }
-        })();
+        this.ensureKeeperPortfolio(key, market);
       } else {
         const state = this.markets.get(key)!;
         state.market = market;
+        if (!state.keeperPortfolio) {
+          this.ensureKeeperPortfolio(key, market);
+        }
         // Update mainnetCA from Supabase on every discovery.
         // Use explicit undefined check so a DB null/removal clears stale values (not just truthy-set).
         if (dbMeta !== undefined) {
