@@ -147,6 +147,35 @@ describe("HeliusPriorityFeeEstimator", () => {
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
+  it("uses SOLANA_RPC_URL when no explicit or Helius RPC URL is provided", async () => {
+    const origHelius = process.env.HELIUS_RPC_URL;
+    const origSolana = process.env.SOLANA_RPC_URL;
+    const origRpc = process.env.RPC_URL;
+    delete process.env.HELIUS_RPC_URL;
+    delete process.env.RPC_URL;
+    process.env.SOLANA_RPC_URL = "https://solana-rpc.example.com";
+
+    try {
+      const fetchFn = mockFetch(HELIUS_SUCCESS_RESPONSE);
+      global.fetch = fetchFn;
+      const estimator = new HeliusPriorityFeeEstimator(undefined, { cacheMs: 0 });
+
+      await estimator.estimate(["acc1"], "crank");
+
+      expect(fetchFn).toHaveBeenCalledWith(
+        "https://solana-rpc.example.com",
+        expect.objectContaining({ method: "POST" }),
+      );
+    } finally {
+      if (origHelius === undefined) delete process.env.HELIUS_RPC_URL;
+      else process.env.HELIUS_RPC_URL = origHelius;
+      if (origSolana === undefined) delete process.env.SOLANA_RPC_URL;
+      else process.env.SOLANA_RPC_URL = origSolana;
+      if (origRpc === undefined) delete process.env.RPC_URL;
+      else process.env.RPC_URL = origRpc;
+    }
+  });
+
   it("reads percentile overrides from env", async () => {
     const origEnv = process.env.KEEPER_PRIORITY_FEE_PERCENTILE_CRANK;
     // Override crank to p95 (veryHigh)

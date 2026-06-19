@@ -83,7 +83,12 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
   private readonly _cache = new Map<string, { value: number; expiresAt: number }>();
 
   constructor(rpcUrl?: string, opts?: { cacheMs?: number }) {
-    this._rpcUrl = rpcUrl ?? process.env.HELIUS_RPC_URL ?? process.env.RPC_URL ?? "";
+    this._rpcUrl =
+      rpcUrl ??
+      process.env.HELIUS_RPC_URL ??
+      process.env.SOLANA_RPC_URL ??
+      process.env.RPC_URL ??
+      "";
     this._cacheMs =
       opts?.cacheMs ??
       parseInt(process.env.KEEPER_PRIORITY_FEE_CACHE_MS ?? String(DEFAULT_CACHE_MS), 10);
