@@ -12,6 +12,7 @@ import {
   CrankAction,
   // v17 portfolio scanning (DESYNC-3 / DESYNC-4 fixes)
   isV17Account,
+  parseWrapperConfigV17,
   parsePortfolioV17,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
@@ -316,6 +317,22 @@ function resolveMarketPrice(
   }
   // Authority stale — fall back to lastEffectivePriceE6 (mirrors on-chain behavior)
   return { price: cfg.lastEffectivePriceE6, stale: true };
+}
+
+function resolveV17WrapperPrice(
+  cfg: ReturnType<typeof parseWrapperConfigV17>,
+  nowSec: bigint,
+): bigint {
+  if (cfg.oracleMode === 3) {
+    const maxStalenessSecs = cfg.maxStalenessSecs > 0n ? cfg.maxStalenessSecs : 60n;
+    const priceAge = cfg.oracleTargetPublishTime > 0n
+      ? nowSec - cfg.oracleTargetPublishTime
+      : nowSec;
+    if (cfg.oracleTargetPriceE6 > 0n && priceAge <= maxStalenessSecs) {
+      return cfg.oracleTargetPriceE6;
+    }
+  }
+  return cfg.markEwmaE6;
 }
 
 interface LiquidationCandidate {
@@ -755,14 +772,40 @@ export class LiquidationService {
           // unavailable (0) we keep the leg-active check + rely on the on-chain program.
           const freshMarketData = await fetchSlabWithRetry(slabAddress);
           const reMmBps = parseV17RiskParams(freshMarketData).maintenanceMarginBps;
-          if (scanPriceE6 > 0n && reMmBps > 0n) {
+          const freshNowSec = await fetchClusterUnixTimeSec(connection);
+          const freshPrice = resolveV17WrapperPrice(parseWrapperConfigV17(freshMarketData), freshNowSec);
+          if (freshPrice === 0n) {
+            logger.warn("v17 liquidate: no fresh price available for pre-submit recheck, aborting", {
+              portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+              slabAddress: slabAddress.toBase58().slice(0, 8),
+            });
+            return null;
+          }
+          if (MAX_LIQUIDATION_DRIFT_BPS > 0n && scanPriceE6 > 0n) {
+            const delta = freshPrice > scanPriceE6
+              ? freshPrice - scanPriceE6
+              : scanPriceE6 - freshPrice;
+            const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
+            if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+              logger.warn("Aborting v17 liquidation: oracle drift exceeds limit", {
+                portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+                slabAddress: slabAddress.toBase58(),
+                scanPriceE6: scanPriceE6.toString(),
+                freshPriceE6: freshPrice.toString(),
+                driftBps: driftBps.toString(),
+                limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+              });
+              return null;
+            }
+          }
+          if (reMmBps > 0n) {
             const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
             const equity = pf.capital + pf.pnl - feeDebt;
             let stillLiquidatable = false;
             for (const leg of pf.legs) {
               if (!leg.active || leg.basisPosQ === 0n) continue;
               const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
-              const notional = absPos * scanPriceE6 / PRICE_E6_DIVISOR;
+              const notional = absPos * freshPrice / PRICE_E6_DIVISOR;
               if (notional === 0n) continue;
               if (computeMarginRatioBps(equity, notional) < reMmBps) {
                 stillLiquidatable = true;

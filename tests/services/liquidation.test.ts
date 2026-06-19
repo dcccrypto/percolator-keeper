@@ -54,6 +54,7 @@ vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: { TradeNoCpi: 1, TradeCpi: 2 },
   // v17 additions — default false so legacy-path tests continue to work.
   isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
   parsePortfolioV17: vi.fn(),
 }));
 
@@ -127,6 +128,20 @@ vi.mock('../../src/lib/keeper-send.js', async () => {
     sharedBudget: new KeeperBudget(),
   };
 });
+
+vi.mock('../../src/lib/v17-risk.js', () => ({
+  parseV17RiskParams: vi.fn(() => ({
+    warmupPeriodSlots: 0n,
+    maintenanceMarginBps: 500n,
+    hMin: 0n,
+    hMax: 0n,
+    openInterestCap: 0n,
+    maintenanceFeePerSlot: 0n,
+    liquidationFeeShareBps: 0n,
+    adlFillCapBps: 0n,
+    minPositionSize: 0n,
+  })),
+}));
 
 import { PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
 import { LiquidationService } from '../../src/services/liquidation.js';
@@ -397,6 +412,70 @@ describe('LiquidationService', () => {
   });
 
   describe('liquidate', () => {
+    it('aborts v17 liquidation when fresh wrapper price drifts beyond the configured limit', async () => {
+      const nowSec = BigInt(Math.floor(Date.now() / 1000));
+      const clockData = Buffer.alloc(40);
+      clockData.writeBigInt64LE(nowSec, 32);
+      const slabAddress = new PublicKey('11111111111111111111111111111111');
+      const portfolioPubkey = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+      const connection = {
+        getSlot: vi.fn(async () => 200),
+        getAccountInfo: vi.fn(async (pubkey: PublicKey) => {
+          if (pubkey.toBase58() === portfolioPubkey.toBase58()) {
+            return { data: new Uint8Array([1, 2, 3]) };
+          }
+          return { data: clockData };
+        }),
+      };
+
+      vi.mocked(shared.getConnection)
+        .mockReturnValueOnce(connection as any)
+        .mockReturnValueOnce(connection as any);
+      vi.mocked(core.fetchSlab).mockResolvedValueOnce(new Uint8Array(512));
+      vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
+        owner: new PublicKey('So11111111111111111111111111111111111111112'),
+        capital: 1_000_000n,
+        pnl: 0n,
+        feeCredits: 0n,
+        legs: [
+          {
+            active: true,
+            basisPosQ: 100_000_000_000n,
+            assetIndex: 0,
+          },
+        ],
+      } as any);
+      vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+        oracleMode: 2, // EWMA_MARK
+        maxStalenessSecs: 60n,
+        oracleTargetPriceE6: 0n,
+        oracleTargetPublishTime: 0n,
+        markEwmaE6: 2_000_000n,
+      } as any);
+
+      const market = {
+        slabAddress,
+        programId: slabAddress,
+        config: {
+          collateralMint: slabAddress,
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: mockZeroKey() },
+      };
+
+      const sig = await liquidationService.liquidate(
+        market as any,
+        0,
+        portfolioPubkey,
+        1_000_000n,
+      );
+
+      expect(sig).toBeNull();
+      expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
+    });
+
     it('should execute liquidation with multi-instruction transaction', async () => {
       const mockMarket = {
         slabAddress: { toBase58: () => 'Market311111111111111111111111111111111' },
