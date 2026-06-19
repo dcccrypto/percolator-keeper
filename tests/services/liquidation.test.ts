@@ -54,6 +54,7 @@ vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: { TradeNoCpi: 1, TradeCpi: 2 },
   // v17 additions — default false so legacy-path tests continue to work.
   isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
   parsePortfolioV17: vi.fn(),
 }));
 
@@ -127,6 +128,20 @@ vi.mock('../../src/lib/keeper-send.js', async () => {
     sharedBudget: new KeeperBudget(),
   };
 });
+
+vi.mock('../../src/lib/v17-risk.js', () => ({
+  parseV17RiskParams: vi.fn(() => ({
+    warmupPeriodSlots: 0n,
+    maintenanceMarginBps: 500n,
+    hMin: 0n,
+    hMax: 0n,
+    openInterestCap: 0n,
+    maintenanceFeePerSlot: 0n,
+    liquidationFeeShareBps: 0n,
+    adlFillCapBps: 0n,
+    minPositionSize: 0n,
+  })),
+}));
 
 import { PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
 import { LiquidationService } from '../../src/services/liquidation.js';
@@ -393,6 +408,75 @@ describe('LiquidationService', () => {
       const candidates = await liquidationService.scanMarket(mockMarket as any);
 
       expect(candidates).toHaveLength(0); // Skipped due to stale price and no fallback
+    });
+
+    it('uses the fresh v17 AUTH_MARK price instead of cached zero market.config price', async () => {
+      const nowSec = BigInt(Math.floor(Date.now() / 1000));
+      const clockData = Buffer.alloc(40);
+      clockData.writeBigInt64LE(nowSec, 32);
+      const portfolioPubkey = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+      const owner = new PublicKey('So11111111111111111111111111111111111111112');
+      const connection = {
+        getAccountInfo: vi.fn(async () => ({ data: clockData })),
+        getProgramAccounts: vi.fn(async () => [
+          { pubkey: portfolioPubkey, account: { data: new Uint8Array([1, 2, 3]) } },
+        ]),
+      };
+
+      vi.mocked(shared.getConnection)
+        .mockReturnValueOnce(connection as any)
+        .mockReturnValueOnce(connection as any);
+      vi.mocked(core.fetchSlab).mockResolvedValueOnce(new Uint8Array(512));
+      vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+      vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+        oracleMode: 3, // AUTH_MARK
+        maxStalenessSecs: 60n,
+        oracleTargetPriceE6: 2_000_000n,
+        oracleTargetPublishTime: nowSec,
+        markEwmaE6: 0n,
+      } as any);
+      vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
+        owner,
+        capital: 1_000_000n,
+        pnl: 0n,
+        feeCredits: 0n,
+        legs: [
+          {
+            active: true,
+            basisPosQ: 100_000_000_000n,
+            assetIndex: 0,
+          },
+        ],
+      } as any);
+
+      const mockMarket = {
+        slabAddress: new PublicKey('11111111111111111111111111111111'),
+        programId: new PublicKey('11111111111111111111111111111111'),
+        config: {
+          collateralMint: owner,
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),
+          // Regression guard: cached discovery-time price is unusable, but the
+          // freshly fetched v17 wrapper has a valid AUTH_MARK target above.
+          lastEffectivePriceE6: 0n,
+          authorityPriceE6: 0n,
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: mockZeroKey() },
+      };
+
+      const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]!.scanPriceE6).toBe(2_000_000n);
+      expect(connection.getProgramAccounts).toHaveBeenCalledWith(
+        mockMarket.programId,
+        expect.objectContaining({
+          filters: expect.arrayContaining([
+            expect.objectContaining({ dataSize: 9347 }),
+          ]),
+        }),
+      );
     });
   });
 

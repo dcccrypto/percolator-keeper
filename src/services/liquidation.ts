@@ -12,6 +12,7 @@ import {
   CrankAction,
   // v17 portfolio scanning (DESYNC-3 / DESYNC-4 fixes)
   isV17Account,
+  parseWrapperConfigV17,
   parsePortfolioV17,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
@@ -318,6 +319,26 @@ function resolveMarketPrice(
   return { price: cfg.lastEffectivePriceE6, stale: true };
 }
 
+function resolveV17ScanPrice(
+  cfg: ReturnType<typeof parseWrapperConfigV17>,
+  nowSec: bigint,
+): bigint {
+  // Program enum (v16_program.rs): MANUAL=0, HYBRID_AFTER_HOURS=1,
+  // EWMA_MARK=2, AUTH_MARK=3. AUTH_MARK is the only v17 mode whose fresh
+  // authority target should beat the EWMA fallback during liquidation scans.
+  if (cfg.oracleMode === 3) {
+    const maxStalenessSecs = cfg.maxStalenessSecs > 0n ? cfg.maxStalenessSecs : 60n;
+    const priceAge = cfg.oracleTargetPublishTime > 0n
+      ? nowSec - cfg.oracleTargetPublishTime
+      : nowSec;
+    if (cfg.oracleTargetPriceE6 > 0n && priceAge <= maxStalenessSecs) {
+      return cfg.oracleTargetPriceE6;
+    }
+  }
+
+  return cfg.markEwmaE6;
+}
+
 interface LiquidationCandidate {
   slabAddress: string;
   accountIdx: number;
@@ -421,11 +442,12 @@ export class LiquidationService {
 
       // DESYNC-3 FIX: Route v17 accounts through the portfolio-based scanner.
       if (isV17Account(data)) {
-        // Resolve price from the v17 config (markEwmaE6 acts as lastEffectivePriceE6)
-        const price = market.config.lastEffectivePriceE6 ?? market.config.authorityPriceE6 ?? 0n;
+        const connection = getConnection();
+        const nowSec = await fetchClusterUnixTimeSec(connection);
+        const wrapperCfg = parseWrapperConfigV17(data);
+        const price = resolveV17ScanPrice(wrapperCfg, nowSec);
         const v17Params = parseV17RiskParams(data);
         const maintenanceMarginBps = v17Params.maintenanceMarginBps;
-        const connection = getConnection();
         const v17Candidates = await scanV17Portfolios(
           connection,
           market.programId,
