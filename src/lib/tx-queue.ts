@@ -73,6 +73,7 @@ export class TxQueue {
   private readonly _lanes: Record<TxLane, PQueue>;
   private readonly _completed: Record<TxLane, number>;
   private readonly _failed: Record<TxLane, number>;
+  private readonly _queuedRejectors: Record<TxLane, Set<(reason: Error) => void>>;
 
   constructor(config: TxQueueConfig = {}) {
     const liqCfg = {
@@ -99,6 +100,11 @@ export class TxQueue {
 
     this._completed = { liquidation: 0, oracle: 0, crank: 0 };
     this._failed = { liquidation: 0, oracle: 0, crank: 0 };
+    this._queuedRejectors = {
+      liquidation: new Set(),
+      oracle: new Set(),
+      crank: new Set(),
+    };
 
     for (const lane of ALL_LANES) {
       const q = this._lanes[lane];
@@ -120,25 +126,53 @@ export class TxQueue {
     const enqueuedAt = Date.now();
     const q = this._lanes[lane];
 
-    return q.add(async (): Promise<T> => {
-      const waitMs = Date.now() - enqueuedAt;
-      txQueueWaitSeconds.observe({ lane }, waitMs / 1000);
-      txQueueActive.set({ lane }, q.pending);
+    return new Promise<T>((resolve, reject) => {
+      let started = false;
+      let settled = false;
+      const rejectQueued = (reason: Error): void => {
+        if (started || settled) return;
+        settled = true;
+        reject(reason);
+      };
+      this._queuedRejectors[lane].add(rejectQueued);
 
-      try {
-        const result = await fn();
-        this._completed[lane]++;
-        txQueueCompletedTotal.inc({ lane });
-        return result;
-      } catch (err) {
-        this._failed[lane]++;
-        txQueueFailedTotal.inc({ lane });
-        throw err;
-      } finally {
+      const queued = q.add(async (): Promise<T> => {
+        started = true;
+        this._queuedRejectors[lane].delete(rejectQueued);
+        const waitMs = Date.now() - enqueuedAt;
+        txQueueWaitSeconds.observe({ lane }, waitMs / 1000);
         txQueueActive.set({ lane }, q.pending);
-        txQueuePending.set({ lane }, q.size);
-      }
-    }) as Promise<T>;
+
+        try {
+          const result = await fn();
+          this._completed[lane]++;
+          txQueueCompletedTotal.inc({ lane });
+          return result;
+        } catch (err) {
+          this._failed[lane]++;
+          txQueueFailedTotal.inc({ lane });
+          throw err;
+        } finally {
+          txQueueActive.set({ lane }, q.pending);
+          txQueuePending.set({ lane }, q.size);
+        }
+      }) as Promise<T>;
+
+      queued.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          this._queuedRejectors[lane].delete(rejectQueued);
+          resolve(value);
+        },
+        (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          this._queuedRejectors[lane].delete(rejectQueued);
+          reject(err);
+        },
+      );
+    });
   }
 
   async drain(timeoutMs: number): Promise<void> {
@@ -176,8 +210,14 @@ export class TxQueue {
    * backlog of sends it queued while still leader.
    */
   clearPending(): void {
+    const err = new Error("TxQueue task cleared before dispatch");
     for (const lane of ALL_LANES) {
       this._lanes[lane].clear();
+      for (const rejectQueued of this._queuedRejectors[lane]) {
+        rejectQueued(err);
+      }
+      this._queuedRejectors[lane].clear();
+      txQueuePending.set({ lane }, 0);
     }
     logger.info("TxQueue: cleared all pending tasks from every lane (post-demote)");
   }

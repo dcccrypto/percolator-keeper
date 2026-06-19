@@ -23,11 +23,10 @@ describe("TxQueue.clearPending", () => {
     const ran: string[] = [];
     // First task blocks until we release it — keeps the single slot busy.
     const p1 = q.enqueue("liquidation", async () => { ran.push("first"); await block; });
-    // These queue behind it and must be dropped by clearPending(). Their promises
-    // never settle once cleared (p-queue drops them), so we don't await them.
-    for (const id of ["a", "b", "c"]) {
-      void q.enqueue("liquidation", async () => { ran.push(id); }).catch(() => {});
-    }
+    // These queue behind it and must be dropped by clearPending().
+    const dropped = ["a", "b", "c"].map((id) =>
+      q.enqueue("liquidation", async () => { ran.push(id); }),
+    );
 
     // Let the first task start (occupy the slot) so a,b,c are pending.
     await Promise.resolve();
@@ -35,6 +34,8 @@ describe("TxQueue.clearPending", () => {
     expect(q.getStats().liquidation.pending).toBeGreaterThan(0);
 
     q.clearPending();
+
+    await expect(Promise.all(dropped)).rejects.toThrow("TxQueue task cleared before dispatch");
 
     // Release the in-flight task and give the loop a few ticks — a,b,c must not run.
     releaseFirst();
