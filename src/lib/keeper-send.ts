@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { ComputeBudgetProgram } from "@solana/web3.js";
 import type { Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
 import { sendWithRetryKeeper, createLogger, sendCriticalAlert } from "@percolatorct/shared";
 import type { KeeperSendOptions } from "@percolatorct/shared";
@@ -191,6 +192,19 @@ export async function keeperSend(
     logger.warn("keeperSend: not leader — skipping send", { txType });
     return null;
   }
+
+  // v17 cutover (issue #176): the wrapper program installs a custom 128KB heap
+  // allocator and aborts ("Access violation in heap section") on its first heap
+  // allocation unless the transaction requests the matching heap frame. Every
+  // keeper send path (crank InitUser/CrankLpVaultFees/RestartAssetOracle/
+  // PermissionlessCrank + liquidation Liquidate) carries a wrapper instruction,
+  // so prepend the request here as the FIRST instruction. 131072 = 128*1024 ==
+  // the program's V16_HEAP_FRAME_BYTES. The CU limit is left to estimateCost /
+  // simulatedCu, so no setComputeUnitLimit is added here.
+  instructions = [
+    ComputeBudgetProgram.requestHeapFrame({ bytes: 131072 }),
+    ...instructions,
+  ];
 
   const { estimatedCost, simulatedCu } = await estimateCost(connection, instructions, signers, txType);
 
