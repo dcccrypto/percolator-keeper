@@ -909,16 +909,29 @@ export class CrankService {
           if (entry) {
             // Re-parse the slab from cached bytes so the market state reflects
             // the latest on-chain data without an RPC call.
-            try {
-              const { parseHeader, parseConfig, parseEngine, parseParams } = await import("@percolatorct/sdk");
-              const data = entry.data;
-              state.market.header = parseHeader(data);
-              state.market.config = parseConfig(data);
-              state.market.engine = parseEngine(data);
-              state.market.params = parseParams(data);
+            const parsed = parseMarketFromAccountData(
+              state.market.slabAddress,
+              state.market.programId,
+              entry.data,
+            );
+            if (parsed) {
+              state.market.header = parsed.header;
+              state.market.config = parsed.config;
+              state.market.engine = parsed.engine;
+              state.market.params = parsed.params;
+              const parsedRawV17 = (parsed as DiscoveredMarket & {
+                _rawV17Config?: ReturnType<typeof parseWrapperConfigV17>;
+              })._rawV17Config;
+              if (parsedRawV17) {
+                (state.market as DiscoveredMarket & {
+                  _rawV17Config?: ReturnType<typeof parseWrapperConfigV17>;
+                })._rawV17Config = parsedRawV17;
+              } else {
+                delete (state.market as DiscoveredMarket & {
+                  _rawV17Config?: ReturnType<typeof parseWrapperConfigV17>;
+                })._rawV17Config;
+              }
               cacheHits++;
-            } catch {
-              // Ignore parse errors — market state stays at last known good.
             }
           }
 

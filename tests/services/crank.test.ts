@@ -25,9 +25,27 @@ vi.mock('@percolatorct/sdk', () => ({
   parseConfig: vi.fn(),
   parseEngine: vi.fn(),
   parseParams: vi.fn(),
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
+  parsePortfolioV17: vi.fn(),
   detectDexType: vi.fn(() => null),
   parseDexPool: vi.fn(),
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
+}));
+
+vi.mock('../../src/lib/v17-risk.js', () => ({
+  V17_RISK_PARAMS_MIN_DATA_LEN: 538,
+  parseV17RiskParams: vi.fn(() => ({
+    warmupPeriodSlots: 0n,
+    maintenanceMarginBps: 500n,
+    hMin: 0n,
+    hMax: 0n,
+    openInterestCap: 0n,
+    maintenanceFeePerSlot: 0n,
+    liquidationFeeShareBps: 0n,
+    adlFillCapBps: 0n,
+    minPositionSize: 0n,
+  })),
 }));
 
 vi.mock('@percolatorct/shared', () => ({
@@ -1502,6 +1520,77 @@ describe('CrankService', () => {
       const stats = realCache.stats();
       expect(stats.hits).toBe(1);
       expect(stats.misses).toBeGreaterThanOrEqual(1);
+
+      service.stop();
+    });
+
+    it('re-parses cached v17 account data with the v17 parser, not legacy slab parsers', async () => {
+      const { AccountCache } = await import('../../src/lib/account-cache.js');
+      const realCache = new AccountCache();
+      const freshData = new Uint8Array(600);
+      realCache.set(GOOD_SLAB, freshData, EXPECTED_PROGRAM_ID, 100);
+
+      const fakeLoader = {
+        getCache: () => realCache,
+        getProgramId: () => EXPECTED_PROGRAM_ID,
+        getStats: () => ({
+          connected: true,
+          lastSlot: 110,
+          eventsReceived: 0,
+          eventsDropped: 0,
+          reconnectCount: 0,
+        }),
+      } as any;
+
+      const service = new CrankService(mockOracleService, undefined, fakeLoader);
+      const mint = new PublicKey('So11111111111111111111111111111111111111112');
+      const staleMarket = {
+        slabAddress: { toBase58: () => GOOD_SLAB, equals: () => false },
+        programId: { toBase58: () => EXPECTED_PROGRAM_ID },
+        config: {
+          collateralMint: mint,
+          oracleAuthority: PublicKey.default,
+          indexFeedId: PublicKey.default,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityPriceE6: 0n,
+        },
+        engine: { vault: 0n },
+        params: { maintenanceMarginBps: 100n },
+        header: { admin: PublicKey.default, version: 16, kind: 1 },
+        _rawV17Config: { markEwmaE6: 1_000_000n },
+      };
+
+      vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+      vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+        marketauth: PublicKey.default,
+        collateralMint: mint,
+        oracleMode: 2, // EWMA_MARK
+        oracleLegFeeds: [],
+        maxStalenessSecs: 60n,
+        confFilterBps: 0,
+        invert: 0,
+        unitScale: 1,
+        oracleTargetPriceE6: 0n,
+        oracleTargetPublishTime: 0n,
+        markEwmaE6: 2_000_000n,
+      } as any);
+
+      const internal: any = service;
+      internal.markets.set(GOOD_SLAB, {
+        market: staleMarket,
+        missedDiscoveryCount: 0,
+        keeperPortfolio: PublicKey.default,
+      });
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      const refreshed = internal.markets.get(GOOD_SLAB).market;
+      expect(core.parseWrapperConfigV17).toHaveBeenCalledWith(freshData);
+      expect(core.parseHeader).not.toHaveBeenCalled();
+      expect(refreshed.config.lastEffectivePriceE6).toBe(2_000_000n);
+      expect(refreshed.params.maintenanceMarginBps).toBe(500n);
+      expect(refreshed._rawV17Config.markEwmaE6).toBe(2_000_000n);
 
       service.stop();
     });
