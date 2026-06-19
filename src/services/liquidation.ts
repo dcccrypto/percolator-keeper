@@ -751,18 +751,61 @@ export class LiquidationService {
           // that a leg is active. The owner may have topped up capital between scan and submit;
           // without this the keeper submits a liquidation the on-chain program then rejects
           // (wasted fee). Mirrors the v12.x recheck below and uses the same fee-debt-aware
-          // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
-          // unavailable (0) we keep the leg-active check + rely on the on-chain program.
+          // equity as the scanner (#230).
           const freshMarketData = await fetchSlabWithRetry(slabAddress);
           const reMmBps = parseV17RiskParams(freshMarketData).maintenanceMarginBps;
-          if (scanPriceE6 > 0n && reMmBps > 0n) {
+
+          // #245: oracle-drift guard. The previous recheck reused the stale
+          // scan-time price (scanPriceE6) for the notional, so a market that
+          // moved between scan and submit was rechecked against a price the
+          // on-chain program no longer sees. Re-resolve a FRESH price from the
+          // just-fetched slab config (same source as scanMarket's v17 path:
+          // lastEffectivePriceE6 ?? authorityPriceE6), fail-safe when no price
+          // is available, abort on excessive drift, and use the fresh price in
+          // the notional — mirroring the v12.x path below.
+          const freshCfg = parseConfig(freshMarketData);
+          const freshPrice =
+            freshCfg.lastEffectivePriceE6 ?? freshCfg.authorityPriceE6 ?? 0n;
+
+          // Fail-safe: no usable fresh price → refuse to submit (mirror v12.x H2).
+          if (freshPrice === 0n) {
+            logger.warn(
+              "v17 liquidate: no fresh price available for pre-submit recheck, aborting",
+              {
+                portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+                slabAddress: slabAddress.toBase58().slice(0, 8),
+              },
+            );
+            return null;
+          }
+
+          // Abort if the oracle drifted beyond MAX_LIQUIDATION_DRIFT_BPS since scan.
+          if (MAX_LIQUIDATION_DRIFT_BPS > 0n && scanPriceE6 > 0n) {
+            const delta = freshPrice > scanPriceE6
+              ? freshPrice - scanPriceE6
+              : scanPriceE6 - freshPrice;
+            const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
+            if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+              logger.warn("v17 liquidate: aborting — oracle drift exceeds limit", {
+                portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+                slabAddress: slabAddress.toBase58().slice(0, 8),
+                scanPriceE6: scanPriceE6.toString(),
+                freshPriceE6: freshPrice.toString(),
+                driftBps: driftBps.toString(),
+                limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+              });
+              return null;
+            }
+          }
+
+          if (reMmBps > 0n) {
             const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
             const equity = pf.capital + pf.pnl - feeDebt;
             let stillLiquidatable = false;
             for (const leg of pf.legs) {
               if (!leg.active || leg.basisPosQ === 0n) continue;
               const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
-              const notional = absPos * scanPriceE6 / PRICE_E6_DIVISOR;
+              const notional = absPos * freshPrice / PRICE_E6_DIVISOR;
               if (notional === 0n) continue;
               if (computeMarginRatioBps(equity, notional) < reMmBps) {
                 stillLiquidatable = true;
@@ -1002,12 +1045,14 @@ export class LiquidationService {
       );
 
       for (let j = 0; j < batchResults.length; j++) {
-        scanned++;
         const result = batchResults[j]!;
         if (result.status === "rejected") {
+          // #247: a rejected scan is not a scan that happened — count only
+          // fulfilled scans so `scanned` reflects markets actually inspected.
           logger.error("Market scan rejected", { error: result.reason });
           continue;
         }
+        scanned++;
         const candidates = result.value;
         candidateCount += candidates.length;
 

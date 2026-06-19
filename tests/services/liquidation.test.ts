@@ -128,7 +128,23 @@ vi.mock('../../src/lib/keeper-send.js', async () => {
   };
 });
 
-import { PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
+// #245: mock the v17 risk-param reader so the v17 liquidate recheck can run
+// against arbitrary fresh slab bytes without needing a byte-perfect fixture.
+vi.mock('../../src/lib/v17-risk.js', () => ({
+  parseV17RiskParams: vi.fn(() => ({
+    warmupPeriodSlots: 0n,
+    maintenanceMarginBps: 500n,
+    hMin: 0n,
+    hMax: 0n,
+    openInterestCap: 0n,
+    maintenanceFeePerSlot: 0n,
+    liquidationFeeShareBps: 0n,
+    adlFillCapBps: 0n,
+    minPositionSize: 0n,
+  })),
+}));
+
+import { PublicKey, ComputeBudgetProgram, Keypair } from '@solana/web3.js';
 import { LiquidationService } from '../../src/services/liquidation.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
@@ -603,6 +619,128 @@ describe('LiquidationService', () => {
         expect(sig).not.toBeNull();
       });
     });
+
+    // ─── #245: v17 liquidate must apply an oracle-drift guard ──────────────
+    // The v17 recheck previously reused the stale scan-time price and had no
+    // fresh-price fetch, no fail-safe, and no drift guard. These tests assert
+    // the new behavior mirrors the v12.x path.
+    describe('#245: v17 oracle-drift guard', () => {
+      const V17_PORTFOLIO = Keypair.generate().publicKey;
+
+      function makeV17Market() {
+        return {
+          slabAddress: { toBase58: () => 'MarketV17111111111111111111111111111111111', toBytes: () => new Uint8Array(32), equals: () => false },
+          programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+          config: {
+            collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+            oracleAuthority: mockNonZeroKey(),
+            indexFeedId: mockZeroKey(), // isAllZeros → oracle tail = slab, no RPC
+          },
+          params: { maintenanceMarginBps: 500n },
+          header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+        };
+      }
+
+      // A portfolio with one active, liquidatable leg.
+      function stubV17Portfolio() {
+        vi.mocked(core.parsePortfolioV17).mockReturnValue({
+          owner: { toBase58: () => 'UserV17111111111111111111111111111111111', equals: () => false },
+          capital: 100n,
+          pnl: -50n,
+          feeCredits: 0n,
+          legs: [{ active: true, basisPosQ: 10_000_000_000n, assetIndex: 0 }],
+        } as any);
+      }
+
+      // Wire getConnection() so the portfolio re-fetch returns valid data.
+      function stubConnectionWithPortfolio() {
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async () => ({ data: Buffer.alloc(9347) })),
+          getSlot: vi.fn(async () => 200),
+        } as any);
+      }
+
+      beforeEach(() => {
+        vi.mocked(core.isV17Account).mockReturnValue(true);
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9347));
+        stubV17Portfolio();
+        stubConnectionWithPortfolio();
+      });
+
+      afterEach(() => {
+        vi.mocked(core.isV17Account).mockReturnValue(false);
+      });
+
+      it('aborts (no send) when the fresh price drifts beyond MAX_LIQUIDATION_DRIFT_BPS', async () => {
+        // scanPriceE6 = 1.000000; fresh = 1.050000 → 500 bps drift > 150 bps limit.
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 0n,
+          lastEffectivePriceE6: 1_050_000n,
+          authorityTimestamp: 0n,
+        } as any);
+
+        const sendSpy = vi.mocked(shared.sendWithRetryKeeper);
+        const before = sendSpy.mock.calls.length;
+
+        const sig = await liquidationService.liquidate(
+          makeV17Market() as any,
+          0,
+          V17_PORTFOLIO,
+          1_000_000n, // scanPriceE6
+        );
+
+        expect(sig).toBeNull();
+        expect(sendSpy.mock.calls.length).toBe(before); // no new send
+      });
+
+      it('fails safe (no send) when no fresh price is available (freshPrice===0n)', async () => {
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 0n,
+          lastEffectivePriceE6: 0n, // never cranked → no usable price
+          authorityTimestamp: 0n,
+        } as any);
+
+        const sendSpy = vi.mocked(shared.sendWithRetryKeeper);
+        const before = sendSpy.mock.calls.length;
+
+        const sig = await liquidationService.liquidate(
+          makeV17Market() as any,
+          0,
+          V17_PORTFOLIO,
+          1_000_000n,
+        );
+
+        expect(sig).toBeNull();
+        expect(sendSpy.mock.calls.length).toBe(before);
+      });
+
+      it('proceeds when the fresh price is within the drift limit and still undercollateralized', async () => {
+        // fresh = scan (no drift), leg still underwater at maintenanceMarginBps=500.
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockZeroKey(),
+          indexFeedId: mockNonZeroKey(),
+          authorityPriceE6: 0n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: 0n,
+        } as any);
+
+        const sig = await liquidationService.liquidate(
+          makeV17Market() as any,
+          0,
+          V17_PORTFOLIO,
+          1_000_000n,
+        );
+
+        // equity = 100 + (-50) = 50; notional = 10_000 (10e9 * 1e6 / 1e6 = 1e10
+        // base units / 1e6 = 1e4); marginRatio = 50 * 10000 / 10000 = 50 bps
+        // < 500 maintenance → liquidatable → proceeds.
+        expect(sig).not.toBeNull();
+      });
+    });
   });
 
   describe('start and stop', () => {
@@ -950,6 +1088,51 @@ describe('LiquidationService', () => {
       // Per-cycle dedup, not lifetime: the same (slab, idx) can be retargeted
       // next cycle (partial-fill retry path).
       expect(liquidateSpy).toHaveBeenCalledTimes(2);
+    });
+
+    // #247: `scanned` must count only fulfilled scans, not rejected ones.
+    it('#247: scanned counts only fulfilled scans, not rejected ones', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const okSlab = 'SlabOk44444444444444444444444444444444444444';
+      const failSlab = 'SlabFail5555555555555555555555555555555555';
+
+      // One market scans cleanly; the other throws (e.g., RPC error) so its
+      // Promise.allSettled entry is `rejected`.
+      vi.spyOn(svc, 'scanMarket').mockImplementation(async (market: any) => {
+        if (market.slabAddress.toBase58() === failSlab) {
+          throw new Error('simulated scan RPC failure');
+        }
+        return [] as any;
+      });
+
+      const markets = new Map([
+        [okSlab, { market: makeMarketAt(okSlab) as any }],
+        [failSlab, { market: makeMarketAt(failSlab) as any }],
+      ]);
+
+      const result = await svc.scanAndLiquidateAll(markets);
+
+      // Two markets attempted, but only the fulfilled one counts as "scanned".
+      expect(result.scanned).toBe(1);
+      expect(result.candidates).toBe(0);
+      expect(result.liquidated).toBe(0);
+    });
+
+    it('#247: scanned equals number of fulfilled scans when all succeed', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const slabs = [
+        'SlabAll00000000000000000000000000000000000',
+        'SlabAll11111111111111111111111111111111111',
+        'SlabAll22222222222222222222222222222222222',
+      ];
+      vi.spyOn(svc, 'scanMarket').mockResolvedValue([] as any);
+
+      const markets = new Map(
+        slabs.map((s) => [s, { market: makeMarketAt(s) as any }]),
+      );
+
+      const result = await svc.scanAndLiquidateAll(markets);
+      expect(result.scanned).toBe(3);
     });
   });
 });

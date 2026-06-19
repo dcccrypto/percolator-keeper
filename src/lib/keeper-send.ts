@@ -265,12 +265,19 @@ export async function keeperSend(
       // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
       // inside append() rather than here to keep this path readable.
       if (process.env.SHADOW_HARNESS_ENABLED === "true") {
-        const firstIx = instructions[0];
-        // The market is the first non-system account from the first instruction.
-        // For crank/liquidation/adl ixs the slab address is always at index 0.
-        const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
+        // #246: the market (slab) is at account index 1, not 0. Account index 0
+        // is the keeper wallet signer. instructions[0] is itself the prepended
+        // ComputeBudget requestHeapFrame ix (zero keys), so we must skip past any
+        // ComputeBudget ixs to the first wrapper ix and read its keys[1]
+        // (layout: [owner(s,w), market(w), portfolio(w), ...oracleTail]).
+        const COMPUTE_BUDGET_ID = ComputeBudgetProgram.programId.toBase58();
+        const programIx = instructions.find(
+          (ix) => ix.programId.toBase58() !== COMPUTE_BUDGET_ID,
+        );
+        const market = programIx?.keys[1]?.pubkey.toBase58() ?? "unknown";
+        // Record the wrapper ix payload (not the prepended ComputeBudget ix data).
         const instructionData =
-          firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
+          programIx !== undefined ? Buffer.from(programIx.data).toString("base64") : "";
         void sharedDecisionLog.append({
           timestamp: new Date().toISOString(),
           txType,

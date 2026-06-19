@@ -834,36 +834,38 @@ export class CrankService {
    * v17 markets need a keeper-owned portfolio before PermissionlessCrank can run.
    * Provisioning can fail transiently, so discovery calls this on first insert and
    * again on rediscovery while keeperPortfolio is still null.
+   *
+   * Returns a promise that always resolves (never rejects — all errors are swallowed
+   * and logged), so the fire-and-forget discovery callers may safely ignore it while
+   * the hot-register path can `await` it to provision before the initial crank (#244).
    */
-  private ensureKeeperPortfolio(key: string, market: DiscoveredMarket): void {
-    void (async () => {
-      try {
-        const connection = getConnection();
-        const keypair = this._keypair;
-        const portfolio = await provisionKeeperPortfolio(
-          connection,
-          market.programId,
-          market.slabAddress,
-          keypair.publicKey,
-          keypair,
-        );
-        const state = this.markets.get(key);
-        if (state) {
-          state.keeperPortfolio = portfolio;
-          if (portfolio) {
-            logger.info("Keeper portfolio provisioned", {
-              market: key.slice(0, 8),
-              portfolio: portfolio.toBase58().slice(0, 8),
-            });
-          }
+  private async ensureKeeperPortfolio(key: string, market: DiscoveredMarket): Promise<void> {
+    try {
+      const connection = getConnection();
+      const keypair = this._keypair;
+      const portfolio = await provisionKeeperPortfolio(
+        connection,
+        market.programId,
+        market.slabAddress,
+        keypair.publicKey,
+        keypair,
+      );
+      const state = this.markets.get(key);
+      if (state) {
+        state.keeperPortfolio = portfolio;
+        if (portfolio) {
+          logger.info("Keeper portfolio provisioned", {
+            market: key.slice(0, 8),
+            portfolio: portfolio.toBase58().slice(0, 8),
+          });
         }
-      } catch (provErr) {
-        logger.debug("Portfolio provisioning deferred", {
-          market: key.slice(0, 8),
-          error: provErr instanceof Error ? provErr.message : String(provErr),
-        });
       }
-    })();
+    } catch (provErr) {
+      logger.debug("Portfolio provisioning deferred", {
+        market: key.slice(0, 8),
+        error: provErr instanceof Error ? provErr.message : String(provErr),
+      });
+    }
   }
 
   /**
@@ -935,7 +937,8 @@ export class CrankService {
             (header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1);
 
           if (isV17Market && !state.keeperPortfolio) {
-            this.ensureKeeperPortfolio(key, state.market);
+            // Fire-and-forget on the discovery fast path; retried each cycle.
+            void this.ensureKeeperPortfolio(key, state.market);
           }
         }
         this.lastDiscoveryTime = now;
@@ -1156,12 +1159,12 @@ export class CrankService {
         // The provisioning result updates state.keeperPortfolio in place.
         // If provisioning fails (network error or portfolio already being created),
         // the market will be skipped this cycle and retried on next discovery.
-        this.ensureKeeperPortfolio(key, market);
+        void this.ensureKeeperPortfolio(key, market);
       } else {
         const state = this.markets.get(key)!;
         state.market = market;
         if (!state.keeperPortfolio) {
-          this.ensureKeeperPortfolio(key, market);
+          void this.ensureKeeperPortfolio(key, market);
         }
         // Update mainnetCA from Supabase on every discovery.
         // Use explicit undefined check so a DB null/removal clears stale values (not just truthy-set).
@@ -1862,6 +1865,13 @@ export class CrankService {
       });
 
       logger.info("Hot-registered new market", { slabAddress, programId: programId.toBase58() });
+
+      // #244: v17 markets need a keeper-owned portfolio before PermissionlessCrank
+      // can run. The discovery paths provision it; the hot-register path must too,
+      // otherwise the immediate crank below runs against a market whose
+      // keeperPortfolio is still null and is silently skipped until the next full
+      // discovery cycle. Await it so the initial crank can actually proceed.
+      await this.ensureKeeperPortfolio(slabAddress, market);
 
       // Trigger immediate oracle push + crank so price is live within seconds
       await this.crankMarket(slabAddress);

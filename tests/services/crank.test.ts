@@ -28,6 +28,8 @@ vi.mock('@percolatorct/sdk', () => ({
   detectDexType: vi.fn(() => null),
   parseDexPool: vi.fn(),
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
+  // #244: provisioning parses an existing portfolio account to confirm ownership.
+  parsePortfolioV17: vi.fn(),
 }));
 
 vi.mock('@percolatorct/shared', () => ({
@@ -83,7 +85,7 @@ vi.mock('../../src/lib/keeper-send.js', async () => {
   };
 });
 
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, Keypair } from '@solana/web3.js';
 import { CrankService } from '../../src/services/crank.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
@@ -1504,6 +1506,95 @@ describe('CrankService', () => {
       expect(stats.misses).toBeGreaterThanOrEqual(1);
 
       service.stop();
+    });
+  });
+
+  // ─── #244: registerMarket must provision the v17 keeper portfolio ─────────
+  // The hot-register path previously set keeperPortfolio: null and went straight
+  // to crankMarket(), which then skipped the market (no send) because the
+  // portfolio was never provisioned — leaving a freshly-created market
+  // uncrankable until the next full discovery cycle.
+  describe('registerMarket — #244 keeper portfolio provisioning', () => {
+    const SLAB = Keypair.generate().publicKey.toBase58();
+    const EXISTING_PORTFOLIO = new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
+
+    // Read the keeper pubkey straight off the service under test so the
+    // provisioned-portfolio owner check matches regardless of which loadKeypair
+    // mock implementation other tests in this file left behind.
+    function keeperKey(): string {
+      return (crankService as any)._keypair.publicKey.toBase58();
+    }
+
+    function wireRegisterMocks() {
+      const KEEPER_KEY = keeperKey();
+      // Slab account owned by a known program (PublicKey.default base58 is the
+      // first allowlisted id).
+      const getProgramAccounts = vi.fn().mockResolvedValue([
+        { pubkey: EXISTING_PORTFOLIO, account: { data: Buffer.alloc(9347) } },
+      ]);
+      // mockReset() drops any queued mockReturnValueOnce(...) from earlier tests
+      // (the LaserStream provisioning test uses mockReturnValueOnce), which would
+      // otherwise be consumed by registerMarket's first getConnection() call.
+      vi.mocked(shared.getConnection).mockReset();
+      vi.mocked(shared.getConnection).mockReturnValue({
+        getAccountInfo: vi.fn().mockResolvedValue({
+          data: Buffer.alloc(64),
+          owner: PublicKey.default, // base58 = '111...11' → allowlisted
+        }),
+        getSlot: vi.fn().mockResolvedValue(200),
+        getProgramAccounts,
+        getMinimumBalanceForRentExemption: vi.fn().mockResolvedValue(1),
+      } as any);
+
+      vi.mocked(core.parseHeader).mockReturnValue({ version: 16, kind: 1 } as any);
+      vi.mocked(core.parseConfig).mockReturnValue({
+        collateralMint: { toBase58: () => 'Mint' },
+        oracleAuthority: { toBase58: () => KEEPER_KEY, equals: () => true },
+        indexFeedId: { toBytes: () => new Uint8Array(32), toBase58: () => 'feed' },
+      } as any);
+      vi.mocked(core.parseEngine).mockReturnValue({} as any);
+      vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+
+      // Provisioning confirms the found account is owned by the keeper.
+      vi.mocked(core.parsePortfolioV17).mockReturnValue({
+        owner: {
+          toBase58: () => KEEPER_KEY,
+          equals: (other: any) => other?.toBase58?.() === KEEPER_KEY,
+        },
+      } as any);
+
+      return { getProgramAccounts };
+    }
+
+    it('provisions the keeper portfolio (sets state.keeperPortfolio) before the initial crank', async () => {
+      const { getProgramAccounts } = wireRegisterMocks();
+
+      const result = await crankService.registerMarket(SLAB);
+
+      expect(result.success).toBe(true);
+
+      // The provisioning RPC ran on the register path (pre-fix: never called).
+      expect(getProgramAccounts).toHaveBeenCalled();
+      expect(getProgramAccounts.mock.calls[0]?.[1]?.filters).toContainEqual({ dataSize: 9347 });
+
+      // keeperPortfolio is now set, so the market is crankable — not left null.
+      const state = crankService.getMarkets().get(SLAB);
+      expect(state?.keeperPortfolio).not.toBeNull();
+      expect(state?.keeperPortfolio?.toBase58()).toBe(EXISTING_PORTFOLIO.toBase58());
+    });
+
+    it('the initial crank actually sends (not skipped) because the portfolio was provisioned first', async () => {
+      wireRegisterMocks();
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({
+        signature: 'mock-reg-crank-sig',
+        estimatedCost: 5000,
+      } as any);
+
+      await crankService.registerMarket(SLAB);
+
+      // crankMarket() only sends when keeperPortfolio is set; pre-fix it was
+      // null at crank time and the market was silently skipped (no send).
+      expect(keeperSendModule.keeperSend).toHaveBeenCalled();
     });
   });
 });
