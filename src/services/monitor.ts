@@ -16,6 +16,7 @@
 import { PublicKey } from "@solana/web3.js";
 import {
   fetchSlab,
+  isV17Account,
   parseEngine,
   parseConfig,
 } from "@percolatorct/sdk";
@@ -61,6 +62,7 @@ export interface MarketInvariantResult {
   /** Shortfall: engineVault - vaultTokenBalance (0n when ok) */
   shortfall: string;
   checkedAt: number;
+  skippedReason?: string;
 }
 
 export interface AdlStalenessResult {
@@ -69,6 +71,7 @@ export interface AdlStalenessResult {
   cycleSinceLastAdl: number;
   stale: boolean;
   checkedAt: number;
+  skippedReason?: string;
 }
 
 interface PerMarketState {
@@ -192,6 +195,29 @@ export class MonitorService {
           MONITOR_RPC_TIMEOUT_MS,
           `fetchSlab(${slabAddress.slice(0, 8)})`,
         );
+        if (isV17Account(data)) {
+          this._invariantResults.set(slabAddress, {
+            slabAddress,
+            ok: true,
+            vaultTokenBalance: "0",
+            engineVault: "0",
+            shortfall: "0",
+            checkedAt: now,
+            skippedReason: "v17 market account: legacy engine.vault invariant is not applicable",
+          });
+          this._adlStalenessResults.set(slabAddress, {
+            slabAddress,
+            adlNeeded: false,
+            cycleSinceLastAdl: 0,
+            stale: false,
+            checkedAt: now,
+            skippedReason: "v17 removed ExecuteAdl; legacy ADL staleness check is not applicable",
+          });
+          logger.debug("MonitorService skipped legacy v12 checks for v17 market", {
+            slabAddress: slabAddress.slice(0, 8),
+          });
+          return;
+        }
         const engine = parseEngine(data);
         const cfg = parseConfig(data);
 
