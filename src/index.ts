@@ -23,6 +23,7 @@ import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
 import { sharedBudget, setLeaderCheck } from "./lib/keeper-send.js";
 import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
 import { sharedDecisionLog } from "./lib/decision-log.js";
+import { createLaserStreamAccountLoader } from "./lib/laserstream-entrypoint.js";
 
 // Monitoring — alerts to Discord on threshold breaches
 export const monitors = createServiceMonitors("Keeper");
@@ -88,8 +89,15 @@ if (isMainnet()) {
 logger.info("Keeper service starting");
 
 const oracleService = new OracleService();
-const crankService = new CrankService(oracleService);
-const liquidationService = new LiquidationService(oracleService);
+const accountLoader = createLaserStreamAccountLoader({
+  env: process.env,
+  programId: config.programId,
+  getConnection,
+  logger,
+  sendWarningAlert,
+});
+const crankService = new CrankService(oracleService, undefined, accountLoader ?? undefined);
+const liquidationService = new LiquidationService(oracleService, undefined, accountLoader ?? undefined);
 const monitorService = new MonitorService();
 const fraudDetector = new FraudDetectorService(oracleService, () => crankService.getMarkets());
 
@@ -746,6 +754,10 @@ async function start() {
   activeMarketsCount.set(markets.length);
 
   async function startAllServices(): Promise<void> {
+    if (accountLoader) {
+      await accountLoader.start();
+      logger.info("LaserStream account loader started");
+    }
     await crankService.start();
     logger.info("Crank service started");
     liquidationService.start(() => crankService.getMarkets());
@@ -758,7 +770,7 @@ async function start() {
     // ADL service removed in v17.
   }
 
-  function stopAllServices(): void {
+  async function stopAllServices(): Promise<void> {
     // ADL service removed in v17.
     crankService.stop();
     logger.info("Crank service stopped (HA demote)");
@@ -768,6 +780,10 @@ async function start() {
     logger.info("MonitorService stopped (HA demote)");
     fraudDetector.stop();
     logger.info("FraudDetectorService stopped (HA demote)");
+    if (accountLoader) {
+      await accountLoader.stop();
+      logger.info("LaserStream account loader stopped (HA demote)");
+    }
   }
 
   if (leaderLock) {
@@ -790,7 +806,7 @@ async function start() {
         // so the keeperSend single-writer guard is already closed. Drop any queued
         // sends so this node runs no backlog after losing leadership.
         sharedTxQueue.clearPending();
-        stopAllServices();
+        void stopAllServices();
       },
     });
     logger.info("HA leader election active", { network, haEnabled: true });
@@ -941,7 +957,12 @@ async function shutdown(signal: string): Promise<void> {
     // Stop liquidation service (clears timers)
     logger.info("Stopping liquidation service");
     liquidationService.stop();
-    
+
+    if (accountLoader) {
+      logger.info("Stopping LaserStream account loader");
+      await accountLoader.stop();
+    }
+
     // Note: Solana connection doesn't need explicit cleanup
     // Oracle service has no persistent state to clean up
     
