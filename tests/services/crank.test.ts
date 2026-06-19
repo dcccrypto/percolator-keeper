@@ -25,9 +25,27 @@ vi.mock('@percolatorct/sdk', () => ({
   parseConfig: vi.fn(),
   parseEngine: vi.fn(),
   parseParams: vi.fn(),
+  isV17Account: vi.fn(() => false),
+  parseWrapperConfigV17: vi.fn(),
+  parsePortfolioV17: vi.fn(),
   detectDexType: vi.fn(() => null),
   parseDexPool: vi.fn(),
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
+}));
+
+vi.mock('../../src/lib/v17-risk.js', () => ({
+  V17_RISK_PARAMS_MIN_DATA_LEN: 538,
+  parseV17RiskParams: vi.fn(() => ({
+    warmupPeriodSlots: 0n,
+    maintenanceMarginBps: 500n,
+    hMin: 0n,
+    hMax: 0n,
+    openInterestCap: 0n,
+    maintenanceFeePerSlot: 0n,
+    liquidationFeeShareBps: 0n,
+    adlFillCapBps: 0n,
+    minPositionSize: 0n,
+  })),
 }));
 
 vi.mock('@percolatorct/shared', () => ({
@@ -1191,6 +1209,62 @@ describe('CrankService', () => {
       await crankService.discover();
       const stateAfter = crankService.getMarkets().get(slabHyperp)!;
       expect(stateAfter.hyperpNoPriceSkipped).toBe(false);
+    });
+  });
+
+  describe('registerMarket', () => {
+    it('provisions a v17 keeper portfolio before reporting the initial hot-register crank', async () => {
+      const slabAddress = 'So11111111111111111111111111111111111111112';
+      const programId = new PublicKey('11111111111111111111111111111111');
+      const portfolio = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+      const marketData = new Uint8Array(600);
+      const connection = {
+        getAccountInfo: vi.fn(async () => ({
+          data: marketData,
+          owner: programId,
+        })),
+        getProgramAccounts: vi.fn(async () => [
+          { pubkey: portfolio, account: { data: new Uint8Array([1, 2, 3]) } },
+        ]),
+      };
+
+      vi.mocked(shared.getConnection)
+        .mockReturnValueOnce(connection as any)
+        .mockReturnValueOnce(connection as any);
+      vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+      vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+        marketauth: PublicKey.default,
+        collateralMint: programId,
+        oracleMode: 2,
+        oracleLegFeeds: [],
+        maxStalenessSecs: 60n,
+        confFilterBps: 0,
+        invert: 0,
+        unitScale: 1,
+        oracleTargetPriceE6: 0n,
+        oracleTargetPublishTime: 0n,
+        markEwmaE6: 1_000_000n,
+      } as any);
+      vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
+        owner: { equals: () => true },
+      } as any);
+
+      const crankSpy = vi.spyOn(crankService, 'crankMarket').mockImplementation(async (slab) => {
+        const state = (crankService as any).markets.get(slab);
+        expect(state.keeperPortfolio).toBe(portfolio);
+        return true;
+      });
+
+      const result = await crankService.registerMarket(slabAddress);
+
+      expect(result).toEqual({
+        success: true,
+        message: 'Market registered and initial crank triggered',
+      });
+      expect(core.parseHeader).not.toHaveBeenCalled();
+      expect(core.parseWrapperConfigV17).toHaveBeenCalledWith(marketData);
+      expect(connection.getProgramAccounts).toHaveBeenCalled();
+      expect(crankSpy).toHaveBeenCalledWith(slabAddress);
     });
   });
 

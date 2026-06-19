@@ -835,35 +835,35 @@ export class CrankService {
    * Provisioning can fail transiently, so discovery calls this on first insert and
    * again on rediscovery while keeperPortfolio is still null.
    */
-  private ensureKeeperPortfolio(key: string, market: DiscoveredMarket): void {
-    void (async () => {
-      try {
-        const connection = getConnection();
-        const keypair = this._keypair;
-        const portfolio = await provisionKeeperPortfolio(
-          connection,
-          market.programId,
-          market.slabAddress,
-          keypair.publicKey,
-          keypair,
-        );
-        const state = this.markets.get(key);
-        if (state) {
-          state.keeperPortfolio = portfolio;
-          if (portfolio) {
-            logger.info("Keeper portfolio provisioned", {
-              market: key.slice(0, 8),
-              portfolio: portfolio.toBase58().slice(0, 8),
-            });
-          }
+  private async ensureKeeperPortfolio(key: string, market: DiscoveredMarket): Promise<PublicKey | null> {
+    try {
+      const connection = getConnection();
+      const keypair = this._keypair;
+      const portfolio = await provisionKeeperPortfolio(
+        connection,
+        market.programId,
+        market.slabAddress,
+        keypair.publicKey,
+        keypair,
+      );
+      const state = this.markets.get(key);
+      if (state) {
+        state.keeperPortfolio = portfolio;
+        if (portfolio) {
+          logger.info("Keeper portfolio provisioned", {
+            market: key.slice(0, 8),
+            portfolio: portfolio.toBase58().slice(0, 8),
+          });
         }
-      } catch (provErr) {
-        logger.debug("Portfolio provisioning deferred", {
-          market: key.slice(0, 8),
-          error: provErr instanceof Error ? provErr.message : String(provErr),
-        });
       }
-    })();
+      return portfolio;
+    } catch (provErr) {
+      logger.debug("Portfolio provisioning deferred", {
+        market: key.slice(0, 8),
+        error: provErr instanceof Error ? provErr.message : String(provErr),
+      });
+      return null;
+    }
   }
 
   /**
@@ -935,7 +935,7 @@ export class CrankService {
             (header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1);
 
           if (isV17Market && !state.keeperPortfolio) {
-            this.ensureKeeperPortfolio(key, state.market);
+            void this.ensureKeeperPortfolio(key, state.market);
           }
         }
         this.lastDiscoveryTime = now;
@@ -1156,12 +1156,12 @@ export class CrankService {
         // The provisioning result updates state.keeperPortfolio in place.
         // If provisioning fails (network error or portfolio already being created),
         // the market will be skipped this cycle and retried on next discovery.
-        this.ensureKeeperPortfolio(key, market);
+        void this.ensureKeeperPortfolio(key, market);
       } else {
         const state = this.markets.get(key)!;
         state.market = market;
         if (!state.keeperPortfolio) {
-          this.ensureKeeperPortfolio(key, market);
+          void this.ensureKeeperPortfolio(key, market);
         }
         // Update mainnetCA from Supabase on every discovery.
         // Use explicit undefined check so a DB null/removal clears stale values (not just truthy-set).
@@ -1841,12 +1841,16 @@ export class CrankService {
     }
 
     try {
-      const header = parseHeader(data);
-      const marketConfig = parseConfig(data);
-      const engine = parseEngine(data);
-      const params = parseParams(data);
-
-      const market: DiscoveredMarket = { slabAddress: slabPubkey, programId, header, config: marketConfig, engine, params };
+      const market = parseMarketFromAccountData(slabPubkey, programId, data);
+      if (!market) {
+        throw new Error("Unrecognized or unsupported market account layout");
+      }
+      const header = market.header as
+        | { version?: number | bigint; kind?: number | bigint }
+        | undefined;
+      const isV17Market =
+        Boolean((market as DiscoveredMarket & { _rawV17Config?: unknown })._rawV17Config) ||
+        (header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1);
 
       this.markets.set(slabAddress, {
         market,
@@ -1863,8 +1867,18 @@ export class CrankService {
 
       logger.info("Hot-registered new market", { slabAddress, programId: programId.toBase58() });
 
+      if (isV17Market) {
+        await this.ensureKeeperPortfolio(slabAddress, market);
+      }
+
       // Trigger immediate oracle push + crank so price is live within seconds
-      await this.crankMarket(slabAddress);
+      const cranked = await this.crankMarket(slabAddress);
+      if (!cranked) {
+        return {
+          success: true,
+          message: "Market registered; initial crank was not executed",
+        };
+      }
 
       return { success: true, message: "Market registered and initial crank triggered" };
     } catch (err) {
