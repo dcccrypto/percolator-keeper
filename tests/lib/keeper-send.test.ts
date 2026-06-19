@@ -26,8 +26,9 @@ vi.mock("../../src/lib/cu-estimator.js", () => {
 
 import * as shared from "@percolatorct/shared";
 import { keeperSend, classifySendError } from "../../src/lib/keeper-send.js";
+import { sharedDecisionLog } from "../../src/lib/decision-log.js";
 import { KeeperBudget } from "../../src/lib/budget.js";
-import { Keypair, TransactionInstruction, PublicKey } from "@solana/web3.js";
+import { ComputeBudgetProgram, Keypair, TransactionInstruction, PublicKey } from "@solana/web3.js";
 
 function makeDummyIx(): TransactionInstruction {
   return new TransactionInstruction({
@@ -226,6 +227,45 @@ describe("keeperSend", () => {
       ]);
       const uniq = new Set(sigs.map((r) => r!.signature));
       expect(uniq.size).toBe(3);
+    });
+
+    it("logs the wrapper market and payload instead of the prepended heap-frame ix", async () => {
+      const originalShadowHarness = process.env.SHADOW_HARNESS_ENABLED;
+      process.env.SHADOW_HARNESS_ENABLED = "true";
+
+      const market = Keypair.generate().publicKey;
+      const portfolio = Keypair.generate().publicKey;
+      const oracle = Keypair.generate().publicKey;
+      const payload = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
+      const wrapperIx = new TransactionInstruction({
+        programId: Keypair.generate().publicKey,
+        keys: [
+          { pubkey: keypair.publicKey, isSigner: true, isWritable: true },
+          { pubkey: market, isSigner: false, isWritable: true },
+          { pubkey: portfolio, isSigner: false, isWritable: true },
+          { pubkey: oracle, isSigner: false, isWritable: false },
+        ],
+        data: payload,
+      });
+      const heapFramePayload = Buffer.from(
+        ComputeBudgetProgram.requestHeapFrame({ bytes: 131072 }).data,
+      ).toString("base64");
+      const appendSpy = vi.spyOn(sharedDecisionLog, "append").mockResolvedValue();
+
+      try {
+        await keeperSend(connection, [wrapperIx], [keypair], "crank", budget);
+
+        expect(appendSpy).toHaveBeenCalledTimes(1);
+        const entry = appendSpy.mock.calls[0]![0];
+        expect(entry.market).toBe(market.toBase58());
+        expect(entry.market).not.toBe(keypair.publicKey.toBase58());
+        expect(entry.instructionData).toBe(payload.toString("base64"));
+        expect(entry.instructionData).not.toBe(heapFramePayload);
+      } finally {
+        appendSpy.mockRestore();
+        if (originalShadowHarness === undefined) delete process.env.SHADOW_HARNESS_ENABLED;
+        else process.env.SHADOW_HARNESS_ENABLED = originalShadowHarness;
+      }
     });
 
     it.skipIf(!process.env.STRESS)(

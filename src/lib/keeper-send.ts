@@ -109,6 +109,10 @@ function isMainnetSender(): boolean {
   );
 }
 
+function firstProgramInstruction(instructions: TransactionInstruction[]): TransactionInstruction | undefined {
+  return instructions.find((ix) => !ix.programId.equals(ComputeBudgetProgram.programId));
+}
+
 interface EstimateCostResult {
   estimatedCost: number;
   simulatedCu: number;
@@ -265,12 +269,11 @@ export async function keeperSend(
       // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
       // inside append() rather than here to keep this path readable.
       if (process.env.SHADOW_HARNESS_ENABLED === "true") {
-        const firstIx = instructions[0];
-        // The market is the first non-system account from the first instruction.
-        // For crank/liquidation/adl ixs the slab address is always at index 0.
-        const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
+        const decisionIx = firstProgramInstruction(instructions);
+        // Keeper wrapper ixs use keys[0] for the signer and keys[1] for the slab/market.
+        const market = decisionIx?.keys[1]?.pubkey.toBase58() ?? "unknown";
         const instructionData =
-          firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
+          decisionIx !== undefined ? Buffer.from(decisionIx.data).toString("base64") : "";
         void sharedDecisionLog.append({
           timestamp: new Date().toISOString(),
           txType,
