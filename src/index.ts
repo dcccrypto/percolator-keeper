@@ -334,6 +334,26 @@ const rateLimitCleanupTimer = setInterval(() => {
 }, RATE_LIMIT_CLEANUP_INTERVAL_MS);
 rateLimitCleanupTimer.unref();
 
+// Number of trusted reverse-proxy hops in front of this service.
+// 0 (default) = direct TCP connection, use socket.remoteAddress.
+// N > 0 = pick the Nth-from-right entry in X-Forwarded-For so that a
+// forged leftmost header cannot spoof the rate-limit bucket key.
+// Set KEEPER_TRUSTED_PROXY_DEPTH=1 when deploying behind Railway's internal
+// networking or any L7 proxy that terminates the TCP connection.
+const KEEPER_PROXY_DEPTH = Math.max(0, Number(process.env.KEEPER_TRUSTED_PROXY_DEPTH ?? "0"));
+
+function getClientIp(req: http.IncomingMessage): string {
+  if (KEEPER_PROXY_DEPTH > 0) {
+    const forwarded = String(req.headers["x-forwarded-for"] ?? "");
+    if (forwarded) {
+      const ips = forwarded.split(",").map((s) => s.trim());
+      const idx = Math.max(0, ips.length - KEEPER_PROXY_DEPTH);
+      return ips[idx] ?? String(req.socket.remoteAddress ?? "unknown");
+    }
+  }
+  return String(req.socket.remoteAddress ?? "unknown");
+}
+
 // Shared security headers for all JSON responses — prevents MIME sniffing
 // and ensures intermediaries (CDN, reverse proxy) don't cache sensitive data.
 const secureJsonHeaders = {
@@ -355,7 +375,7 @@ res.writeHead(503, secureJsonHeaders);
       return;
     }
 
-    const clientIp = String(req.socket.remoteAddress ?? "unknown");
+    const clientIp = getClientIp(req);
     if (isRateLimited(clientIp)) {
       logger.warn("Register rate limited", { ip: clientIp });
 req.resume();
@@ -459,7 +479,7 @@ res.writeHead(401, secureJsonHeaders);
       return;
     }
 
-    const clientIp = String(req.socket.remoteAddress ?? "unknown");
+    const clientIp = getClientIp(req);
     if (isRateLimited(clientIp)) {
       logger.warn("Budget resume rate limited", { ip: clientIp });
       req.resume();
