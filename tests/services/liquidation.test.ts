@@ -274,6 +274,15 @@ describe('LiquidationService', () => {
       expect(candidates).toHaveLength(1);
       expect(candidates[0].accountIdx).toBe(0);
       expect(candidates[0].marginRatio).toBeLessThan(5); // Below 5%
+
+      // M-6: fetchSlab must be called with the market's own programId so the
+      // SDK's owner check (fetchSlab throws if info.owner !== expectedOwner)
+      // actually runs, instead of trusting whatever account is at that pubkey.
+      expect(core.fetchSlab).toHaveBeenCalledWith(
+        expect.anything(),
+        mockMarket.slabAddress,
+        mockMarket.programId,
+      );
     });
 
     it('should find undercollateralized accounts in Pyth-pinned oracle mode', async () => {
@@ -578,6 +587,14 @@ describe('LiquidationService', () => {
 
       expect(sig).toBeNull();
       expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
+
+      // M-6: the v17 pre-submit recheck's fetchSlab call must pass the
+      // market's programId as expectedOwner, not just the slab pubkey.
+      expect(core.fetchSlab).toHaveBeenCalledWith(
+        expect.anything(),
+        slabAddress,
+        market.programId,
+      );
     });
 
     it('should execute liquidation with multi-instruction transaction', async () => {
@@ -623,6 +640,12 @@ describe('LiquidationService', () => {
         expect.any(String),
         expect.objectContaining({ accountIdx: 0 })
       );
+
+      // M-6: the pre-submit recheck's fetchSlab call (re-reading the slab right
+      // before submitting) must also pass the market's programId as expectedOwner.
+      for (const call of vi.mocked(core.fetchSlab).mock.calls) {
+        expect(call[2]).toBe(mockMarket.programId);
+      }
     });
 
     it('should increment liquidation count on success', async () => {

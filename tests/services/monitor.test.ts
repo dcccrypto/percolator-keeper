@@ -70,4 +70,27 @@ describe("MonitorService", () => {
       }),
     ]);
   });
+
+  it("M-6: passes the market's programId to fetchSlab as expectedOwner", async () => {
+    const service = new MonitorService();
+    const slabAddress = "11111111111111111111111111111111";
+    const programId = new PublicKey("So11111111111111111111111111111111111111112");
+    const market = {
+      slabAddress: new PublicKey(slabAddress),
+      programId,
+    };
+    const markets = new Map([[slabAddress, { market }]]);
+
+    vi.mocked(sdk.fetchSlab).mockResolvedValue(new Uint8Array([1, 2, 3]));
+    vi.mocked(sdk.isV17Account).mockReturnValue(true);
+
+    service.setMarketSource(() => markets as any);
+    await (service as any)._runChecks();
+
+    expect(sdk.fetchSlab).toHaveBeenCalledWith(
+      expect.anything(),
+      market.slabAddress,
+      programId,
+    );
+  });
 });

@@ -54,6 +54,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 async function fetchSlabWithRetry(
   slabPubkey: PublicKey,
+  expectedOwner: PublicKey,
   maxRetries = 3,
 ): Promise<Uint8Array> {
   let lastErr: unknown;
@@ -62,7 +63,7 @@ async function fetchSlabWithRetry(
     try {
       await acquireToken();
       return await withTimeout(
-        fetchSlab(conn, slabPubkey),
+        fetchSlab(conn, slabPubkey, expectedOwner),
         RPC_TIMEOUT_MS,
         `fetchSlab(${slabPubkey.toBase58()})`,
       );
@@ -482,7 +483,7 @@ export class LiquidationService {
     const slabAddress = market.slabAddress.toBase58();
 
     try {
-      const data = await fetchSlabWithRetry(market.slabAddress);
+      const data = await fetchSlabWithRetry(market.slabAddress, market.programId);
 
       // DESYNC-3 FIX: Route v17 accounts through the portfolio-based scanner.
       if (isV17Account(data)) {
@@ -862,7 +863,8 @@ export class LiquidationService {
           // (wasted fee). Mirrors the v12.x recheck below and uses the same fee-debt-aware
           // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
           // unavailable (0) we keep the leg-active check + rely on the on-chain program.
-          const freshMarketData = await fetchSlabWithRetry(slabAddress);
+          // #287 (M-6): pass programId so fetchSlab enforces the on-chain owner check.
+          const freshMarketData = await fetchSlabWithRetry(slabAddress, programId);
           // H-8: isolate this call from the outer "proceed cautiously" catch --
           // that catch's fail-open posture is meant for transient RPC failures
           // preventing re-verification entirely, not for "we got data back but
@@ -941,7 +943,7 @@ export class LiquidationService {
       } else {
       // Bug 3: Re-read slab data and verify account before submitting (v12.x path)
       {
-        const freshData = await fetchSlabWithRetry(slabAddress);
+        const freshData = await fetchSlabWithRetry(slabAddress, programId);
         const freshEngine = parseEngine(freshData);
         const freshParams = parseParams(freshData);
         const freshCfg = parseConfig(freshData);

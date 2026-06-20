@@ -191,7 +191,7 @@ export class MonitorService {
       // ── 6.1: Conservation invariant ───────────────────────────────────────
       try {
         const data = await withTimeout(
-          fetchSlab(conn, crankState.market.slabAddress),
+          fetchSlab(conn, crankState.market.slabAddress, crankState.market.programId),
           MONITOR_RPC_TIMEOUT_MS,
           `fetchSlab(${slabAddress.slice(0, 8)})`,
         );
