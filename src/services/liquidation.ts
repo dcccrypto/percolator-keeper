@@ -1075,12 +1075,14 @@ export class LiquidationService {
       );
 
       for (let j = 0; j < batchResults.length; j++) {
-        scanned++;
         const result = batchResults[j]!;
         if (result.status === "rejected") {
+          // #247: a rejected scan was NOT successfully scanned — don't inflate
+          // the counter. Only fulfilled scans count toward `scanned`.
           logger.error("Market scan rejected", { error: result.reason });
           continue;
         }
+        scanned++;
         const candidates = result.value;
         candidateCount += candidates.length;
 
