@@ -24,36 +24,7 @@ export function getV17OracleTailFeeds(
   return [fallbackOracle];
 }
 
-const oracleTailCache = new Map<string, { accounts: PublicKey[]; fetchedAt: number }>();
-const ORACLE_TAIL_TTL_MS = 5 * 60_000;
-
 export async function resolveV17OracleTail(
-  market: V17OracleTailMarket,
-  fallbackOracle: PublicKey,
-  connection: Connection,
-): Promise<PublicKey[]> {
-  const slabAddr = (market as any).slabAddress;
-  if (!slabAddr) {
-    return _resolveV17OracleTailUncached(market, fallbackOracle, connection);
-  }
-
-  const cacheKey = `${slabAddr.toBase58()}:${fallbackOracle.toBase58()}`;
-  const cached = oracleTailCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < ORACLE_TAIL_TTL_MS) {
-    return cached.accounts;
-  }
-
-  try {
-    const accounts = await _resolveV17OracleTailUncached(market, fallbackOracle, connection);
-    oracleTailCache.set(cacheKey, { accounts, fetchedAt: Date.now() });
-    return accounts;
-  } catch (err) {
-    oracleTailCache.delete(cacheKey);
-    throw err;
-  }
-}
-
-async function _resolveV17OracleTailUncached(
   market: V17OracleTailMarket,
   fallbackOracle: PublicKey,
   connection: Connection,
