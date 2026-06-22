@@ -394,7 +394,11 @@ const healthServer = http.createServer((req, res) => {
         contentMatch = lengthMatch && timingSafeEqual(secretPad, providedPad);
       }
       
-      if (!contentMatch) {
+      // #321: fail OPEN when no secret is configured (registerSecret === "") so
+      // liveness/health probes on a remote bind aren't silently 401'd before the
+      // operator has set KEEPER_REGISTER_SECRET — a one-time startup warning is
+      // emitted at .listen() time instead. When a secret IS set, enforce it.
+      if (registerSecret && !contentMatch) {
         res.writeHead(401, secureJsonHeaders);
         res.end(JSON.stringify({ error: "Unauthorized" }));
         return;
@@ -510,7 +514,12 @@ res.writeHead(401, secureJsonHeaders);
   // without a full restart. Auth mirrors /register: x-shared-secret header
   // matching KEEPER_ADMIN_SECRET, constant-time compare, per-IP rate limit.
   if (req.url === "/admin/budget/resume" && req.method === "POST") {
-    const adminSecret = process.env.KEEPER_ADMIN_SECRET ?? "";
+    // #323: prefer a dedicated KEEPER_ADMIN_SECRET (least-privilege vs the
+    // register secret), but fall back to KEEPER_REGISTER_SECRET so existing
+    // deployments that only set the register secret don't silently 503 on
+    // /admin/budget/resume during an incident (the worst time to discover it).
+    const adminSecret =
+      process.env.KEEPER_ADMIN_SECRET ?? process.env.KEEPER_REGISTER_SECRET ?? "";
     if (!adminSecret) {
       req.resume();
       res.writeHead(503, secureJsonHeaders);
@@ -871,6 +880,17 @@ async function start() {
     healthServer.listen(healthPort, healthBindAddr, () => {
       healthServer.off("error", reject);
       logger.info("Health endpoint started", { port: healthPort, host: healthBindAddr });
+      // #321: warn loudly if exposed remotely without a shared secret — the
+      // /health, /pause-status, /shadow/report gate fails OPEN in that posture
+      // (so probes work), leaving operational data unauthenticated.
+      const isRemoteBind =
+        healthBindAddr !== "127.0.0.1" && healthBindAddr !== "localhost" && healthBindAddr !== "::1";
+      if (isRemoteBind && !(process.env.KEEPER_REGISTER_SECRET ?? "")) {
+        logger.warn(
+          "Health server bound to a remote address without KEEPER_REGISTER_SECRET — /health, /pause-status and /shadow/report are UNAUTHENTICATED. Set KEEPER_REGISTER_SECRET to require the x-shared-secret header.",
+          { host: healthBindAddr },
+        );
+      }
       resolve();
     });
   });
