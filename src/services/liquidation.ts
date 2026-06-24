@@ -134,6 +134,130 @@ const V17_PORTFOLIO_MARKET_OFFSET = 16;
  *
  * @returns Array of {portfolioPubkey, owner} tuples for liquidatable portfolios.
  */
+/**
+ * #335: SHARED v17 portfolio-health evaluator — the single source of truth used
+ * by BOTH scanV17Portfolios() (prefilter) and liquidate()'s pre-submit recheck,
+ * so the two can never diverge. Replaces the old per-leg
+ * `computeMarginRatioBps(equity, notional) < maintenanceMarginBps` recheck with
+ * the same aggregate-maintenance semantics the scanner uses.
+ *
+ * Mirrors the engine's maintenance check as closely as an off-chain keeper can:
+ *  - Aggregate maintenance across ALL active legs (not per-leg) — a portfolio is
+ *    undercollateralized when equity < sum(legMaintenance) (#330).
+ *  - Per-asset effective_price (#331) and the minNonzeroMmReq floor.
+ *  - #335.2 CONSERVATIVE equity: capital + min(pnl, 0n) - feeDebt. The engine
+ *    haircuts positive PnL down to realizable source support
+ *    (account_haircut_equity, src/v16.rs:8451; positive PnL with no source claims
+ *    contributes ZERO), which the keeper cannot reproduce off-chain. Counting
+ *    positive PnL at 0 can only ever flag MORE portfolios (safe — no false
+ *    negatives). Negative PnL is still fully counted.
+ *  - #335.3 target/effective-price lag penalty ADDED to each leg's maintenance
+ *    (src/v16.rs:1207). Computed from the leg side + the asset's
+ *    raw_oracle_target_price + effective_price. If raw_oracle_target_price is
+ *    unreadable (0n) the penalty is omitted (never used to mark healthy).
+ *  - #335.4 If a required input is missing (no price for an active leg), the leg
+ *    is treated CONSERVATIVELY — it is flagged as a candidate rather than
+ *    silently skipped, so a missing read can never produce a false "healthy".
+ *
+ * Returns:
+ *  - liquidatable: equity <= 0n OR equity < aggregateMaintenance.
+ *  - closeQ: absPos of the first active nonzero leg (the liquidation target leg),
+ *            0n if there is no active nonzero leg.
+ *  - assetIndex: assetIndex of that first active leg (-1 if none).
+ *  - deficit: max(0, aggregateMaintenance - equity) — used only for prioritization.
+ */
+export function evaluateV17PortfolioHealth(
+  pf: ReturnType<typeof parsePortfolioV17>,
+  marketData: Uint8Array,
+  riskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint },
+  fallbackPrice: bigint,
+): { liquidatable: boolean; closeQ: bigint; assetIndex: number; deficit: bigint } {
+  const { maintenanceMarginBps, minNonzeroMmReq } = riskParams;
+
+  // #335.2 CONSERVATIVE equity: positive PnL contributes 0 (engine haircuts it
+  // to realizable support, which we can't compute off-chain). Negative PnL fully
+  // counted. fee debt fully subtracted.
+  const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
+  const conservativePnl = pf.pnl < 0n ? pf.pnl : 0n;
+  const equity = pf.capital + conservativePnl - feeDebt;
+
+  let aggregateMaintenance = 0n;
+  let firstActiveAssetIndex = -1;
+  let candidateCloseQ = 0n;
+  for (const leg of pf.legs) {
+    if (!leg.active) continue;
+    if (leg.basisPosQ === 0n) continue;
+    const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
+    // #331: per-asset effective_price from the market bytes; fall back to the
+    // market-level price when the buffer is too short.
+    const legPrice = readEffectivePriceForAsset(marketData, leg.assetIndex) || fallbackPrice;
+
+    if (firstActiveAssetIndex < 0) {
+      firstActiveAssetIndex = leg.assetIndex;
+      candidateCloseQ = absPos;
+    }
+
+    // #335.4 CONSERVATIVE-UNKNOWN: an active nonzero leg with no resolvable price
+    // is a verification gap, not a healthy leg. We cannot size its maintenance,
+    // so flag the whole portfolio as a candidate (do NOT silently skip → that
+    // would risk a false "healthy"). Return liquidatable with this leg as target.
+    if (legPrice <= 0n) {
+      return {
+        liquidatable: true,
+        closeQ: absPos,
+        assetIndex: leg.assetIndex,
+        deficit: aggregateMaintenance > equity ? aggregateMaintenance - equity : 0n,
+      };
+    }
+
+    // Ceiling division to match on-chain risk_notional_ceil (POS_SCALE = 1e6).
+    const notional = (absPos * legPrice + PRICE_E6_DIVISOR - 1n) / PRICE_E6_DIVISOR;
+    if (notional === 0n) continue;
+    // Base per-leg maintenance, clamped up to the minNonzeroMmReq floor.
+    const legMaintenance = notional * maintenanceMarginBps / BPS_MULTIPLIER;
+    let legMaintenanceClamped = legMaintenance < minNonzeroMmReq ? minNonzeroMmReq : legMaintenance;
+
+    // #335.3 target/effective-price lag penalty, ADDED to the per-leg maintenance
+    // exactly as the engine does (src/v16.rs:1207). Derive side from basisPosQ
+    // sign (cross-checks with leg.side: 0=long, 1=short). Penalty omitted when
+    // raw_oracle_target_price is unreadable (0n) — never marks healthier.
+    const side: 1 | -1 = leg.basisPosQ > 0n ? 1 : -1;
+    const rawTarget = readRawOracleTargetPriceForAsset(marketData, leg.assetIndex);
+    const lagPenalty = targetEffectiveLagPenalty(absPos, side, legPrice, rawTarget);
+    legMaintenanceClamped += lagPenalty;
+
+    aggregateMaintenance += legMaintenanceClamped;
+  }
+
+  if (firstActiveAssetIndex < 0) {
+    return { liquidatable: false, closeQ: 0n, assetIndex: -1, deficit: 0n };
+  }
+
+  // H-8 defense-in-depth: equity<=0n is unconditionally bankrupt.
+  // #330: check AGGREGATE maintenance, not per-leg.
+  const liquidatable = equity <= 0n || equity < aggregateMaintenance;
+  const deficit = aggregateMaintenance > equity ? aggregateMaintenance - equity : 0n;
+  return { liquidatable, closeQ: candidateCloseQ, assetIndex: firstActiveAssetIndex, deficit };
+}
+
+// ─── #334: bounded v17 portfolio enumeration constants ───────────────────────
+
+/**
+ * #334: hard cap on portfolios PARSED per market per cycle. getProgramAccounts is
+ * unbounded — an attacker can create thousands of portfolios for one market to
+ * make a single scan run unbounded and stall every other market. We cap the work
+ * per market per cycle and walk a PERSISTENT per-market rotating cursor so every
+ * portfolio is eventually scanned across cycles (fairness — none is permanently
+ * skipped). Sized generously so legitimate markets are fully covered in one cycle.
+ */
+const MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE = 512;
+
+/** #334: cap on liquidation candidates emitted per market per cycle. */
+const MAX_CANDIDATES_PER_MARKET = 64;
+
+/** #334: cap on liquidation candidates emitted globally per cycle (all markets). */
+const MAX_CANDIDATES_PER_GLOBAL_CYCLE = 256;
+
 async function scanV17Portfolios(
   connection: ReturnType<typeof getConnection>,
   programId: PublicKey,
@@ -142,7 +266,10 @@ async function scanV17Portfolios(
   price: bigint,
   marketData: Uint8Array,
   minNonzeroMmReq: bigint,
-): Promise<Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint }>> {
+  // #334: persistent rotating cursor map (marketKey → next start offset) so every
+  // portfolio is eventually scanned across cycles even when truncated.
+  cursors: Map<string, number>,
+): Promise<Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint; deficit: bigint }>> {
   const marketKey = market.slabAddress.toBase58();
   let rawPortfolios: ReadonlyArray<{ pubkey: PublicKey; account: { data: Buffer | Uint8Array } }>;
   try {
@@ -171,8 +298,53 @@ async function scanV17Portfolios(
 
   if (price === 0n) return []; // No price, can't compute margin
 
-  const candidates: Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint }> = [];
-  for (const { pubkey, account } of rawPortfolios) {
+  // #334: bound the per-market work. getProgramAccounts is unbounded, so an
+  // attacker can create many portfolios to make one market's scan run unbounded
+  // and stall every other market (health flaps → restart loop). We process at
+  // most MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE accounts per market per cycle and
+  // advance a PERSISTENT rotating cursor so the rest are picked up next cycle —
+  // every portfolio is eventually scanned (fairness; no permanent skip).
+  const total = rawPortfolios.length;
+  // Sort for a STABLE rotation order independent of RPC return order, so the
+  // cursor reliably advances over the same sequence across cycles.
+  const ordered =
+    total > MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE
+      ? [...rawPortfolios].sort((a, b) =>
+          a.pubkey.toBase58() < b.pubkey.toBase58() ? -1 : a.pubkey.toBase58() > b.pubkey.toBase58() ? 1 : 0,
+        )
+      : rawPortfolios;
+
+  type RawPortfolio = { pubkey: PublicKey; account: { data: Buffer | Uint8Array } };
+  let startOffset = 0;
+  let window: ReadonlyArray<RawPortfolio> = ordered;
+  if (total > MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE) {
+    startOffset = ((cursors.get(marketKey) ?? 0) % total + total) % total;
+    // Take a rotating window of size MAX_…, wrapping around the end.
+    const win: RawPortfolio[] = [];
+    for (let k = 0; k < MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE; k++) {
+      win.push(ordered[(startOffset + k) % total]!);
+    }
+    window = win;
+    // Persist the next start so subsequent cycles cover the remaining portfolios.
+    cursors.set(marketKey, (startOffset + MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE) % total);
+    logger.info("scanV17Portfolios: truncating to per-market cap — remaining portfolios deferred to later cycles", {
+      market: marketKey.slice(0, 8),
+      totalPortfolios: total,
+      processedThisCycle: MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE,
+      droppedThisCycle: total - MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE,
+      cursorStart: startOffset,
+      cursorNext: (startOffset + MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE) % total,
+    });
+  } else if (cursors.has(marketKey)) {
+    // Market shrank back under the cap — reset the cursor so we don't carry a
+    // stale offset that would skip the front of a now-small set.
+    cursors.delete(marketKey);
+  }
+
+  // #334: collect all qualifying candidates with their deficit so we can
+  // prioritize by LARGEST deficit before applying the per-market candidate cap.
+  const scored: Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint; deficit: bigint }> = [];
+  for (const { pubkey, account } of window) {
     try {
       const pfData = new Uint8Array(account.data);
       const pf = parsePortfolioV17(pfData);
@@ -193,56 +365,44 @@ async function scanV17Portfolios(
         continue;
       }
 
-      // #230: fee debt is portfolio-level — compute once outside the leg loop.
-      const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
-      const equity = pf.capital + pf.pnl - feeDebt;
-
-      // #330/#331: Aggregate maintenance across all active legs using per-asset
-      // effective_price. A portfolio with N legs is undercollateralized when
-      // equity < sum(legMaintenance) even if equity >= any individual leg's
-      // maintenance — the old per-leg break missed this case.
-      let aggregateMaintenance = 0n;
-      let firstActiveAssetIndex = -1;
-      let candidateCloseQ = 0n;
-      for (const leg of pf.legs) {
-        if (!leg.active) continue;
-        if (leg.basisPosQ === 0n) continue;
-        const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
-        // #331: Use per-asset effective_price from the market account bytes.
-        // Falls back to the market-level price when the buffer is too short.
-        const legPrice = readEffectivePriceForAsset(marketData, leg.assetIndex) || price;
-        // Ceiling division to match on-chain notional rounding.
-        const notional = (absPos * legPrice + PRICE_E6_DIVISOR - 1n) / PRICE_E6_DIVISOR;
-        if (notional === 0n) continue;
-        // Per-leg maintenance: clamped up to minNonzeroMmReq so even tiny
-        // positions carry the minimum margin floor.
-        const legMaintenance = notional * maintenanceMarginBps / BPS_MULTIPLIER;
-        const legMaintenanceClamped = legMaintenance < minNonzeroMmReq ? minNonzeroMmReq : legMaintenance;
-        aggregateMaintenance += legMaintenanceClamped;
-        // Track first active leg for candidate assetIndex and closeQ.
-        if (firstActiveAssetIndex < 0) {
-          firstActiveAssetIndex = leg.assetIndex;
-          candidateCloseQ = absPos;
-        }
-      }
-
-      if (firstActiveAssetIndex < 0) continue; // no active nonzero legs
-
-      // H-8 defense-in-depth: equity<=0n is unconditionally bankrupt.
-      // #330: check aggregate maintenance, not per-leg.
-      if (equity <= 0n || equity < aggregateMaintenance) {
-        candidates.push({
+      // #335: single shared health evaluator (aggregate maintenance, per-asset
+      // price, conservative equity, target-lag penalty). IDENTICAL semantics to
+      // the pre-submit recheck in liquidate().
+      const health = evaluateV17PortfolioHealth(
+        pf,
+        marketData,
+        { maintenanceMarginBps, minNonzeroMmReq },
+        price,
+      );
+      if (health.assetIndex < 0) continue; // no active nonzero legs
+      if (health.liquidatable) {
+        scored.push({
           portfolioPubkey: pubkey,
           owner: pf.owner.toBase58(),
-          assetIndex: firstActiveAssetIndex, // DESYNC-4: use leg.assetIndex, NOT slab slot index
-          closeQ: candidateCloseQ,           // #329: absPos of first active leg
+          assetIndex: health.assetIndex, // DESYNC-4: leg.assetIndex, NOT slab slot index
+          closeQ: health.closeQ,         // #329: absPos of first active leg
+          deficit: health.deficit,
         });
       }
     } catch {
       // Skip portfolios that fail to parse
     }
   }
-  return candidates;
+
+  // #334: cap candidates PER MARKET, prioritizing the largest deficit (most
+  // urgent / most insurance-fund exposure) first. The GLOBAL per-cycle cap
+  // (MAX_CANDIDATES_PER_GLOBAL_CYCLE) is enforced in scanAndLiquidateAll where
+  // candidates are consumed sequentially across markets.
+  scored.sort((a, b) => (b.deficit > a.deficit ? 1 : b.deficit < a.deficit ? -1 : 0));
+  if (scored.length > MAX_CANDIDATES_PER_MARKET) {
+    logger.info("scanV17Portfolios: per-market candidate cap reached — lower-deficit candidates deferred", {
+      market: marketKey.slice(0, 8),
+      qualifying: scored.length,
+      kept: MAX_CANDIDATES_PER_MARKET,
+      droppedThisCycle: scored.length - MAX_CANDIDATES_PER_MARKET,
+    });
+  }
+  return scored.slice(0, MAX_CANDIDATES_PER_MARKET);
 }
 
 // Oracle-drift guard (main hardening): abort liquidation if the oracle price drifts more than
@@ -441,6 +601,14 @@ export class LiquidationService {
   // PERC-484: Track markets that permanently fail with InvalidSlabLen (0x4).
   // These are test/corrupt markets with wrong slab size — skip them indefinitely.
   private readonly permanentlySkipped = new Set<string>();
+  // #334: PERSISTENT per-market rotating cursor (marketKey → next start offset
+  // into the portfolio set). When a market has more than
+  // MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE portfolios, scanV17Portfolios processes a
+  // rotating window and advances this cursor so every portfolio is eventually
+  // scanned across cycles — an attacker can't permanently hide an underwater
+  // portfolio behind a flood of dummy ones, and the scan can't run unbounded.
+  // Survives across cycles (not cleared in scanAndLiquidateAll) by design.
+  private readonly _v17PortfolioCursors = new Map<string, number>();
   // H-8: per-market cooldown latch for the "corrupted risk params" alert. A
   // corrupted/zero maintenanceMarginBps is a sustained, unchanging condition
   // re-evaluated every scan cycle (default 60s) -- not a burst of distinct
@@ -571,6 +739,7 @@ export class LiquidationService {
           price,
           data,
           v17Params.minNonzeroMmReq,
+          this._v17PortfolioCursors, // #334: persistent rotating cursor
         );
         // Map to LiquidationCandidate — v17 uses portfolio pubkey as accountIdx sentinel
         // The liquidate() method is updated below to use portfolioPubkey directly.
@@ -1265,6 +1434,15 @@ export class LiquidationService {
     const BATCH_DELAY_MS = 1_200; // ~1.2s pause between batches
     const entries = Array.from(markets.values());
 
+    // #334: global per-cycle candidate budget. Bounds the total number of
+    // (serial, RPC-heavy) liquidate() submissions a single cycle will attempt,
+    // so an attacker who spreads underwater portfolios across many markets can't
+    // make one cycle run unbounded and stall the scheduler. Candidates beyond
+    // the budget are deferred to the next cycle (the per-market deficit sort
+    // means the most urgent are processed first within each market).
+    let globalCandidatesProcessed = 0;
+    let globalBudgetLoggedThisCycle = false;
+
     for (let i = 0; i < entries.length; i += BATCH_SIZE) {
       const batch = entries.slice(i, i + BATCH_SIZE);
       // PERC-484: Skip markets permanently flagged as invalid slab (0x4 InvalidSlabLen).
@@ -1296,6 +1474,21 @@ export class LiquidationService {
         // C1: dedup per on-chain (slab, accountIdx) position; rate-limit per
         // owner across the cycle.
         for (const candidate of candidates) {
+          // #334: honor the global per-cycle candidate cap. Once exhausted, stop
+          // submitting liquidations this cycle — the remainder is picked up next
+          // cycle. Logged once so a sustained breach is operator-visible (no
+          // silent cap).
+          if (globalCandidatesProcessed >= MAX_CANDIDATES_PER_GLOBAL_CYCLE) {
+            if (!globalBudgetLoggedThisCycle) {
+              logger.info("scanAndLiquidateAll: global per-cycle candidate cap reached — remaining liquidations deferred to next cycle", {
+                cap: MAX_CANDIDATES_PER_GLOBAL_CYCLE,
+                totalCandidatesThisCycle: candidateCount,
+              });
+              globalBudgetLoggedThisCycle = true;
+            }
+            break; // stop processing this market's remaining candidates
+          }
+          globalCandidatesProcessed++;
           // C1/#218: dedup by (slab, accountIdx) + per-owner cap are enforced inside the
           // shared gate, which the LaserStream event path also uses — so neither path can
           // bypass it.
