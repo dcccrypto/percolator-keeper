@@ -6,9 +6,18 @@
  * input can drain that wallet faster than ops can notice. The budget caps
  * lamport spend per cycle / hour / day and tx count per cycle, plus a
  * rolling-window success-rate guard that catches "we're sending but nothing
- * lands". On breach, the budget halts: every subsequent canSpend() returns
- * false until an operator manually resume()s. Day-cap breaches especially
- * never auto-recover — that's a real signal something is wrong.
+ * lands". On a genuine anomaly (spend caps, non-finite cost, success-rate
+ * breaker, operator halt) the budget LATCHES a halt: every subsequent
+ * canSpend() returns false until an operator manually resume()s. Day-cap
+ * breaches especially never auto-recover — that's a real signal something is
+ * wrong.
+ *
+ * #333: the per-cycle tx-COUNT cap is deliberately NOT a latching halt. Hitting
+ * it is routine burst pressure (permissionless market creation drives crank /
+ * provisioning / lp-vault volume), so canSpend() returns false as soft
+ * backpressure and the work auto-resumes on the next window roll. A reserved
+ * slice of the count cap (reservedCriticalTxPerCycle) is held back from routine
+ * lanes so liquidation / oracle / adl always have capacity even under a flood.
  *
  * Concurrency: every public method is synchronous. Under Node's single-
  * threaded event loop, no two calls can interleave between their reads and
@@ -32,6 +41,19 @@ export interface KeeperBudgetConfig {
   maxSolPerDay: number;
   /** Cap on tx attempts per cycle (default 60). */
   maxTxPerCycle: number;
+  /**
+   * Number of per-cycle tx slots RESERVED for safety-critical lanes
+   * (liquidation / oracle / adl), default 10. Routine non-critical lanes
+   * (crank, which buckets provisioning + lp-vault) see an effective cap of
+   * `maxTxPerCycle - reservedCriticalTxPerCycle`, while critical lanes may use
+   * the full `maxTxPerCycle`. This guarantees a permissionless crank/
+   * provisioning/lp-vault flood — which an attacker can drive via market
+   * creation — can never consume the last slots liquidation needs.
+   *
+   * #333: capped to maxTxPerCycle - 1 internally so routine lanes always keep
+   * at least 1 usable slot (a reservation >= maxTxPerCycle would starve them).
+   */
+  reservedCriticalTxPerCycle: number;
   /**
    * Length of the per-cycle window in ms (default 30_000, matching the default
    * crank interval). The per-cycle caps (maxSolPerCycle / maxTxPerCycle) are a
@@ -106,6 +128,7 @@ const DEFAULTS: KeeperBudgetConfig = {
   maxSolPerHour: 500_000_000,
   maxSolPerDay: 3_000_000_000,
   maxTxPerCycle: 60,
+  reservedCriticalTxPerCycle: 10,
   cycleWindowMs: 30_000,
   txSuccessRateWindow: 60_000,
   txSuccessRateThreshold: 0.7,
@@ -120,6 +143,7 @@ const INT_ENV_KEYS: Array<[keyof KeeperBudgetConfig, string]> = [
   ["maxSolPerHour", "KEEPER_MAX_SOL_PER_HOUR"],
   ["maxSolPerDay", "KEEPER_MAX_SOL_PER_DAY"],
   ["maxTxPerCycle", "KEEPER_MAX_TX_PER_CYCLE"],
+  ["reservedCriticalTxPerCycle", "KEEPER_RESERVED_CRITICAL_TX_PER_CYCLE"],
   ["cycleWindowMs", "KEEPER_CYCLE_WINDOW_MS"],
   ["txSuccessRateWindow", "KEEPER_TX_SUCCESS_RATE_WINDOW_MS"],
   ["txSuccessRateMinSamples", "KEEPER_TX_SUCCESS_RATE_MIN_SAMPLES"],
@@ -194,11 +218,20 @@ export class KeeperBudget {
 
   /**
    * Pre-flight check: would sending a tx that costs `lamports` lamports breach
-   * any cap? Returns false on breach AND latches the halt so subsequent calls
-   * also return false until resume() is called.
+   * any cap?
    *
-   * txType is currently advisory (logged on breach); planned use is to attribute
-   * Prometheus halt counters per tx category.
+   * Two distinct refusal semantics:
+   *  - LATCHING halt (returns false until resume()): genuine anomalies —
+   *    cycle/hour/day SPEND caps, non-finite cost, the success-rate breaker, or
+   *    an explicit operator halt. These are real "something is wrong" signals.
+   *  - SOFT backpressure (returns false, NO halt, auto-clears next window): the
+   *    per-cycle tx-COUNT cap (#333) and the reservation back-pressure path.
+   *    These are routine burst pressure, not overspend, and self-heal on the
+   *    next window roll without operator action.
+   *
+   * txType selects the per-cycle tx-count cap the caller sees: safety-critical
+   * lanes (liquidation / oracle / adl) use the full maxTxPerCycle; routine
+   * lanes (crank / provisioning / lp-vault) use the reserved-adjusted cap.
    */
   canSpend(lamports: number, txType: TxType): boolean {
     if (this._isHalted) return false;
@@ -247,11 +280,24 @@ export class KeeperBudget {
       );
       return false;
     }
-    if (this._cycleTxCount + 1 > this.config.maxTxPerCycle) {
-      this._halt(
-        "cycle-tx-count-cap",
-        `proposed cycle tx count ${this._cycleTxCount + 1} > cap ${this.config.maxTxPerCycle} (txType=${txType})`,
-      );
+    // ── Count-cap saturation: SOFT BACKPRESSURE, do NOT halt ───────────────
+    // #333: exceeding the per-cycle tx-count cap is NOT an overspend anomaly —
+    // it is routine burst pressure. Permissionless market creation drives
+    // crank / provisioning / lp-vault tx volume, so a latching halt here let an
+    // attacker permanently stop ALL cranks and liquidations cross-market with
+    // mere volume. Instead, refuse this send WITHOUT setting _isHalted: the
+    // window auto-rolls (_rollCycleIfElapsed zeroes _cycleTxCount) so deferred
+    // work resumes next window with no operator action. Only genuine anomalies
+    // (day/hour/cycle SPEND, non-finite cost, success-rate breaker, operator
+    // halt) still latch above/below.
+    //
+    // Critical lanes (liquidation / oracle / adl) may use the FULL cap;
+    // routine non-critical lanes (crank, which buckets provisioning + lp-vault)
+    // see the reserved-adjusted cap so a routine flood can never consume the
+    // last slots a liquidation needs. Reservations are counted in the same
+    // unit so the backpressure path below stays consistent.
+    const effectiveTxCap = this._effectiveTxCap(txType);
+    if (this._cycleTxCount + 1 > effectiveTxCap) {
       return false;
     }
 
@@ -275,7 +321,10 @@ export class KeeperBudget {
       this._cycleSpend + this._reservedLamports + lamports > this.config.maxSolPerCycle ||
       this._hourSpendSum + this._reservedLamports + lamports > this.config.maxSolPerHour ||
       this._daySpendSum + this._reservedLamports + lamports > this.config.maxSolPerDay ||
-      this._cycleTxCount + this._reservedTxCount + 1 > this.config.maxTxPerCycle
+      // #333: in-flight reservations count against the SAME lane-aware effective
+      // cap, so a flood of in-flight routine sends can't reserve away the
+      // critical reserve either.
+      this._cycleTxCount + this._reservedTxCount + 1 > effectiveTxCap
     ) {
       return false;
     }
@@ -576,4 +625,40 @@ export class KeeperBudget {
     if (total < this.config.txSuccessRateMinSamples) return null;
     return this._txWindowSuccesses / total;
   }
+
+  /**
+   * #333: the per-cycle tx-count cap a given lane sees.
+   *
+   * Safety-critical lanes (liquidation / oracle / adl) get the FULL
+   * `maxTxPerCycle`. Routine non-critical lanes (crank — which buckets
+   * provisioning + lp-vault sends) get `maxTxPerCycle - reservedCriticalTxPerCycle`,
+   * so the reserved slots are always available when a liquidation arrives even
+   * if routine crank/provisioning volume has otherwise saturated the cycle.
+   *
+   * The reservation is clamped to [0, maxTxPerCycle - 1] so a misconfiguration
+   * (e.g. reserved >= maxTxPerCycle) can never starve routine lanes to 0 — they
+   * always keep at least one usable slot.
+   */
+  private _effectiveTxCap(txType: TxType): number {
+    if (_isCriticalLane(txType)) return this.config.maxTxPerCycle;
+    const reserved = Math.min(
+      Math.max(0, this.config.reservedCriticalTxPerCycle),
+      Math.max(0, this.config.maxTxPerCycle - 1),
+    );
+    return this.config.maxTxPerCycle - reserved;
+  }
+}
+
+/**
+ * Safety-critical lanes whose sends must always have reserved per-cycle
+ * capacity available: liquidation (resolving underwater positions), oracle
+ * (mark/index freshness that liquidation reads), and adl (auto-deleverage,
+ * the deleveraging half of the liquidation safety path). Everything else —
+ * notably "crank", which also carries provisioning and lp-vault sends — is
+ * routine and subject to the reserved-adjusted cap.
+ */
+const CRITICAL_LANES: ReadonlySet<TxType> = new Set<TxType>(["liquidation", "oracle", "adl"]);
+
+function _isCriticalLane(txType: TxType): boolean {
+  return CRITICAL_LANES.has(txType);
 }

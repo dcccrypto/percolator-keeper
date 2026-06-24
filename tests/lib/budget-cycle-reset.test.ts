@@ -73,8 +73,12 @@ describe("KeeperBudget cycle-reset regression (drives the real keeperSend)", () 
     expect(refused).toBe(0);
   });
 
-  it("a genuine burst beyond the per-cycle cap within one window still halts, and resume() recovers", async () => {
-    // No clock advance → all sends fall in one window. The 61st trips the cap.
+  it("#333: a within-window crank burst beyond the cap is soft-refused (no halt) and auto-recovers", async () => {
+    // No clock advance → all sends fall in one window. With default config
+    // (maxTxPerCycle=60, reservedCriticalTxPerCycle=10) "crank" sees an
+    // effective cap of 50, so the 51st+ crank is refused — but as SOFT
+    // backpressure, NOT a latching halt (#333). An attacker driving crank/
+    // provisioning volume can no longer wedge the whole keeper.
     const clock = makeClock();
     const budget = new KeeperBudget({}, { now: clock.now });
     const kp = Keypair.generate();
@@ -83,14 +87,31 @@ describe("KeeperBudget cycle-reset regression (drives the real keeperSend)", () 
     for (let i = 0; i < 80; i++) {
       if ((await keeperSend(c, [ix()], [kp], "crank", budget)) === null) refused++;
     }
-    expect(budget.isHalted()).toBe(true);
-    expect(budget.getStats().haltKind).toBe("cycle-tx-count-cap");
-    expect(refused).toBeGreaterThan(0);
+    expect(budget.isHalted()).toBe(false); // soft backpressure — no latch
+    expect(budget.getStats().haltKind).toBeUndefined();
+    expect(refused).toBeGreaterThan(0); // sends past the effective cap were deferred
 
-    // Recoverable without a restart: resume + a fresh window lets sends through.
-    budget.resume("test-operator");
+    // Auto-recovers next window WITHOUT any operator resume().
     clock.advance(30_000);
     expect(await keeperSend(c, [ix()], [kp], "crank", budget)).not.toBeNull();
+    expect(budget.isHalted()).toBe(false);
+  });
+
+  it("#333: reserved critical capacity — a crank flood still leaves room for a liquidation", async () => {
+    // Saturate the routine (crank) lane within one window. The reserved slots
+    // (default 10) are held back from crank, so a liquidation still lands even
+    // though crank is fully backpressured.
+    const clock = makeClock();
+    const budget = new KeeperBudget({}, { now: clock.now });
+    const kp = Keypair.generate();
+    const c = conn();
+    for (let i = 0; i < 60; i++) {
+      await keeperSend(c, [ix()], [kp], "crank", budget); // floods up to the 50-slot crank cap
+    }
+    // crank is now refused (effective cap 50 reached)…
+    expect(await keeperSend(c, [ix()], [kp], "crank", budget)).toBeNull();
+    // …but a liquidation uses the FULL cap of 60, so reserved slots remain.
+    expect(await keeperSend(c, [ix()], [kp], "liquidation", budget)).not.toBeNull();
     expect(budget.isHalted()).toBe(false);
   });
 });

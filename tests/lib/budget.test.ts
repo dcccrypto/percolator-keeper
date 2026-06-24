@@ -19,6 +19,11 @@ const TIGHT_CONFIG = {
   maxSolPerHour: 5_000,
   maxSolPerDay: 20_000,
   maxTxPerCycle: 5,
+  // #333: pin the critical-reserve to 0 in the shared config so spend/reservation
+  // tests exercise the FULL count cap on the "crank" lane (matching their
+  // pre-#333 intent). The dedicated count-cap / reserved-capacity tests below set
+  // reservedCriticalTxPerCycle explicitly where the reserve is the thing under test.
+  reservedCriticalTxPerCycle: 0,
   txSuccessRateWindow: 60_000,
   txSuccessRateThreshold: 0.7,
   txSuccessRateMinSamples: 4,
@@ -154,14 +159,21 @@ describe("KeeperBudget — day spend cap", () => {
 });
 
 describe("KeeperBudget — cycle tx count cap", () => {
-  it("trips when cycle tx count would exceed cap", () => {
+  // #333: hitting the per-cycle tx-COUNT cap is soft backpressure, NOT a
+  // latching halt. The send is refused but the breaker stays un-halted so the
+  // next window auto-resumes the deferred work — an attacker can no longer
+  // wedge the whole keeper with mere crank/provisioning volume.
+  it("refuses the over-cap send WITHOUT halting (soft backpressure)", () => {
     const clock = makeClock();
-    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+    // TIGHT_CONFIG pins reservedCriticalTxPerCycle:0 so "crank" sees the full
+    // count cap (5) and this test isolates the raw count-cap → soft-refuse path.
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, reservedCriticalTxPerCycle: 0 }, { now: clock.now });
     for (let i = 0; i < 5; i++) {
       b.recordTx(1, "crank", "success");
     }
     expect(b.canSpend(1, "crank")).toBe(false);
-    expect(b.haltKind).toBe("cycle-tx-count-cap");
+    expect(b.isHalted()).toBe(false); // no latch
+    expect(b.haltKind).toBeUndefined();
   });
 });
 
@@ -199,19 +211,38 @@ describe("KeeperBudget — per-cycle window auto-reset", () => {
     expect(b.getStats().cycleSpend).toBe(0); // rolled
   });
 
-  it("a genuine within-window burst still trips the cap and latches (brake intact)", () => {
+  it("#333: a within-window count-cap burst refuses (soft) but does NOT latch", () => {
     const clock = makeClock();
-    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000, reservedCriticalTxPerCycle: 0 }, { now: clock.now });
     for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success"); // maxTxPerCycle = 5
     expect(b.canSpend(1, "crank")).toBe(false);
-    expect(b.haltKind).toBe("cycle-tx-count-cap");
+    expect(b.isHalted()).toBe(false); // soft backpressure, no halt
+    expect(b.haltKind).toBeUndefined();
   });
 
-  it("window roll does NOT clear a latched halt — resume() is still required", () => {
+  it("#333: a genuine SPEND-cap burst still latches (brake intact for real anomalies)", () => {
+    const clock = makeClock();
+    // maxSolPerCycle = 1_000; one big spend breaches it → real overspend → latch.
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    expect(b.canSpend(2_000, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("cycle-spend-cap");
+  });
+
+  it("#333: count-cap soft refusal auto-clears next window (no resume needed)", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000, reservedCriticalTxPerCycle: 0 }, { now: clock.now });
+    for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success");
+    expect(b.canSpend(1, "crank")).toBe(false); // count cap hit
+    expect(b.isHalted()).toBe(false);
+    clock.advance(30_000); // window rolls → _cycleTxCount zeroed
+    expect(b.canSpend(1, "crank")).toBe(true); // auto-resumed, no operator action
+  });
+
+  it("window roll does NOT clear a latched SPEND halt — resume() is still required", () => {
     const clock = makeClock();
     const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
-    for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success");
-    expect(b.canSpend(1, "crank")).toBe(false);
+    expect(b.canSpend(2_000, "crank")).toBe(false); // spend-cap breach → latch
     expect(b.isHalted()).toBe(true);
     clock.advance(120_000); // several windows elapse
     expect(b.isHalted()).toBe(true); // a real breach stays halted until a human resumes
