@@ -801,6 +801,8 @@ export class CrankService {
   // entry/exit so every code path that reaches crankMarket honors the same
   // in-flight invariant.
   private _inflightMarkets = new Set<string>();
+  /** Per-market in-flight guard for LP-vault maintenance — mirrors _inflightMarkets. */
+  private _inflightLpVaultMarkets = new Set<string>();
   private _stalePauseCheck?: (slabAddress: string) => boolean;
   // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
@@ -1770,11 +1772,16 @@ export class CrankService {
     //
     // B2: closure returns a plain boolean; processBatched sums succeeded/failed
     // after Promise.all resolves. No outer counter mutation in the closure.
+    const succeededSlabs = new Set<string>();
     const batchResult = await processBatched(
       toCrank,
       PARALLEL_CONCURRENCY,
       50,
-      (slabAddress) => this.crankMarket(slabAddress),
+      async (slabAddress) => {
+        const result = await this.crankMarket(slabAddress);
+        if (result === "success") succeededSlabs.add(slabAddress);
+        return result;
+      },
     );
     success = batchResult.succeeded;
     failed = batchResult.failed;
@@ -1783,17 +1790,45 @@ export class CrankService {
     // DESYNC-5 FIX: LpVaultCrankFees (tag 78) — submit for each successfully
     // cranked market that has an LP vault. This advances the backing-domain
     // ledger so LP depositors receive their pro-rata fee share.
-    // Run fire-and-forget so LP vault crank failures don't block the cycle.
-    // Only check markets that were in the toCrank list (skip permanently failed / skipped).
-    if (success > 0) {
+    // #339: LP-vault maintenance — tracked, guarded, shutdown-aware.
+    // Only run for markets that were individually successful this cycle (not all
+    // of toCrank, which includes markets whose own crank failed this batch).
+    // Uses Promise.allSettled so failures don't block the cycle but work IS
+    // tracked so shutdown can complete before new enqueues race the drain.
+    if (succeededSlabs.size > 0 && this._isRunning) {
       const connection = getConnection();
       const keypair = this._keypair;
-      for (const slabAddress of toCrank) {
+      const lpVaultTasks: Promise<void | string | null>[] = [];
+      for (const slabAddress of succeededSlabs) {
+        // #339: per-market in-flight guard — two cycles can't duplicate LP-vault
+        // work for the same market (mirrors _inflightMarkets for crankMarket).
+        if (this._inflightLpVaultMarkets.has(slabAddress)) {
+          logger.debug("crankAll: LP-vault already in-flight for market, skipping duplicate", {
+            slabAddress: slabAddress.slice(0, 8),
+          });
+          continue;
+        }
+        // #339: shutdown guard — don't start new LP-vault work if stop() was called
+        // while the batch was in flight. Prevents post-drain enqueues.
+        if (!this._isRunning) break;
         const state = this.markets.get(slabAddress);
         if (!state) continue;
-        // Fire LP vault crank asynchronously — don't await so it doesn't slow down the cycle.
-        crankLpVault(connection, state.market.programId, state.market, keypair).catch(() => {});
+        this._inflightLpVaultMarkets.add(slabAddress);
+        const task = crankLpVault(connection, state.market.programId, state.market, keypair)
+          .catch((err) => {
+            logger.debug("crankLpVault threw (tracked)", {
+              slabAddress: slabAddress.slice(0, 8),
+              error: err instanceof Error ? err.message : String(err),
+            });
+          })
+          .finally(() => {
+            this._inflightLpVaultMarkets.delete(slabAddress);
+          });
+        lpVaultTasks.push(task);
       }
+      // Await all LP-vault work before the cycle exits so shutdown can reliably
+      // drain the queue before accepting new enqueues.
+      await Promise.allSettled(lpVaultTasks);
     }
 
     // BM7: Log detailed error summary if any failed
