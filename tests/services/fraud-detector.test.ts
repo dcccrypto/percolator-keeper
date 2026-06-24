@@ -46,6 +46,8 @@ function makeHyperpState(opts: {
   /** If true, make indexFeedId non-zero (non-HYPERP market) */
   nonZeroFeed?: boolean;
   mainnetCA?: string;
+  /** v17 oracle mode: 0=MANUAL, 2=EWMA_MARK, 3=AUTH_MARK. Omit for v12 market (no _rawV17Config). */
+  v17OracleMode?: number;
 }): MarketCrankState {
   const ZERO = new PublicKey("11111111111111111111111111111111");
   const NONZERO = new PublicKey("So11111111111111111111111111111111111111112");
@@ -71,6 +73,10 @@ function makeHyperpState(opts: {
         markPriceE6: 0n,
       } as never,
       params: {} as never,
+      // #340: v17 oracle mode — only present for v17 markets. Omit for v12.
+      ...(opts.v17OracleMode !== undefined
+        ? { _rawV17Config: { oracleMode: opts.v17OracleMode } }
+        : {}),
     },
     lastCrankTime: 0,
     successCount: 0,
@@ -82,18 +88,20 @@ function makeHyperpState(opts: {
   };
 }
 
-/** Build a mock OracleService with controllable fetchPrice behavior. */
+/** Build a mock OracleService with controllable fetchPrice/peekPrice behavior. */
 function makeMockOracle(
   resolveWith: Awaited<ReturnType<OracleService["fetchPrice"]>>,
 ): OracleService {
   return {
     fetchPrice: vi.fn().mockResolvedValue(resolveWith),
+    peekPrice: vi.fn().mockResolvedValue(resolveWith),
   } as unknown as OracleService;
 }
 
 function makeThrowingOracle(err: Error): OracleService {
   return {
     fetchPrice: vi.fn().mockRejectedValue(err),
+    peekPrice: vi.fn().mockRejectedValue(err),
   } as unknown as OracleService;
 }
 
@@ -155,6 +163,7 @@ describe("FraudDetectorService", () => {
     svc.start();
     // Advance time by 60 seconds — no check cycle should fire
     vi.advanceTimersByTime(60_000);
+    expect(oracle.peekPrice).not.toHaveBeenCalled();
     expect(oracle.fetchPrice).not.toHaveBeenCalled();
     svc.stop();
   });
@@ -170,7 +179,8 @@ describe("FraudDetectorService", () => {
     vi.advanceTimersByTime(50);
     svc.stop();
     vi.advanceTimersByTime(300);
-    // fetchPrice never called (no HYPERP markets in empty map)
+    // peekPrice/fetchPrice never called (no HYPERP markets in empty map)
+    expect(oracle.peekPrice).not.toHaveBeenCalled();
     expect(oracle.fetchPrice).not.toHaveBeenCalled();
   });
 
@@ -329,7 +339,8 @@ describe("FraudDetectorService", () => {
     const svc = new FraudDetectorService(oracle, () => markets);
     await svc._runCheck();
 
-    expect(oracle.fetchPrice).toHaveBeenCalled();
+    expect(oracle.peekPrice).toHaveBeenCalled();
+    expect(oracle.fetchPrice).not.toHaveBeenCalled();
   });
 
   it("skips non-HYPERP market where indexFeedId is non-zero", async () => {
@@ -340,6 +351,7 @@ describe("FraudDetectorService", () => {
     const svc = new FraudDetectorService(oracle, () => markets);
     await svc._runCheck();
 
+    expect(oracle.peekPrice).not.toHaveBeenCalled();
     expect(oracle.fetchPrice).not.toHaveBeenCalled();
   });
 
@@ -353,6 +365,7 @@ describe("FraudDetectorService", () => {
     const svc = new FraudDetectorService(oracle, () => markets);
     await svc._runCheck();
 
+    expect(oracle.peekPrice).not.toHaveBeenCalled();
     expect(oracle.fetchPrice).not.toHaveBeenCalled();
     expect(mockFraudOffchainUnavailableTotal.inc).not.toHaveBeenCalled();
   });
@@ -405,8 +418,9 @@ describe("FraudDetectorService", () => {
     const svc = new FraudDetectorService(oracle, () => markets);
     await svc._runCheck();
 
-    // fetchPrice should be called with mainnetCA, not the collateral mint
-    expect(oracle.fetchPrice).toHaveBeenCalledWith(mainnetCA, "slab1");
+    // peekPrice should be called with mainnetCA (no slabAddress — peekPrice is read-only)
+    expect(oracle.peekPrice).toHaveBeenCalledWith(mainnetCA);
+    expect(oracle.fetchPrice).not.toHaveBeenCalled();
   });
 
   // ── malformed env config PoC ───────────────────────────────────────────────
@@ -459,5 +473,50 @@ describe("FraudDetectorService", () => {
 
     expect(mockWarnAlertFn).toHaveBeenCalledTimes(1);
     expect(mockFraudAlertTotal.inc).toHaveBeenCalledTimes(1);
+  });
+
+  // ── #340: v17 oracle mode enrollment ──────────────────────────────────────
+
+  it("#340: v17 MANUAL(0) market with zero indexFeedId is NOT fraud-enrolled", async () => {
+    const state = makeHyperpState({ markPriceE6: 2_000_000n, v17OracleMode: 0 });
+    const markets = new Map([["slab1", state]]);
+    const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });
+    const svc = new FraudDetectorService(oracle, () => markets);
+    await svc._runCheck();
+    expect(oracle.peekPrice).not.toHaveBeenCalled();
+    expect(mockFraudAlertTotal.inc).not.toHaveBeenCalled();
+  });
+
+  it("#340: v17 EWMA_MARK(2) market with zero indexFeedId is NOT fraud-enrolled", async () => {
+    const state = makeHyperpState({ markPriceE6: 2_000_000n, v17OracleMode: 2 });
+    const markets = new Map([["slab1", state]]);
+    const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });
+    const svc = new FraudDetectorService(oracle, () => markets);
+    await svc._runCheck();
+    expect(oracle.peekPrice).not.toHaveBeenCalled();
+    expect(mockFraudAlertTotal.inc).not.toHaveBeenCalled();
+  });
+
+  it("#340: v17 AUTH_MARK(3) market IS fraud-enrolled and alerts on divergence", async () => {
+    process.env.FRAUD_DETECT_DIVERGENCE_BPS = "500";
+    mockWarnAlertFn.mockReturnValue(Promise.resolve());
+    const state = makeHyperpState({ markPriceE6: 2_000_000n, v17OracleMode: 3 });
+    const markets = new Map([["slab1", state]]);
+    const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });
+    const svc = new FraudDetectorService(oracle, () => markets);
+    await svc._runCheck();
+    expect(oracle.peekPrice).toHaveBeenCalled();
+    expect(mockFraudAlertTotal.inc).toHaveBeenCalledOnce();
+  });
+
+  it("#340: fraud-detector uses peekPrice not fetchPrice, so fetchPrice freshness state is NOT mutated", async () => {
+    process.env.FRAUD_DETECT_DIVERGENCE_BPS = "500";
+    const state = makeHyperpState({ markPriceE6: 1_000_000n }); // v12 HYPERP (no _rawV17Config)
+    const markets = new Map([["slab1", state]]);
+    const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });
+    const svc = new FraudDetectorService(oracle, () => markets);
+    await svc._runCheck();
+    expect(oracle.peekPrice).toHaveBeenCalled();
+    expect(oracle.fetchPrice).not.toHaveBeenCalled();
   });
 });

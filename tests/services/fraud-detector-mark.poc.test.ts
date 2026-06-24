@@ -53,10 +53,10 @@ function makeState(o: MarketOpts) {
 const SLAB = "Slab11111111111111111111111111111111111111";
 
 describe("PoC: fraud detector mark field + HYPERP detection", () => {
-  let oracle: { fetchPrice: ReturnType<typeof vi.fn> };
+  let oracle: { fetchPrice: ReturnType<typeof vi.fn>; peekPrice: ReturnType<typeof vi.fn> };
   beforeEach(() => {
     vi.clearAllMocks();
-    oracle = { fetchPrice: vi.fn() };
+    oracle = { fetchPrice: vi.fn(), peekPrice: vi.fn() };
   });
 
   function svcFor(state: ReturnType<typeof makeState>): FraudDetectorService {
@@ -67,21 +67,21 @@ describe("PoC: fraud detector mark field + HYPERP detection", () => {
   it("INS-4: uses the on-chain config mark, not engine.markPriceE6 (which is 0n on v12.17+)", async () => {
     // engine.markPriceE6 == 0n (current layout); the real mark is in config.authorityPriceE6.
     const svc = svcFor(makeState({ feedZero: true, authZero: true, engineMark: 0n, configMark: 100_000_000n }));
-    oracle.fetchPrice.mockResolvedValue({ priceE6: 50_000_000n }); // 100% divergence vs the config mark
+    oracle.peekPrice.mockResolvedValue({ priceE6: 50_000_000n }); // 100% divergence vs the config mark
     await svc._runCheck();
     expect(h.sendWarningAlert).toHaveBeenCalled(); // FAILS unfixed: reads 0n → skipped
   });
 
   it("INS-5: checks a HYPERP market that carries a non-zero oracle authority", async () => {
     const svc = svcFor(makeState({ feedZero: true, authZero: false, engineMark: 100_000_000n, configMark: 100_000_000n }));
-    oracle.fetchPrice.mockResolvedValue({ priceE6: 50_000_000n });
+    oracle.peekPrice.mockResolvedValue({ priceE6: 50_000_000n });
     await svc._runCheck();
     expect(h.sendWarningAlert).toHaveBeenCalled(); // FAILS unfixed: isZeroAuthority false → skipped
   });
 
   it("does not alert when the on-chain mark agrees with off-chain consensus", async () => {
     const svc = svcFor(makeState({ feedZero: true, authZero: true, engineMark: 0n, configMark: 50_000_000n }));
-    oracle.fetchPrice.mockResolvedValue({ priceE6: 50_000_000n }); // 0 divergence
+    oracle.peekPrice.mockResolvedValue({ priceE6: 50_000_000n }); // 0 divergence
     await svc._runCheck();
     expect(h.sendWarningAlert).not.toHaveBeenCalled();
   });

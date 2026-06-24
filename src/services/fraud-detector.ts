@@ -272,15 +272,44 @@ export class FraudDetectorService {
         continue;
       }
 
-      // HYPERP detection matches the program's oracle::is_hyperp_mode, which keys
-      // ONLY off index_feed_id == [0;32]. A bootstrapped HYPERP market may carry a
-      // non-zero hyperp_authority, so we must NOT additionally require
-      // oracle_authority == 0 (that silently skipped such markets). Non-HYPERP
-      // markets read an external Pyth/Chainlink feed — nothing to cross-validate.
-      const feedBytes = state.market.config.indexFeedId.toBytes();
-      const isZeroFeed = feedBytes.every((b: number) => b === 0);
-      if (!isZeroFeed) {
-        continue;
+      // HYPERP / external-authority oracle detection.
+      //
+      // v12 markets: a zero index_feed_id IS the HYPERP signal (the program's
+      // oracle::is_hyperp_mode gates on this). Non-zero means an external Pyth/
+      // Chainlink feed — nothing for the fraud detector to cross-validate.
+      //
+      // v17 markets: wrapperConfigV17ToMarketConfig() maps ALL of MANUAL(0),
+      // EWMA_MARK(2), and AUTH_MARK(3) to indexFeedId=PublicKey.default (zero) as
+      // a bridge artifact — so the zero-feed test alone would falsely enroll these
+      // modes. We must consult _rawV17Config.oracleMode directly:
+      //   MANUAL(0)             — no external mark; skip.
+      //   HYBRID_AFTER_HOURS(1) — uses Pyth leg feeds; indexFeedId is non-zero, so
+      //                           the non-zero skip above already handles it.
+      //   EWMA_MARK(2)          — keeper-authority EWMA; no external mark; skip.
+      //   AUTH_MARK(3)          — admin pushes authorityPriceE6 on-chain; this IS
+      //                           the mode the fraud detector was designed to guard.
+      //                           Enroll: cross-validate authorityPriceE6 vs DEX.
+      //
+      // For v17 AUTH_MARK(3) and all v12 zero-feed markets, fall through to the
+      // off-chain cross-validation below.
+      const rawV17Cfg = (state.market as { _rawV17Config?: { oracleMode?: number } })._rawV17Config;
+      if (rawV17Cfg !== undefined) {
+        // v17 market — gate on explicit oracle mode.
+        const oracleMode = rawV17Cfg.oracleMode ?? -1;
+        // Only AUTH_MARK(3) has an on-chain authority price worth cross-validating.
+        // MANUAL(0) and EWMA_MARK(2) produce a zero indexFeedId as a bridge artifact
+        // but have no external mark for us to compare against.
+        if (oracleMode !== 3) {
+          continue;
+        }
+        // AUTH_MARK: fall through — authorityPriceE6 is set on-chain, cross-validate below.
+      } else {
+        // v12 market — use the legacy zero-feed heuristic.
+        const feedBytes = state.market.config.indexFeedId.toBytes();
+        const isZeroFeed = feedBytes.every((b: number) => b === 0);
+        if (!isZeroFeed) {
+          continue;
+        }
       }
 
       // On-chain HYPERP mark (E6). v12.17+ dropped the engine mark field
@@ -327,7 +356,7 @@ export class FraudDetectorService {
       } else {
         let resolved: bigint | null = null;
         try {
-          const entry = await this._oracleService.fetchPrice(priceMint, slabAddress);
+          const entry = await this._oracleService.peekPrice(priceMint);
           if (entry === null || entry.priceE6 === undefined || entry.priceE6 === 0n) {
             logger.debug("FraudDetector: off-chain price unavailable for market", {
               mint: mint.slice(0, 8),

@@ -498,6 +498,41 @@ export class OracleService {
   }
 
   /**
+   * Read-only price probe used by FraudDetectorService for cross-validation.
+   *
+   * Identical external fetch logic to fetchPrice() but does NOT update:
+   *   - lastExternalPriceMs (the staleness clock read by getStaleMarkets)
+   *   - priceHistory / deviationRejections
+   *   - _singleSourceState / _dualNullState
+   *
+   * This ensures fraud-detector checks are purely observational: a successful
+   * or failed probe cannot advance or break the authoritative freshness state
+   * that drives stalePausedMarkets → crank gating.
+   *
+   * Callers MUST NOT use this for crank decisions — it has no history or
+   * deviation-cap guard. Use fetchPrice() for anything that feeds into cranks.
+   */
+  async peekPrice(mint: string): Promise<{ priceE6: bigint; source: string; timestamp: number } | null> {
+    const [dexPrice, jupPrice] = await Promise.all([
+      this.fetchDexScreenerPrice(mint),
+      this.fetchJupiterPrice(mint),
+    ]);
+
+    if (dexPrice !== null && jupPrice !== null && dexPrice > 0n && jupPrice > 0n) {
+      const larger = dexPrice > jupPrice ? dexPrice : jupPrice;
+      const smaller = dexPrice > jupPrice ? jupPrice : dexPrice;
+      const devBps = Number((larger - smaller) * 10_000n / smaller);
+      if (devBps > MAX_CROSS_SOURCE_DEVIATION_BPS) return null;
+    }
+
+    const priceE6 = dexPrice ?? jupPrice;
+    if (priceE6 === null) return null;
+
+    const source = dexPrice !== null ? "dexscreener" : "jupiter";
+    return { priceE6, source, timestamp: this.now() };
+  }
+
+  /**
    * #336: set a value into a per-mint state map, evicting the oldest-inserted
    * entry first when the map is at capacity. JS Map preserves insertion order,
    * so the first key returned by keys() is the oldest. Re-setting an existing
