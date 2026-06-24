@@ -44,6 +44,8 @@ function makeState(o: MarketOpts) {
       },
       engine: { markPriceE6: o.engineMark },
     },
+    // #336: the detector skips !isActive markets; these PoC markets are active.
+    isActive: true,
     mainnetCA: undefined,
   };
 }

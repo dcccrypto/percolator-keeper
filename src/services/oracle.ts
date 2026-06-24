@@ -69,6 +69,12 @@ export class OracleService {
     { consecutive: number; alertSent: boolean }
   >();
   private static readonly SINGLE_SOURCE_ALERT_THRESHOLD = 10;
+  // #336: bound the per-mint state maps. fetchPrice() is reachable per discovered
+  // market, and permissionless market creation means an attacker can spray
+  // distinct mints to grow these maps without limit. Cap them (mirrors the
+  // priceHistory maxTrackedMarkets pattern) and evict the oldest-inserted entry
+  // when full. Map insertion order is FIFO in JS, so the first key is the oldest.
+  private static readonly MAX_TRACKED_MINT_STATE = 500;
   // M6: per-mint dual-null state. Both DexScreener and Jupiter can return null
   // simultaneously during an outage. Track consecutive observations and escalate
   // via sendCriticalAlert at threshold so ops sees the outage immediately rather
@@ -353,7 +359,9 @@ export class OracleService {
         ])?.catch(() => {});
       }
     }
-    this._singleSourceState.set(mint, mintState);
+    // #336: bounded set — caps the per-mint state map so an attacker spraying
+    // distinct mints can't grow it without limit.
+    OracleService._setBounded(this._singleSourceState, mint, mintState, OracleService.MAX_TRACKED_MINT_STATE);
 
     // Select best available price (DexScreener preferred)
     let priceE6: bigint | null = dexPrice;
@@ -402,7 +410,8 @@ export class OracleService {
           { name: "Sources Down", value: "DexScreener + Jupiter", inline: false },
         ])?.catch(() => {});
       }
-      this._dualNullState.set(mint, dualState);
+      // #336: bounded set — see _singleSourceState above.
+      OracleService._setBounded(this._dualNullState, mint, dualState, OracleService.MAX_TRACKED_MINT_STATE);
 
       if (history && history.length > 0) {
         const last = history[history.length - 1];
@@ -430,7 +439,8 @@ export class OracleService {
         });
         dualState.consecutive = 0;
         dualState.alertSent = false;
-        this._dualNullState.set(mint, dualState);
+        // #336: bounded set (no-op for size since this re-sets an existing key).
+        OracleService._setBounded(this._dualNullState, mint, dualState, OracleService.MAX_TRACKED_MINT_STATE);
       }
     }
 
@@ -485,6 +495,21 @@ export class OracleService {
     // before this line, so they never refresh the staleness clock.
     this.lastExternalPriceMs.set(slabAddress, entry.timestamp);
     return entry;
+  }
+
+  /**
+   * #336: set a value into a per-mint state map, evicting the oldest-inserted
+   * entry first when the map is at capacity. JS Map preserves insertion order,
+   * so the first key returned by keys() is the oldest. Re-setting an existing
+   * key does NOT change its position, so a hot mint won't be evicted while it's
+   * being updated every cycle — only genuinely idle (oldest) mints are dropped.
+   */
+  private static _setBounded<V>(map: Map<string, V>, key: string, value: V, max: number): void {
+    if (!map.has(key) && map.size >= max) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+    map.set(key, value);
   }
 
   private recordPrice(slabAddress: string, entry: PriceEntry): void {

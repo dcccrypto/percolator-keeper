@@ -62,6 +62,21 @@ export function divergenceBps(onchain: bigint | number, offchain: bigint | numbe
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_DIVERGENCE_THRESHOLD_BPS = 500;
 const DEFAULT_PER_MINT_COOLDOWN_MS = 1_800_000;
+// #336: per-cycle market cap. The cycle iterated EVERY discovered market and
+// awaited up to 2 external HTTP calls per market — permissionless market
+// creation lets an attacker make a single cycle unbounded (and, with no
+// in-flight guard, overlap cycles). Cap markets visited per cycle and walk a
+// round-robin cursor so all admitted markets are covered over time.
+const DEFAULT_MAX_MARKETS_PER_CYCLE = 200;
+// #336: negative-cache TTL for unavailable/invalid off-chain prices, so a dead
+// attacker mint isn't re-fetched (2 HTTP calls) every single cycle.
+const DEFAULT_NEGATIVE_CACHE_TTL_MS = 300_000; // 5 min
+// #336: max alerts emitted per cycle (global budget on top of per-mint cooldown),
+// so a correlated divergence across many attacker mints can't flood the channel
+// in one cycle.
+const DEFAULT_MAX_ALERTS_PER_CYCLE = 20;
+// #336: cap on the per-mint cooldown map so it can't grow without bound.
+const MAX_TRACKED_ALERT_MINTS = 1_000;
 
 function parseBoundedIntEnv(
   name: string,
@@ -100,14 +115,41 @@ function getPerMintCooldownMs(): number {
   );
 }
 
+function getMaxMarketsPerCycle(): number {
+  return parseBoundedIntEnv("FRAUD_DETECT_MAX_MARKETS_PER_CYCLE", DEFAULT_MAX_MARKETS_PER_CYCLE, 1);
+}
+
+function getNegativeCacheTtlMs(): number {
+  return parseBoundedIntEnv("FRAUD_DETECT_NEGATIVE_CACHE_TTL_MS", DEFAULT_NEGATIVE_CACHE_TTL_MS, 0);
+}
+
+function getMaxAlertsPerCycle(): number {
+  return parseBoundedIntEnv("FRAUD_DETECT_MAX_ALERTS_PER_CYCLE", DEFAULT_MAX_ALERTS_PER_CYCLE, 0);
+}
+
 function isEnabled(): boolean {
   return process.env.FRAUD_DETECT_ENABLED !== "false";
 }
 
 export class FraudDetectorService {
-  private _timer: ReturnType<typeof setInterval> | null = null;
-  /** Map<mint, timestamp-of-last-alert> for per-mint cooldown. */
+  private _timer: ReturnType<typeof setTimeout> | null = null;
+  private _stopped = false;
+  // #336: single-flight guard. The cycle awaits external HTTP per market, so a
+  // slow cycle could overlap the next tick under the old setInterval. We now
+  // schedule the next cycle with setTimeout AFTER the previous one settles, and
+  // this flag rejects any re-entrant _runCheck() (e.g. a test or manual call
+  // landing while a cycle is mid-flight).
+  private _inFlight = false;
+  /** Map<mint, timestamp-of-last-alert> for per-mint cooldown. Bounded (#336). */
   private readonly _lastAlertByMint = new Map<string, number>();
+  // #336: round-robin cursor into the discovered-market list so the per-cycle
+  // market cap still covers every admitted market over successive cycles.
+  private _marketCursor = 0;
+  // #336: negative cache for mints whose off-chain price was unavailable/invalid,
+  // so dead attacker mints aren't re-fetched (2 HTTP calls) every cycle.
+  // Map<priceMint, expiry-timestamp-ms>. Bounded by the per-cycle market cap and
+  // pruned on expiry.
+  private readonly _negativePriceCache = new Map<string, number>();
 
   constructor(
     private readonly _oracleService: OracleService,
@@ -119,32 +161,44 @@ export class FraudDetectorService {
       logger.info("FraudDetectorService disabled via FRAUD_DETECT_ENABLED=false — no interval registered");
       return;
     }
-    if (this._timer) return;
+    if (this._timer || this._stopped) return;
 
     const intervalMs = getIntervalMs();
     logger.info("FraudDetectorService starting", {
       intervalMs,
       divergenceThresholdBps: getDivergenceThresholdBps(),
       perMintCooldownMs: getPerMintCooldownMs(),
+      maxMarketsPerCycle: getMaxMarketsPerCycle(),
+      maxAlertsPerCycle: getMaxAlertsPerCycle(),
     });
 
-    this._timer = setInterval(async () => {
-      try {
-        await this._runCheck();
-      } catch (err) {
-        logger.error("FraudDetectorService cycle failed", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }, intervalMs);
-
-    // Do not block process exit on this observational loop.
-    this._timer.unref();
+    // #336: recursive setTimeout — the next cycle is scheduled only AFTER the
+    // current one settles, so cycles can NEVER overlap regardless of how long
+    // the external HTTP fan-out takes. The single-flight _inFlight flag is a
+    // defense-in-depth backstop for any direct _runCheck() invocation.
+    const scheduleNext = (): void => {
+      if (this._stopped) return;
+      this._timer = setTimeout(async () => {
+        try {
+          await this._runCheck();
+        } catch (err) {
+          logger.error("FraudDetectorService cycle failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          scheduleNext();
+        }
+      }, getIntervalMs());
+      // Do not block process exit on this observational loop.
+      this._timer.unref();
+    };
+    scheduleNext();
   }
 
   stop(): void {
+    this._stopped = true;
     if (this._timer) {
-      clearInterval(this._timer);
+      clearTimeout(this._timer);
       this._timer = null;
       logger.info("FraudDetectorService stopped");
     }
@@ -152,12 +206,72 @@ export class FraudDetectorService {
 
   // Exposed for tests to invoke directly without waiting for the interval.
   async _runCheck(): Promise<void> {
+    // #336: single-flight — never run two cycles concurrently. The recursive
+    // setTimeout already serializes the scheduled path; this also covers any
+    // direct/manual _runCheck() that lands mid-cycle.
+    if (this._inFlight) {
+      logger.debug("FraudDetector: a cycle is already in flight — skipping this tick");
+      return;
+    }
+    this._inFlight = true;
+    try {
+      await this._runCheckInner();
+    } finally {
+      this._inFlight = false;
+    }
+  }
+
+  private async _runCheckInner(): Promise<void> {
     const markets = this._getMarkets();
     const thresholdBps = getDivergenceThresholdBps();
     const cooldownMs = getPerMintCooldownMs();
+    const maxMarketsPerCycle = getMaxMarketsPerCycle();
+    const negativeTtlMs = getNegativeCacheTtlMs();
+    const maxAlertsPerCycle = getMaxAlertsPerCycle();
     const now = Date.now();
 
-    for (const [slabAddress, state] of markets) {
+    // #336: prune expired negative-cache entries so the map can't grow unbounded.
+    for (const [k, expiry] of this._negativePriceCache) {
+      if (expiry <= now) this._negativePriceCache.delete(k);
+    }
+
+    // #336: select at most maxMarketsPerCycle markets, advancing a round-robin
+    // cursor so the cap still covers every admitted market over successive
+    // cycles. An attacker who creates thousands of markets can no longer make a
+    // single cycle iterate (and HTTP-fan-out over) all of them.
+    const entries = Array.from(markets.entries());
+    const totalMarkets = entries.length;
+    let selected: Array<[string, MarketCrankState]>;
+    if (totalMarkets <= maxMarketsPerCycle) {
+      selected = entries;
+      this._marketCursor = 0;
+    } else {
+      const start = ((this._marketCursor % totalMarkets) + totalMarkets) % totalMarkets;
+      selected = [];
+      for (let k = 0; k < maxMarketsPerCycle; k++) {
+        selected.push(entries[(start + k) % totalMarkets]!);
+      }
+      this._marketCursor = (start + maxMarketsPerCycle) % totalMarkets;
+      logger.debug("FraudDetector: per-cycle market cap reached — remaining markets deferred to later cycles", {
+        totalMarkets,
+        processedThisCycle: maxMarketsPerCycle,
+        cursorNext: this._marketCursor,
+      });
+    }
+
+    // #336: dedupe off-chain price fetches by priceMint WITHIN this cycle, so N
+    // markets sharing one mint cost one fetch (2 HTTP calls), not 2N. Maps
+    // priceMint → resolved off-chain price (or null when unavailable/invalid).
+    const cyclefetched = new Map<string, bigint | null>();
+    let alertsThisCycle = 0;
+
+    for (const [slabAddress, state] of selected) {
+      // #336: skip inactive markets — no point spending HTTP calls validating a
+      // market the keeper isn't cranking.
+      if (!state.isActive) {
+        continue;
+      }
+
       // HYPERP detection matches the program's oracle::is_hyperp_mode, which keys
       // ONLY off index_feed_id == [0;32]. A bootstrapped HYPERP market may carry a
       // non-zero hyperp_authority, so we must NOT additionally require
@@ -187,34 +301,58 @@ export class FraudDetectorService {
       // Off-chain consensus from OracleService (DexScreener + Jupiter median).
       // Use mainnetCA if set for devnet mirror markets.
       const priceMint = state.mainnetCA ?? mint;
-      let offChainPriceE6: bigint;
-      try {
-        const entry = await this._oracleService.fetchPrice(priceMint, slabAddress);
-        if (entry === null || entry.priceE6 === undefined || entry.priceE6 === 0n) {
-          logger.debug("FraudDetector: off-chain price unavailable for market", {
-            mint: mint.slice(0, 8),
-            slabAddress: slabAddress.slice(0, 8),
-          });
-          fraudOffchainUnavailableTotal.inc({ mint });
-          continue;
-        }
-        offChainPriceE6 = entry.priceE6;
-      } catch (err) {
-        logger.debug("FraudDetector: off-chain price fetch threw for market", {
+
+      // #336: negative cache — skip mints whose off-chain price was recently
+      // unavailable/invalid so dead attacker mints don't cost 2 HTTP calls every
+      // cycle.
+      const negExpiry = this._negativePriceCache.get(priceMint);
+      if (negExpiry !== undefined && negExpiry > now) {
+        logger.debug("FraudDetector: priceMint in negative cache — skipping fetch", {
           mint: mint.slice(0, 8),
-          slabAddress: slabAddress.slice(0, 8),
-          error: err instanceof Error ? err.message : String(err),
         });
         fraudOffchainUnavailableTotal.inc({ mint });
         continue;
       }
 
-      if (offChainPriceE6 === 0n) {
-        logger.debug("FraudDetector: off-chain price is zero — skipping market (cannot divide)", {
-          mint: mint.slice(0, 8),
-        });
-        fraudOffchainUnavailableTotal.inc({ mint });
-        continue;
+      // #336: dedupe fetch by priceMint within this cycle.
+      let offChainPriceE6: bigint;
+      if (cyclefetched.has(priceMint)) {
+        const cached = cyclefetched.get(priceMint)!;
+        if (cached === null) {
+          // Already known unavailable this cycle — no re-fetch, no re-log.
+          fraudOffchainUnavailableTotal.inc({ mint });
+          continue;
+        }
+        offChainPriceE6 = cached;
+      } else {
+        let resolved: bigint | null = null;
+        try {
+          const entry = await this._oracleService.fetchPrice(priceMint, slabAddress);
+          if (entry === null || entry.priceE6 === undefined || entry.priceE6 === 0n) {
+            logger.debug("FraudDetector: off-chain price unavailable for market", {
+              mint: mint.slice(0, 8),
+              slabAddress: slabAddress.slice(0, 8),
+            });
+            resolved = null;
+          } else {
+            resolved = entry.priceE6;
+          }
+        } catch (err) {
+          logger.debug("FraudDetector: off-chain price fetch threw for market", {
+            mint: mint.slice(0, 8),
+            slabAddress: slabAddress.slice(0, 8),
+            error: err instanceof Error ? err.message : String(err),
+          });
+          resolved = null;
+        }
+        cyclefetched.set(priceMint, resolved);
+        if (resolved === null) {
+          // #336: cache the negative result with a bounded TTL.
+          if (negativeTtlMs > 0) this._negativePriceCache.set(priceMint, now + negativeTtlMs);
+          fraudOffchainUnavailableTotal.inc({ mint });
+          continue;
+        }
+        offChainPriceE6 = resolved;
       }
 
       const bps = divergenceBps(onChainMarkE6, offChainPriceE6);
@@ -244,8 +382,20 @@ export class FraudDetectorService {
         continue;
       }
 
+      // #336: global per-cycle alert budget on top of the per-mint cooldown. A
+      // correlated divergence across many (attacker) mints can't flood the
+      // channel in a single cycle. Logged once so a sustained breach is visible.
+      if (alertsThisCycle >= maxAlertsPerCycle) {
+        logger.warn("FraudDetector: per-cycle alert budget exhausted — suppressing further alerts this cycle", {
+          maxAlertsPerCycle,
+        });
+        break;
+      }
+
       // Alert: update cooldown timestamp, increment counter, fire Discord warning.
-      this._lastAlertByMint.set(mint, now);
+      // #336: bounded cooldown map so it can't grow without limit.
+      this._setLastAlert(mint, now);
+      alertsThisCycle++;
       fraudAlertTotal.inc({ mint });
 
       const onChainUsd = (Number(onChainMarkE6) / PRICE_E6_SCALE).toFixed(6);
@@ -269,5 +419,19 @@ export class FraudDetectorService {
         { name: "Market", value: slabAddress.slice(0, 16) + "...", inline: false },
       ])?.catch(() => {});
     }
+  }
+
+  /**
+   * #336: set the per-mint last-alert timestamp, evicting the oldest-inserted
+   * entry first when the map is at capacity (FIFO; JS Map preserves insertion
+   * order). Re-setting an existing mint keeps its position, so a repeatedly-
+   * alerting mint won't evict itself.
+   */
+  private _setLastAlert(mint: string, ts: number): void {
+    if (!this._lastAlertByMint.has(mint) && this._lastAlertByMint.size >= MAX_TRACKED_ALERT_MINTS) {
+      const oldest = this._lastAlertByMint.keys().next().value;
+      if (oldest !== undefined) this._lastAlertByMint.delete(oldest);
+    }
+    this._lastAlertByMint.set(mint, ts);
   }
 }
