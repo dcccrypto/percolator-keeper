@@ -146,7 +146,11 @@ vi.mock('../../src/lib/v17-risk.js', async () => {
       liquidationFeeShareBps: 0n,
       adlFillCapBps: 0n,
       minPositionSize: 0n,
+      minNonzeroMmReq: 0n,
     })),
+    // Fix #331: readEffectivePriceForAsset is used in scanV17Portfolios.
+    // Return 0n (falls back to the market-level price, matching pre-fix behavior in tests).
+    readEffectivePriceForAsset: vi.fn(() => 0n),
   };
 });
 
@@ -200,6 +204,17 @@ describe('LiquidationService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+
+    // Restore the default getConnection mock after clearAllMocks() — tests that set
+    // a persistent mockReturnValue (e.g. M-9 tests using {getProgramAccounts: ...})
+    // would otherwise poison subsequent tests that rely on getSlot/getAccountInfo.
+    // vi.clearAllMocks() clears call counts but NOT mockReturnValue implementations.
+    vi.mocked(shared.getConnection).mockImplementation(() => ({
+      getAccountInfo: vi.fn(),
+      getLatestBlockhash: vi.fn(async () => ({ blockhash: 'mock-blockhash', lastValidBlockHeight: 1000000 })),
+      sendRawTransaction: vi.fn(async () => 'mock-tx-signature'),
+      getSlot: vi.fn().mockResolvedValue(200),
+    } as any));
 
     mockOracleService = {
       fetchPrice: vi.fn().mockResolvedValue({
@@ -680,6 +695,7 @@ describe('LiquidationService', () => {
         0,
         portfolioPubkey,
         1_000_000n,
+        100_000_000_000n, // closeQ: abs(basisPosQ) of the active leg (fix #329)
       );
 
       expect(sig).toBeNull();

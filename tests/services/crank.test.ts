@@ -258,16 +258,17 @@ describe('CrankService', () => {
 
         await service.discover();
 
-        // The fast-path should retry the v17 portfolio provisioning path only once:
-        // for the v17 market with keeperPortfolio=null, not for the legacy market.
+        // Fix #332: the fast-path must NOT eagerly provision keeper portfolios —
+        // that drains keeper SOL on every 30-second cache refresh. Provisioning
+        // is deferred to the full discover path (every KEEPER_FULL_REDISCOVER_INTERVAL_MS).
+        // After discover(), no getProgramAccounts call for portfolio provisioning should occur.
         await Promise.resolve();
         await Promise.resolve();
         await Promise.resolve();
 
-        expect(shared.getConnection).toHaveBeenCalledTimes(1);
-        expect(getProgramAccounts).toHaveBeenCalledTimes(1);
-        expect(getProgramAccounts.mock.calls[0]?.[0]).toBe(mockMarket.programId);
-        expect(getProgramAccounts.mock.calls[0]?.[1]?.filters).toContainEqual({ dataSize: 9347 });
+        // getConnection may have been called for cache reads, but getProgramAccounts
+        // must NOT have been called (no provisioning in the fast path).
+        expect(getProgramAccounts).not.toHaveBeenCalled();
 
         service.stop();
       } finally {

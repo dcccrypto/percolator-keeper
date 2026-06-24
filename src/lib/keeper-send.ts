@@ -43,15 +43,18 @@ const TIER_MAP: Record<TxType, PriorityFeeTier> = {
  * Pure lamport-cost formula, factored out so property tests can exercise it
  * without the fetch/simulate stubs around the public keeperSend API.
  *
- * Cost = base + ceil(microLamports * cu / 1_000_000) + jitoTip.
+ * Cost = base + ceil(microLamports * cu / 1_000_000) + jitoTip + extraLamports.
+ * extraLamports is used when the tx must fund a new account (rent); pass 0 (default)
+ * for normal sends.
  */
 export function estimateLamportCost(
   microLamports: number,
   cu: number,
   jitoTip: number,
+  extraLamports = 0,
 ): number {
   const priorityFee = Math.ceil((microLamports * cu) / 1_000_000);
-  return BASE_FEE_LAMPORTS + priorityFee + jitoTip;
+  return BASE_FEE_LAMPORTS + priorityFee + jitoTip + extraLamports;
 }
 
 // Lazy singletons — instantiated on first use so mocks applied in test setup take effect.
@@ -123,14 +126,16 @@ interface EstimateCostResult {
 
 /**
  * Estimate total lamport cost of a transaction.
- * priority_fee_microlamports * CU / 1_000_000 + base_fee + jito_tip.
+ * priority_fee_microlamports * CU / 1_000_000 + base_fee + jito_tip + extraLamports.
  * Also returns the raw simulated CU so callers can record it separately.
+ * extraLamports: additional lamports required by the tx (e.g. rent for a new account).
  */
 async function estimateCost(
   connection: Connection,
   instructions: TransactionInstruction[],
   signers: Keypair[],
   txType: TxType,
+  extraLamports = 0,
 ): Promise<EstimateCostResult> {
   const accountKeys = instructions
     .flatMap((ix) => ix.keys.map((k) => k.pubkey.toBase58()))
@@ -146,7 +151,7 @@ async function estimateCost(
     : 0;
 
   return {
-    estimatedCost: estimateLamportCost(microLamports, cuResult.cu, jitoTip),
+    estimatedCost: estimateLamportCost(microLamports, cuResult.cu, jitoTip, extraLamports),
     simulatedCu: cuResult.cu,
     provenToFail: cuResult.provenToFail,
     simError: cuResult.simError,
@@ -186,6 +191,9 @@ export function classifySendError(err: unknown): TxResult {
  *
  * Returns null if the budget is exhausted (budget.canSpend returned false) — caller
  * should skip without treating this as a send failure.
+ *
+ * extraLamports: additional lamports the tx must transfer (e.g. rent for a new account).
+ * The budget gate includes this cost so provisioning txs are correctly accounted for.
  */
 export async function keeperSend(
   connection: Connection,
@@ -195,6 +203,7 @@ export async function keeperSend(
   budget: KeeperBudget,
   maxRetries = 3,
   keeperOpts?: KeeperSendOptions,
+  extraLamports = 0,
 ): Promise<KeeperSendResult | null> {
   // Single-writer guard: abort before any RPC if this node has lost leadership.
   // The guard is checked here — before estimateCost, sendWithRetry, or any
@@ -223,6 +232,7 @@ export async function keeperSend(
     instructions,
     signers,
     txType,
+    extraLamports,
   );
 
   // H-3: simulateTransaction can report a positive unitsConsumed even when

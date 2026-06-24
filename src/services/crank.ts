@@ -488,7 +488,7 @@ async function provisionKeeperPortfolio(
         skipPreflight: false,
         multiRpcBroadcast: false,
         simulateForCU: false,
-      }),
+      }, rentLamports),
     );
 
     if (!sendResult) {
@@ -1007,9 +1007,11 @@ export class CrankService {
             Boolean((state.market as DiscoveredMarket & { _rawV17Config?: unknown })._rawV17Config) ||
             (header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1);
 
-          if (isV17Market && !state.keeperPortfolio) {
-            void this.ensureKeeperPortfolio(key, state.market);
-          }
+          // Fix #332: do NOT eagerly provision here (LaserStream fast path).
+          // Eager provisioning in the fast path drains keeper SOL on every
+          // 30-second cache refresh even if the portfolio will never be needed.
+          // The full discover path (every KEEPER_FULL_REDISCOVER_INTERVAL_MS)
+          // calls ensureKeeperPortfolio and is the correct place for provisioning.
         }
         this.lastDiscoveryTime = now;
         logger.debug("LaserStream fast-path discover complete", {

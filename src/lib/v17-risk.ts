@@ -1,7 +1,22 @@
 const V17_HEADER_LEN = 16;
 const V17_WRAPPER_CONFIG_LEN = 432;
-const V17_MARKET_GROUP_OFF = V17_HEADER_LEN + V17_WRAPPER_CONFIG_LEN;
+// V17_MARKET_GROUP_OFF is exported below for use by callers (per-asset price reading).
 const V17_MARKET_GROUP_ID_LEN = 32;
+
+// ─── Exported layout constants ────────────────────────────────────────────────
+
+export const V17_MARKET_GROUP_OFF = V17_HEADER_LEN + V17_WRAPPER_CONFIG_LEN; // 448
+export const V17_MARKET_GROUP_LEN = 758; // MarketGroupV16HeaderAccount size
+export const V17_ENGINE_ASSET_SLOT_LEN = 1285; // EngineAssetSlotV16Account size
+export const V17_ASSET_ORACLE_WRAPPER_LEN = 512; // ASSET_ORACLE_WRAPPER_LEN constant
+export const V17_ASSET_SLOT_STRIDE = 1797; // ASSET_ORACLE_WRAPPER_LEN + ENGINE_ASSET_SLOT_LEN
+// offset of effective_price within EngineAssetSlotV16Account (after the ORACLE_WRAPPER prefix)
+// = 8 (market_id) + 8 (retired_slot) + 1 (lifecycle) + 8 (raw_oracle_target_price) = 25
+export const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = 25;
+// absolute offset of min_nonzero_mm_req in the market account data
+// = V17_ENGINE_CONFIG_OFF + V16PodU16(2) + V16PodU32(4) = 480 + 6 = 486
+export const V17_MIN_NONZERO_MM_REQ_OFF = 486;
+
 const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_ID_LEN;
 
 const V17_ENGINE_CONFIG_H_MIN_OFF = 38;
@@ -11,10 +26,12 @@ const V17_ENGINE_CONFIG_LIQUIDATION_FEE_BPS_OFF = 78;
 
 const V17_WRAPPER_MAINTENANCE_FEE_PER_SLOT_OFF = V17_HEADER_LEN + 96;
 
-export const V17_RISK_PARAMS_MIN_DATA_LEN =
-  V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_LIQUIDATION_FEE_BPS_OFF + 8;
+export const V17_RISK_PARAMS_MIN_DATA_LEN = Math.max(
+  V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_LIQUIDATION_FEE_BPS_OFF + 8,
+  V17_MIN_NONZERO_MM_REQ_OFF + 16,
+);
 
-function readU64LE(data: Uint8Array, offset: number): bigint {
+export function readU64LE(data: Uint8Array, offset: number): bigint {
   if (offset < 0 || offset + 8 > data.length) {
     throw new Error(`readU64LE out of bounds at ${offset}`);
   }
@@ -25,10 +42,30 @@ function readU64LE(data: Uint8Array, offset: number): bigint {
   return value;
 }
 
-function readU128LE(data: Uint8Array, offset: number): bigint {
+export function readU128LE(data: Uint8Array, offset: number): bigint {
   const lo = readU64LE(data, offset);
   const hi = readU64LE(data, offset + 8);
   return lo | (hi << 64n);
+}
+
+/**
+ * Read the effective_price (u64 LE) for a given asset index from raw market account bytes.
+ *
+ * Layout (within the market account data, past the wrapper config + market group header):
+ *   Per-asset slot starts at: V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * V17_ASSET_SLOT_STRIDE
+ *   Within each slot: first V17_ASSET_ORACLE_WRAPPER_LEN bytes = oracle wrapper prefix,
+ *     then V17_ENGINE_ASSET_SLOT_LEN bytes = EngineAssetSlotV16Account.
+ *   effective_price is at offset V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT within the engine asset slot.
+ *
+ * Returns 0n if the buffer is too short to contain the field (safe fallback to caller-provided price).
+ */
+export function readEffectivePriceForAsset(data: Uint8Array, assetIndex: number): bigint {
+  const off = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN
+    + assetIndex * V17_ASSET_SLOT_STRIDE
+    + V17_ASSET_ORACLE_WRAPPER_LEN
+    + V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT;
+  if (off + 8 > data.length) return 0n;
+  return readU64LE(data, off);
 }
 
 /**
@@ -79,6 +116,7 @@ export function parseV17RiskParams(data: Uint8Array): {
   liquidationFeeShareBps: bigint;
   adlFillCapBps: bigint;
   minPositionSize: bigint;
+  minNonzeroMmReq: bigint;
 } {
   if (data.length < V17_RISK_PARAMS_MIN_DATA_LEN) {
     throw new Error(
@@ -107,5 +145,6 @@ export function parseV17RiskParams(data: Uint8Array): {
     ),
     adlFillCapBps: 0n, // no on-chain field exists — see function doc comment
     minPositionSize: 0n, // no on-chain field exists — see function doc comment
+    minNonzeroMmReq: readU128LE(data, V17_MIN_NONZERO_MM_REQ_OFF),
   };
 }

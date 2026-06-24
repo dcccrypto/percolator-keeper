@@ -30,7 +30,7 @@ import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
-import { parseV17RiskParams, V17RiskParamsCorruptedError } from "../lib/v17-risk.js";
+import { parseV17RiskParams, V17RiskParamsCorruptedError, readEffectivePriceForAsset } from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 
 const logger = createLogger("keeper:liquidation");
@@ -134,7 +134,9 @@ async function scanV17Portfolios(
   market: DiscoveredMarket,
   maintenanceMarginBps: bigint,
   price: bigint,
-): Promise<Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number }>> {
+  marketData: Uint8Array,
+  minNonzeroMmReq: bigint,
+): Promise<Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint }>> {
   const marketKey = market.slabAddress.toBase58();
   let rawPortfolios: ReadonlyArray<{ pubkey: PublicKey; account: { data: Buffer | Uint8Array } }>;
   try {
@@ -163,11 +165,11 @@ async function scanV17Portfolios(
 
   if (price === 0n) return []; // No price, can't compute margin
 
-  const candidates: Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number }> = [];
+  const candidates: Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint }> = [];
   for (const { pubkey, account } of rawPortfolios) {
     try {
-      const data = new Uint8Array(account.data);
-      const pf = parsePortfolioV17(data);
+      const pfData = new Uint8Array(account.data);
+      const pf = parsePortfolioV17(pfData);
 
       // M-9: getProgramAccounts' memcmp filter is enforced RPC-side, not
       // on-chain -- a non-conforming or misbehaving RPC could return a
@@ -185,32 +187,50 @@ async function scanV17Portfolios(
         continue;
       }
 
-      // Check each active leg for undercollateralization.
-      // DESYNC-4: asset_index is the leg's assetIndex field (0 for single-asset markets).
+      // #230: fee debt is portfolio-level — compute once outside the leg loop.
+      const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
+      const equity = pf.capital + pf.pnl - feeDebt;
+
+      // #330/#331: Aggregate maintenance across all active legs using per-asset
+      // effective_price. A portfolio with N legs is undercollateralized when
+      // equity < sum(legMaintenance) even if equity >= any individual leg's
+      // maintenance — the old per-leg break missed this case.
+      let aggregateMaintenance = 0n;
+      let firstActiveAssetIndex = -1;
+      let candidateCloseQ = 0n;
       for (const leg of pf.legs) {
         if (!leg.active) continue;
         if (leg.basisPosQ === 0n) continue;
         const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
-        const notional = absPos * price / PRICE_E6_DIVISOR;
+        // #331: Use per-asset effective_price from the market account bytes.
+        // Falls back to the market-level price when the buffer is too short.
+        const legPrice = readEffectivePriceForAsset(marketData, leg.assetIndex) || price;
+        // Ceiling division to match on-chain notional rounding.
+        const notional = (absPos * legPrice + PRICE_E6_DIVISOR - 1n) / PRICE_E6_DIVISOR;
         if (notional === 0n) continue;
-        // #230: subtract fee debt from equity (matches the v12 scan path + the on-chain
-        // liquidation check). fee_debt = -feeCredits when feeCredits < 0. Omitting it
-        // OVERSTATES equity for fee-indebted portfolios → the scanner misses liquidatable ones.
-        const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
-        const equity = pf.capital + pf.pnl - feeDebt;
-        const marginRatioBps = computeMarginRatioBps(equity, notional);
-        // H-8 defense-in-depth: a position with equity<=0n is unambiguously
-        // bankrupt and liquidatable regardless of maintenanceMarginBps -- even
-        // if that value were somehow corrupted/zero despite parseV17RiskParams'
-        // own validation. Don't let a bad threshold mask the unconditional case.
-        if (equity <= 0n || marginRatioBps < maintenanceMarginBps) {
-          candidates.push({
-            portfolioPubkey: pubkey,
-            owner: pf.owner.toBase58(),
-            assetIndex: leg.assetIndex, // DESYNC-4: use leg.assetIndex, NOT slab slot index
-          });
-          break; // One candidate per portfolio — pick first undercollateralized leg
+        // Per-leg maintenance: clamped up to minNonzeroMmReq so even tiny
+        // positions carry the minimum margin floor.
+        const legMaintenance = notional * maintenanceMarginBps / BPS_MULTIPLIER;
+        const legMaintenanceClamped = legMaintenance < minNonzeroMmReq ? minNonzeroMmReq : legMaintenance;
+        aggregateMaintenance += legMaintenanceClamped;
+        // Track first active leg for candidate assetIndex and closeQ.
+        if (firstActiveAssetIndex < 0) {
+          firstActiveAssetIndex = leg.assetIndex;
+          candidateCloseQ = absPos;
         }
+      }
+
+      if (firstActiveAssetIndex < 0) continue; // no active nonzero legs
+
+      // H-8 defense-in-depth: equity<=0n is unconditionally bankrupt.
+      // #330: check aggregate maintenance, not per-leg.
+      if (equity <= 0n || equity < aggregateMaintenance) {
+        candidates.push({
+          portfolioPubkey: pubkey,
+          owner: pf.owner.toBase58(),
+          assetIndex: firstActiveAssetIndex, // DESYNC-4: use leg.assetIndex, NOT slab slot index
+          closeQ: candidateCloseQ,           // #329: absPos of first active leg
+        });
       }
     } catch {
       // Skip portfolios that fail to parse
@@ -382,6 +402,14 @@ interface LiquidationCandidate {
   // Oracle price (E6) at candidacy decision time. Used by liquidate() to detect
   // oracle drift between scan and submit and abort if it exceeds MAX_LIQUIDATION_DRIFT_BPS.
   scanPriceE6: bigint;
+  /**
+   * #329: For v17 markets, the absolute position size (absPos = abs(basisPosQ))
+   * of the first active leg selected as the liquidation target. Must be > 0 for
+   * the v17 PermissionlessCrank(Liquidate) payload; zero means no valid leg was
+   * found and the liquidation must be aborted.
+   * Undefined for legacy v12.x markets (the v12 path uses positionSize instead).
+   */
+  closeQ?: bigint;
 }
 
 export class LiquidationService {
@@ -526,12 +554,17 @@ export class LiquidationService {
         this._corruptedRiskParamsAlertedAt.delete(slabAddress); // recovered — re-arm the latch
         const maintenanceMarginBps = v17Params.maintenanceMarginBps;
         const connection = getConnection();
+        // #330/#331: pass raw market account bytes and minNonzeroMmReq so
+        // scanV17Portfolios can read per-asset effective_price and apply the
+        // aggregate maintenance check (sum across all legs, not per-leg).
         const v17Candidates = await scanV17Portfolios(
           connection,
           market.programId,
           market,
           maintenanceMarginBps,
           price,
+          data,
+          v17Params.minNonzeroMmReq,
         );
         // Map to LiquidationCandidate — v17 uses portfolio pubkey as accountIdx sentinel
         // The liquidate() method is updated below to use portfolioPubkey directly.
@@ -549,6 +582,8 @@ export class LiquidationService {
           v17PortfolioPubkey: c.portfolioPubkey,
           // Oracle drift guard: use the scan-time price for drift detection in liquidate().
           scanPriceE6: price,
+          // #329: forward closeQ so liquidate() can pass it to encodePermissionlessCrank.
+          closeQ: c.closeQ,
         }));
       }
 
@@ -719,6 +754,7 @@ export class LiquidationService {
       owner: string;
       v17PortfolioPubkey?: PublicKey;
       scanPriceE6: bigint;
+      closeQ?: bigint;
     },
   ): Promise<string | null> {
     const positionKey = candidate.v17PortfolioPubkey
@@ -759,6 +795,7 @@ export class LiquidationService {
         candidate.accountIdx,
         candidate.v17PortfolioPubkey,
         candidate.scanPriceE6,
+        candidate.closeQ ?? 0n,
       )) ?? null;
     } finally {
       // Always release, regardless of success, a returned null (race-
@@ -783,8 +820,20 @@ export class LiquidationService {
     accountIdx: number,
     v17PortfolioPubkey?: PublicKey,
     scanPriceE6: bigint = 0n,
+    closeQ: bigint = 0n,
   ): Promise<string | null> {
     const slabAddress = market.slabAddress;
+
+    // #329: v17 liquidation requires a non-zero closeQ (absPos of the target leg).
+    // A zero closeQ means no valid active leg was found during scanning — abort
+    // immediately to avoid submitting a malformed PermissionlessCrank(Liquidate).
+    if (v17PortfolioPubkey && closeQ === 0n) {
+      logger.error("v17 liquidate: closeQ must be > 0 — aborting to avoid malformed crank", {
+        portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+        slabAddress: slabAddress.toBase58().slice(0, 8),
+      });
+      return null;
+    }
 
     try {
       const connection = getConnection();
@@ -828,11 +877,14 @@ export class LiquidationService {
 
       // DESYNC-4 FIX: For v17 markets, assetIndex comes from the leg (always 0
       // for single-asset markets). For v12.x markets, accountIdx is the slab slot.
+      // #329: use the scan-time closeQ; it will be re-derived from the fresh portfolio
+      // in the pre-submit recheck below and the instruction data rebuilt if changed.
+      let effectiveCloseQ = closeQ;
       const crankData = encodePermissionlessCrank({
         action: CrankAction.Liquidate,
         assetIndex: accountIdx, // v17: leg.assetIndex; v12: slab slot
         nowSlot,
-        closeQ: 0n,
+        closeQ: effectiveCloseQ,
         feeBps: 0n,
         recoveryReason: 0,
       });
@@ -947,6 +999,9 @@ export class LiquidationService {
             const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
             const equity = pf.capital + pf.pnl - feeDebt;
             let stillLiquidatable = false;
+            // #329: Re-derive closeQ from the fresh portfolio. The position may
+            // have been partially closed since scan time — use the current absPos.
+            let freshCloseQ = 0n;
             for (const leg of pf.legs) {
               if (!leg.active || leg.basisPosQ === 0n) continue;
               const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
@@ -954,6 +1009,7 @@ export class LiquidationService {
               if (notional === 0n) continue;
               if (equity <= 0n || (reMmBps !== null && computeMarginRatioBps(equity, notional) < reMmBps)) {
                 stillLiquidatable = true;
+                if (freshCloseQ === 0n) freshCloseQ = absPos; // first qualifying leg
                 break;
               }
             }
@@ -962,6 +1018,21 @@ export class LiquidationService {
                 portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
               });
               return null;
+            }
+            // #329: If the fresh closeQ differs from the scan-time value (position
+            // partially closed), rebuild the crank instruction with the updated value
+            // so the on-chain close_q matches the actual remaining position size.
+            if (freshCloseQ > 0n && freshCloseQ !== effectiveCloseQ) {
+              effectiveCloseQ = freshCloseQ;
+              const updatedCrankData = encodePermissionlessCrank({
+                action: CrankAction.Liquidate,
+                assetIndex: accountIdx,
+                nowSlot,
+                closeQ: effectiveCloseQ,
+                feeBps: 0n,
+                recoveryReason: 0,
+              });
+              instructions[0] = buildIx({ programId, keys: crankKeys, data: updatedCrankData });
             }
           }
         } catch {
