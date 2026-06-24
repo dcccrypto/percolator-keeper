@@ -510,6 +510,15 @@ describe('LiquidationService', () => {
       it('v17 path: returns no candidates and fires sendCriticalAlert when parseV17RiskParams throws V17RiskParamsCorruptedError', async () => {
         vi.mocked(core.isV17Account).mockReturnValueOnce(true);
         vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        // #342 FIX: scanMarket now calls parseWrapperConfigV17 + resolveV17WrapperPrice
+        // before parseV17RiskParams, so we must mock it to return a valid config.
+        vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+          oracleMode: 2, // EWMA_MARK — no auth price path
+          maxStalenessSecs: 60n,
+          oracleTargetPriceE6: 0n,
+          oracleTargetPublishTime: BigInt(Math.floor(Date.now() / 1000)) - 10n,
+          markEwmaE6: 1_000_000n,
+        } as any);
         const v17Risk = await import('../../src/lib/v17-risk.js');
         vi.mocked(v17Risk.parseV17RiskParams).mockImplementationOnce(() => {
           throw new v17Risk.V17RiskParamsCorruptedError('maintenanceMarginBps', 0n);
@@ -570,8 +579,17 @@ describe('LiquidationService', () => {
       it('skips a portfolio whose parsed marketGroupId does not match the scanned market', async () => {
         vi.mocked(core.isV17Account).mockReturnValueOnce(true);
         vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        // #342 FIX: scanMarket now calls parseWrapperConfigV17 + fetchClusterUnixTimeSec.
         vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async () => null),
           getProgramAccounts: vi.fn(async () => [makeRawPortfolio('Mismatched')]),
+        } as any);
+        vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+          oracleMode: 2, // EWMA_MARK
+          maxStalenessSecs: 60n,
+          oracleTargetPriceE6: 0n,
+          oracleTargetPublishTime: BigInt(Math.floor(Date.now() / 1000)) - 10n,
+          markEwmaE6: 1_000_000n,
         } as any);
         vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
           marketGroupId: mockNonZeroKey('SomeOtherMarket1111111111111111111111'),
@@ -590,8 +608,20 @@ describe('LiquidationService', () => {
       it('keeps a portfolio whose parsed marketGroupId matches the scanned market', async () => {
         vi.mocked(core.isV17Account).mockReturnValueOnce(true);
         vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        // #342 FIX: scanMarket now calls parseWrapperConfigV17 + fetchClusterUnixTimeSec
+        // before scanV17Portfolios, so the connection mock must also expose getAccountInfo
+        // (used by fetchClusterUnixTimeSec for clock sysvar; returning null falls back to
+        // Date.now()/1000 which is fine for this test).
         vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async () => null),
           getProgramAccounts: vi.fn(async () => [makeRawPortfolio('Matching')]),
+        } as any);
+        vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+          oracleMode: 2, // EWMA_MARK
+          maxStalenessSecs: 60n,
+          oracleTargetPriceE6: 0n,
+          oracleTargetPublishTime: BigInt(Math.floor(Date.now() / 1000)) - 10n,
+          markEwmaE6: 1_000_000n,
         } as any);
         vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
           marketGroupId: mockMarket.slabAddress,
@@ -610,11 +640,22 @@ describe('LiquidationService', () => {
       it('evaluates a mixed batch correctly: drops the mismatched portfolio, keeps the matching one', async () => {
         vi.mocked(core.isV17Account).mockReturnValueOnce(true);
         vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        // #342 FIX: scanMarket now calls parseWrapperConfigV17 + fetchClusterUnixTimeSec
+        // before scanV17Portfolios. Connection needs getAccountInfo; parseWrapperConfigV17
+        // needs a mock return so resolveV17WrapperPrice doesn't throw.
         vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async () => null),
           getProgramAccounts: vi.fn(async () => [
             makeRawPortfolio('Mismatched'),
             makeRawPortfolio('Matching'),
           ]),
+        } as any);
+        vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+          oracleMode: 2, // EWMA_MARK
+          maxStalenessSecs: 60n,
+          oracleTargetPriceE6: 0n,
+          oracleTargetPublishTime: BigInt(Math.floor(Date.now() / 1000)) - 10n,
+          markEwmaE6: 1_000_000n,
         } as any);
         vi.mocked(core.parsePortfolioV17)
           .mockReturnValueOnce({

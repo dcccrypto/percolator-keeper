@@ -713,8 +713,26 @@ export class LiquidationService {
 
       // DESYNC-3 FIX: Route v17 accounts through the portfolio-based scanner.
       if (isV17Account(data)) {
-        // Resolve price from the v17 config (markEwmaE6 acts as lastEffectivePriceE6)
-        const price = market.config.lastEffectivePriceE6 ?? market.config.authorityPriceE6 ?? 0n;
+        // #342 FIX: resolve scan-time price via the SAME path as submit-time so the
+        // drift guard always compares the same field at both checkpoints.
+        //
+        // Before this fix, scan used market.config.lastEffectivePriceE6 (= markEwmaE6
+        // per crank.ts:172) while submit called resolveV17WrapperPrice which, for
+        // AUTH_MARK (oracleMode=3) with a fresh authority push, returns
+        // oracleTargetPriceE6 instead.  Those two fields are legitimately different
+        // (EWMA lags the authority-pushed spot price by design), so the drift guard
+        // fired spuriously on every scan cycle even when the oracle had not moved.
+        //
+        // Fix: fetch cluster time here (same pattern as the v12.x path below) and
+        // call resolveV17WrapperPrice so scan-time and submit-time resolve identically:
+        //   - AUTH_MARK(3) with fresh oracleTargetPriceE6 → oracleTargetPriceE6
+        //   - All other modes / stale authority                → markEwmaE6
+        // If resolveV17WrapperPrice returns 0n (no usable price), fall back to 0n
+        // so scanV17Portfolios bails early (same as before) rather than using a
+        // wrong field that masked the bug.
+        const connection = getConnection();
+        const scanNowSec = await fetchClusterUnixTimeSec(connection);
+        const price = resolveV17WrapperPrice(parseWrapperConfigV17(data), scanNowSec);
         let v17Params: ReturnType<typeof parseV17RiskParams>;
         try {
           v17Params = parseV17RiskParams(data);
@@ -727,7 +745,6 @@ export class LiquidationService {
         }
         this._corruptedRiskParamsAlertedAt.delete(slabAddress); // recovered — re-arm the latch
         const maintenanceMarginBps = v17Params.maintenanceMarginBps;
-        const connection = getConnection();
         // #330/#331: pass raw market account bytes and minNonzeroMmReq so
         // scanV17Portfolios can read per-asset effective_price and apply the
         // aggregate maintenance check (sum across all legs, not per-leg).
