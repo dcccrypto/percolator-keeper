@@ -151,6 +151,12 @@ vi.mock('../../src/lib/v17-risk.js', async () => {
     // Fix #331: readEffectivePriceForAsset is used in scanV17Portfolios.
     // Return 0n (falls back to the market-level price, matching pre-fix behavior in tests).
     readEffectivePriceForAsset: vi.fn(() => 0n),
+    // #335: raw_oracle_target_price + lag penalty are read by evaluateV17PortfolioHealth.
+    // Return 0n target → real targetEffectiveLagPenalty yields 0 (no penalty), which is
+    // the behavior these legacy tests assume. Use the REAL penalty fn so its logic is
+    // exercised wherever a non-zero target is supplied.
+    readRawOracleTargetPriceForAsset: vi.fn(() => 0n),
+    targetEffectiveLagPenalty: actual.targetEffectiveLagPenalty,
   };
 });
 

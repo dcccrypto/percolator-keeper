@@ -30,7 +30,13 @@ import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
-import { parseV17RiskParams, V17RiskParamsCorruptedError, readEffectivePriceForAsset } from "../lib/v17-risk.js";
+import {
+  parseV17RiskParams,
+  V17RiskParamsCorruptedError,
+  readEffectivePriceForAsset,
+  readRawOracleTargetPriceForAsset,
+  targetEffectiveLagPenalty,
+} from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 
 const logger = createLogger("keeper:liquidation");
@@ -952,9 +958,13 @@ export class LiquidationService {
           // (which would fall through to submitting the liquidation
           // unconditionally) -- degrade to relying on the equity<=0n signal
           // alone instead.
-          let reMmBps: bigint | null = null;
+          let freshRiskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint } | null = null;
           try {
-            reMmBps = parseV17RiskParams(freshMarketData).maintenanceMarginBps;
+            const parsed = parseV17RiskParams(freshMarketData);
+            freshRiskParams = {
+              maintenanceMarginBps: parsed.maintenanceMarginBps,
+              minNonzeroMmReq: parsed.minNonzeroMmReq,
+            };
             this._corruptedRiskParamsAlertedAt.delete(slabAddress.toBase58());
           } catch (err) {
             if (err instanceof V17RiskParamsCorruptedError) {
@@ -989,28 +999,38 @@ export class LiquidationService {
               return null;
             }
           }
-          // H-8: always run the recheck, even when reMmBps could not be
-          // obtained (corrupted/null) -- equity<=0n is checked unconditionally
+          // #335.1: pre-submit recheck uses the IDENTICAL aggregate-maintenance
+          // health evaluator as scanV17Portfolios — no per-leg vs aggregate
+          // divergence between scan and submit.
+          //
+          // H-8 / #335.4: equity<=0n is checked unconditionally inside the helper
           // so an outright-bankrupt position is never masked by an untrusted
-          // threshold. If reMmBps is null AND equity>0n for every leg, we have
-          // no reliable signal either way -- stillLiquidatable stays false and
-          // the function safely aborts (fails closed) rather than guessing.
+          // threshold. When freshRiskParams could not be obtained (corrupted), we
+          // CANNOT trust the maintenanceMarginBps threshold — so we degrade to a
+          // conservative equity<=0n-only check (using the same conservative
+          // equity the helper uses: positive PnL counted at 0). If equity>0n in
+          // that degraded case we have no reliable threshold signal and abort
+          // (fail closed) rather than guessing.
           {
-            const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
-            const equity = pf.capital + pf.pnl - feeDebt;
             let stillLiquidatable = false;
-            // #329: Re-derive closeQ from the fresh portfolio. The position may
-            // have been partially closed since scan time — use the current absPos.
             let freshCloseQ = 0n;
-            for (const leg of pf.legs) {
-              if (!leg.active || leg.basisPosQ === 0n) continue;
-              const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
-              const notional = absPos * freshPrice / PRICE_E6_DIVISOR;
-              if (notional === 0n) continue;
-              if (equity <= 0n || (reMmBps !== null && computeMarginRatioBps(equity, notional) < reMmBps)) {
-                stillLiquidatable = true;
-                if (freshCloseQ === 0n) freshCloseQ = absPos; // first qualifying leg
-                break;
+            if (freshRiskParams !== null) {
+              const health = evaluateV17PortfolioHealth(pf, freshMarketData, freshRiskParams, freshPrice);
+              stillLiquidatable = health.liquidatable;
+              freshCloseQ = health.closeQ;
+            } else {
+              // Corrupted/unavailable risk params: rely on equity<=0n alone, with
+              // the same conservative equity (positive PnL → 0) the helper uses.
+              const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
+              const conservativePnl = pf.pnl < 0n ? pf.pnl : 0n;
+              const equity = pf.capital + conservativePnl - feeDebt;
+              if (equity <= 0n) {
+                for (const leg of pf.legs) {
+                  if (!leg.active || leg.basisPosQ === 0n) continue;
+                  stillLiquidatable = true;
+                  freshCloseQ = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ; // first active leg
+                  break;
+                }
               }
             }
             if (!stillLiquidatable) {

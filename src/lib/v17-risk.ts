@@ -13,6 +13,14 @@ export const V17_ASSET_SLOT_STRIDE = 1797; // ASSET_ORACLE_WRAPPER_LEN + ENGINE_
 // offset of effective_price within EngineAssetSlotV16Account (after the ORACLE_WRAPPER prefix)
 // = 8 (market_id) + 8 (retired_slot) + 1 (lifecycle) + 8 (raw_oracle_target_price) = 25
 export const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = 25;
+// #335: offset of raw_oracle_target_price within EngineAssetSlotV16Account (after the
+// ORACLE_WRAPPER prefix). It is the field immediately BEFORE effective_price:
+// = 8 (market_id) + 8 (retired_slot) + 1 (lifecycle) = 17.
+// Verified against percolator engine AssetStateV16Account (src/v16.rs:4317): the Pod
+// struct is #[repr(C)] over alignment-1 byte-array fields (V16PodU64 = [u8;8], no
+// padding), so raw_oracle_target_price (V16PodU64) sits at byte 17 and effective_price
+// at byte 25. (src/v16.rs:1168 target_effective_lag_adverse_delta consumes both.)
+export const V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT = 17;
 // absolute offset of min_nonzero_mm_req in the market account data
 // = V17_ENGINE_CONFIG_OFF + V16PodU16(2) + V16PodU32(4) = 480 + 6 = 486
 export const V17_MIN_NONZERO_MM_REQ_OFF = 486;
@@ -66,6 +74,68 @@ export function readEffectivePriceForAsset(data: Uint8Array, assetIndex: number)
     + V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT;
   if (off + 8 > data.length) return 0n;
   return readU64LE(data, off);
+}
+
+/**
+ * #335: Read the raw_oracle_target_price (u64 LE) for a given asset index from raw
+ * market account bytes. Same per-asset slot layout as readEffectivePriceForAsset,
+ * but at V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT (17) within the engine asset
+ * slot. Needed to compute the engine's target/effective-price lag penalty
+ * (src/v16.rs:1168 target_effective_lag_adverse_delta).
+ *
+ * Returns 0n if the buffer is too short to contain the field. Callers MUST treat
+ * 0n as "unknown" — never as a real $0 target — so a missing read can only ever
+ * OMIT the lag penalty (conservative: it never marks a portfolio healthier).
+ */
+export function readRawOracleTargetPriceForAsset(data: Uint8Array, assetIndex: number): bigint {
+  const off = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN
+    + assetIndex * V17_ASSET_SLOT_STRIDE
+    + V17_ASSET_ORACLE_WRAPPER_LEN
+    + V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT;
+  if (off + 8 > data.length) return 0n;
+  return readU64LE(data, off);
+}
+
+/**
+ * #335: target/effective-price lag penalty, mirroring the engine exactly.
+ *
+ * Engine (verified):
+ *   src/v16.rs:1168 target_effective_lag_adverse_delta(side, effective, raw_target):
+ *     long  → effective - raw_target   when raw_target <  effective (strict)
+ *     short → raw_target - effective   when raw_target >  effective (strict)
+ *     else  → 0
+ *   src/v16.rs:1157 target_effective_lag_loss_penalty:
+ *     penalty = risk_notional_ceil(abs_pos_q, adverse_delta)
+ *             = ceil(abs_pos_q * adverse_delta / POS_SCALE)   (POS_SCALE = 1_000_000, lib.rs:15)
+ *   src/v16.rs:1207 health_requirements_from_base_and_target_lag:
+ *     leg_maintenance = base_maintenance + target_lag_penalty   (ADDED at face value)
+ *
+ * `side`: +1 for long (basisPosQ > 0), -1 for short (basisPosQ < 0).
+ * `absPos`: abs(basisPosQ). `effectivePrice`/`rawTargetPrice`: per-asset prices (E6).
+ *
+ * Returns 0n (no penalty) when rawTargetPrice is 0n ("unknown") so a missing
+ * read can only ever under-penalize toward MORE liquidations, never mask one.
+ */
+export function targetEffectiveLagPenalty(
+  absPos: bigint,
+  side: 1 | -1,
+  effectivePrice: bigint,
+  rawTargetPrice: bigint,
+): bigint {
+  // 0n target means we couldn't read it — omit the penalty (never mark healthier).
+  if (rawTargetPrice <= 0n || effectivePrice <= 0n || absPos <= 0n) return 0n;
+  let adverseDelta = 0n;
+  if (side === 1) {
+    // long: adverse when effective > raw_target
+    if (rawTargetPrice < effectivePrice) adverseDelta = effectivePrice - rawTargetPrice;
+  } else {
+    // short: adverse when raw_target > effective
+    if (rawTargetPrice > effectivePrice) adverseDelta = rawTargetPrice - effectivePrice;
+  }
+  if (adverseDelta === 0n) return 0n;
+  // ceil(absPos * adverseDelta / POS_SCALE), POS_SCALE = 1_000_000
+  const POS_SCALE = 1_000_000n;
+  return (absPos * adverseDelta + POS_SCALE - 1n) / POS_SCALE;
 }
 
 /**
