@@ -198,7 +198,7 @@ export function parseV17RiskParams(data: Uint8Array): {
     data,
     V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_MAINTENANCE_MARGIN_BPS_OFF,
   );
-  if (maintenanceMarginBps <= 0n || maintenanceMarginBps >= 10_000n) {
+  if (maintenanceMarginBps <= 0n || maintenanceMarginBps > 10_000n) {
     throw new V17RiskParamsCorruptedError("maintenanceMarginBps", maintenanceMarginBps);
   }
 
