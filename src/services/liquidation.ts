@@ -1241,9 +1241,18 @@ export class LiquidationService {
               instructions[0] = buildIx({ programId, keys: crankKeys, data: updatedCrankData });
             }
           }
-        } catch {
-          // If we can't re-verify, proceed cautiously — the on-chain program
-          // will reject if the portfolio is already closed.
+        } catch (recheckErr) {
+          // Cannot re-verify portfolio state — abort rather than submitting with
+          // scan-time data. The oracle drift guard (lines 1171-1187) lives inside
+          // this try block; proceeding past a thrown error would bypass it and
+          // allow a stale-price liquidation if the oracle moved >MAX_LIQUIDATION_DRIFT_BPS
+          // between scan and submit. Fail closed: position is re-scanned next cycle.
+          logger.warn("v17 liquidate: pre-submit recheck threw — aborting to avoid stale submission", {
+            portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+            slabAddress: slabAddress.toBase58().slice(0, 8),
+            error: recheckErr instanceof Error ? recheckErr.message : String(recheckErr),
+          });
+          return null;
         }
       } else {
       // Bug 3: Re-read slab data and verify account before submitting (v12.x path)
