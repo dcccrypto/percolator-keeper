@@ -91,9 +91,20 @@ export class OracleService {
   // staleness rather than cranking on a frozen price forever.
   private lastExternalPriceMs = new Map<string, number>();
   // H1: Track consecutive deviation rejections per slab to avoid permanent anchor lock.
-  // After DEVIATION_ACCEPT_AFTER consecutive rejections, accept the price as legitimate.
+  // After DEVIATION_ACCEPT_AFTER consecutive rejections AND at least
+  // DEVIATION_ACCEPT_AFTER_MS have elapsed since the FIRST rejection in the current
+  // streak, accept the price as legitimate.
+  // KEEPER-12: the count-only guard allowed a ~25-second coordinated dual-source
+  // manipulation (attacker moves a thin pool that both DexScreener and Jupiter index;
+  // both feeds agree so cross-validation passes; H1 fires after 5 * 5s cycles).
+  // Adding a wall-clock minimum ensures rapid manipulation cannot win the race.
   private deviationRejections = new Map<string, number>();
+  private deviationFirstRejectedAt = new Map<string, number>();
   private static readonly DEVIATION_ACCEPT_AFTER = 5;
+  // Minimum elapsed time since the first consecutive rejection before H1 fires.
+  // Default: 5 minutes — ensures a sustained legitimate move, not a 25-second trade.
+  private static readonly DEVIATION_ACCEPT_AFTER_MS =
+    Number(process.env.ORACLE_DEVIATION_ACCEPT_AFTER_MS ?? 5 * 60 * 1000);
 
   /** Injectable clock — defaults to Date.now() in production; overridden in
    *  tests so price freshness / staleness is deterministic without faking the
@@ -460,7 +471,16 @@ export class OracleService {
         if (deviationBps > HISTORICAL_DEVIATION_MAX_BPS) {
           const consecutiveCount = (this.deviationRejections.get(slabAddress) ?? 0) + 1;
           this.deviationRejections.set(slabAddress, consecutiveCount);
-          if (consecutiveCount < OracleService.DEVIATION_ACCEPT_AFTER) {
+          // Track the timestamp of the first consecutive rejection so we can enforce
+          // a wall-clock minimum in addition to the count gate (KEEPER-12).
+          if (consecutiveCount === 1) {
+            this.deviationFirstRejectedAt.set(slabAddress, this.now());
+          }
+          const firstRejectedAt = this.deviationFirstRejectedAt.get(slabAddress) ?? this.now();
+          const elapsedMs = this.now() - firstRejectedAt;
+          const countGate = consecutiveCount >= OracleService.DEVIATION_ACCEPT_AFTER;
+          const timeGate = elapsedMs >= OracleService.DEVIATION_ACCEPT_AFTER_MS;
+          if (!countGate || !timeGate) {
             logger.warn("Price deviation exceeds threshold", {
               mint,
               deviationBps,
@@ -469,14 +489,17 @@ export class OracleService {
               newPrice: priceE6.toString(),
               source,
               consecutiveRejections: consecutiveCount,
-              acceptAfter: OracleService.DEVIATION_ACCEPT_AFTER,
+              acceptAfterCount: OracleService.DEVIATION_ACCEPT_AFTER,
+              acceptAfterMs: OracleService.DEVIATION_ACCEPT_AFTER_MS,
+              elapsedMs: Math.round(elapsedMs),
             });
             return null;
           }
-          logger.warn("Accepting deviated price after consecutive rejections (H1)", {
+          logger.warn("Accepting deviated price after consecutive rejections + time gate (H1)", {
             mint,
             deviationBps,
             consecutiveRejections: consecutiveCount,
+            elapsedMs: Math.round(elapsedMs),
             lastPrice: lastPrice.toString(),
             newPrice: priceE6.toString(),
             source,
@@ -484,8 +507,9 @@ export class OracleService {
         }
       }
     }
-    // H1: Price accepted — reset consecutive rejection counter
+    // H1: Price accepted — reset consecutive rejection counter and first-rejection timestamp
     this.deviationRejections.delete(slabAddress);
+    this.deviationFirstRejectedAt.delete(slabAddress);
 
     const entry: PriceEntry = { priceE6, source, timestamp: this.now() };
     this.recordPrice(slabAddress, entry);
