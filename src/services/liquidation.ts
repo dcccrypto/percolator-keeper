@@ -948,6 +948,13 @@ export class LiquidationService {
       scanPriceE6: bigint;
       closeQ?: bigint;
     },
+    // KEEPER-11: LaserStream-triggered calls do NOT count against _cycleOwnerCounts.
+    // The per-owner cap was designed to bound the polling scan from over-liquidating a
+    // single owner within one cycle. A burst of LaserStream events for distinct positions
+    // of the same owner would exhaust the cap before the polling scan could reach those
+    // positions, causing valid liquidation candidates to be skipped. Event-driven calls
+    // are already deduplicated by _cycleSeenPositions and _inFlightPositions.
+    source: "polling" | "laserstream" = "polling",
   ): Promise<string | null> {
     const positionKey = candidate.v17PortfolioPubkey
       ? `${candidate.slabAddress}:v17:${candidate.v17PortfolioPubkey.toBase58()}`
@@ -970,16 +977,18 @@ export class LiquidationService {
       });
       return null;
     }
-    const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
-    if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
-      logger.debug("Owner hit per-cycle liquidation cap", {
-        owner: candidate.owner.slice(0, 8),
-        cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
-      });
-      return null;
+    if (source === "polling") {
+      const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
+      if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
+        logger.debug("Owner hit per-cycle liquidation cap", {
+          owner: candidate.owner.slice(0, 8),
+          cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
+        });
+        return null;
+      }
+      this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
     }
     this._cycleSeenPositions.add(positionKey);
-    this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
     this._inFlightPositions.add(positionKey);
     try {
       return (await this.liquidate(
@@ -1616,8 +1625,10 @@ export class LiquidationService {
             this.scanMarket(market.market).then(async (candidates) => {
               for (const c of candidates) {
                 // #218: route through the shared gate so the event path honors the same
-                // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
-                const sig = await this.gatedLiquidate(market.market, c);
+                // per-cycle dedup + in-flight guard as the polling path (no double-liquidation).
+                // KEEPER-11: pass "laserstream" so LaserStream bursts do not exhaust the
+                // per-owner cap (_cycleOwnerCounts) for the polling scan.
+                const sig = await this.gatedLiquidate(market.market, c, "laserstream");
                 if (sig) {
                   logger.info("Event-driven liquidation complete", {
                     slabAddress: slabKey,
