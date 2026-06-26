@@ -22,7 +22,8 @@ import {
   encodeLpVaultCrankFees,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
+import { config, getConnection, getFallbackConnection, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
+import { getKeeperKeypair } from "../lib/keypair-singleton.js";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
@@ -804,8 +805,8 @@ export class CrankService {
   /** Per-market in-flight guard for LP-vault maintenance — mirrors _inflightMarkets. */
   private _inflightLpVaultMarkets = new Set<string>();
   private _stalePauseCheck?: (slabAddress: string) => boolean;
-  // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
-  private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+  // Use the process-wide keypair singleton — avoids a second secretKey allocation.
+  private get _keypair() { return getKeeperKeypair(); }
   // 6.2: Total crank cycles completed (exposed via getMetrics for health + MonitorService)
   private _totalCrankCycles = 0;
   // 6.2: Optional callback fired after each completed crank cycle

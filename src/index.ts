@@ -1,7 +1,8 @@
 import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, createServiceMonitors, getConnection, loadKeypair } from "@percolatorct/shared";
+import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, createServiceMonitors, getConnection } from "@percolatorct/shared";
+import { getKeeperKeypair } from "./lib/keypair-singleton.js";
 import { OracleService } from "./services/oracle.js";
 import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
@@ -74,7 +75,7 @@ validateKeeperEnvGuards();
 // scope means a malformed keypair fails at boot (clean supervisor restart)
 // instead of producing a "keeper appears healthy but can't sign anything"
 // degraded state.
-const keeperKeypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+const keeperKeypair = getKeeperKeypair();
 
 // If NETWORK=mainnet, the keeper runs against mainnet program (requires FORCE_MAINNET=1).
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
