@@ -376,6 +376,15 @@ const secureJsonHeaders = {
 };
 
 const healthServer = http.createServer((req, res) => {
+  // KEEPER-10: Unauthenticated liveness probe — returns 200 if the server is up,
+  // no operational data exposed. Use ?probe=liveness for Railway health checks
+  // when KEEPER_HEALTH_BIND_ADDR is remote and KEEPER_REGISTER_SECRET is set.
+  if (req.url === "/health?probe=liveness" && req.method === "GET") {
+    res.writeHead(200, secureJsonHeaders);
+    res.end(JSON.stringify({ alive: true }));
+    return;
+  }
+
   // Authentication check for health and sensitive endpoints when exposed remotely
   if (healthBindAddr !== "127.0.0.1" && healthBindAddr !== "localhost" && healthBindAddr !== "::1") {
     if ((req.url === "/health" || req.url === "/pause-status" || req.url === "/shadow/report" || req.url?.startsWith("/shadow/report?")) && req.method === "GET") {
@@ -394,11 +403,18 @@ const healthServer = http.createServer((req, res) => {
         contentMatch = lengthMatch && timingSafeEqual(secretPad, providedPad);
       }
       
-      // #321: fail OPEN when no secret is configured (registerSecret === "") so
-      // liveness/health probes on a remote bind aren't silently 401'd before the
-      // operator has set KEEPER_REGISTER_SECRET — a one-time startup warning is
-      // emitted at .listen() time instead. When a secret IS set, enforce it.
-      if (registerSecret && !contentMatch) {
+      // KEEPER-10: Fail CLOSED on remote bind regardless of whether a secret is set.
+      // The previous fail-open posture (#321) exposed keeperWallet.solBalance,
+      // budget circuit-breaker state, and stale-oracle market lists to any internet
+      // client when KEEPER_REGISTER_SECRET was unset. Operators using a remote bind
+      // must set KEEPER_REGISTER_SECRET; /health with ?probe=liveness provides an
+      // unauthenticated liveness signal for Railway health checks.
+      if (!registerSecret) {
+        res.writeHead(503, secureJsonHeaders);
+        res.end(JSON.stringify({ error: "KEEPER_REGISTER_SECRET must be set when KEEPER_HEALTH_BIND_ADDR is a remote address" }));
+        return;
+      }
+      if (!contentMatch) {
         res.writeHead(401, secureJsonHeaders);
         res.end(JSON.stringify({ error: "Unauthorized" }));
         return;
