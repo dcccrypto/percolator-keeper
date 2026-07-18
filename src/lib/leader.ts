@@ -20,6 +20,58 @@ end
 
 export type LeaderRole = "leader" | "standby" | "starting";
 
+/**
+ * #377: thrown when lease timings would make the single-writer guarantee
+ * unenforceable. Constructing a LeaderLock is the last point at which this is
+ * still cheap to catch — past it the misconfiguration is silent, and its only
+ * symptom is two nodes writing on-chain at once.
+ */
+export class LeaderLockTimingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LeaderLockTimingError";
+  }
+}
+
+/**
+ * #377: the lock's correctness rests on timings nothing previously checked.
+ * `Number(process.env.X ?? default)` in index.ts yields NaN for any malformed
+ * value, and NaN fails every comparison silently: `setTimeout(fn, NaN)` fires
+ * on the next tick, turning renewal into a hot loop, while `ex: NaN` produces a
+ * lease Redis will not honour.
+ *
+ * The ordering invariant matters more than the individual bounds. If
+ * renewMs >= ttlMs the lease expires BEFORE the leader ever tries to renew, so
+ * a standby acquires the freed key and promotes itself while the original node
+ * still reports role() === "leader" — it does not learn otherwise until its
+ * renewal finally runs and the fencing script rejects it. keeperSend gates
+ * writes on that local role alone, so both nodes submit transactions in the
+ * interval. Split-brain is then deterministic, not a race.
+ */
+function validateTiming(ttlMs: number, renewMs: number, pollMs: number): void {
+  for (const [name, value] of [
+    ["ttlMs", ttlMs],
+    ["renewMs", renewMs],
+    ["pollMs", pollMs],
+  ] as const) {
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new LeaderLockTimingError(
+        `LeaderLock ${name} must be a finite positive number of milliseconds, got ${String(value)}. ` +
+          `Check KEEPER_LEADER_LOCK_TTL_MS / KEEPER_LEADER_LOCK_RENEW_MS / KEEPER_STANDBY_POLL_MS.`,
+      );
+    }
+  }
+
+  if (renewMs >= ttlMs) {
+    throw new LeaderLockTimingError(
+      `LeaderLock renewMs (${renewMs}) must be strictly less than ttlMs (${ttlMs}) — otherwise the ` +
+        `lease expires before the leader renews it and a standby can promote while this node still ` +
+        `reports itself leader, allowing both to submit on-chain transactions (split-brain). ` +
+        `Set KEEPER_LEADER_LOCK_RENEW_MS below KEEPER_LEADER_LOCK_TTL_MS (recommended: at most half).`,
+    );
+  }
+}
+
 export interface LeaderLockOptions {
   ttlMs?: number;
   renewMs?: number;
@@ -56,11 +108,32 @@ export class LeaderLock {
   private _stopped = false;
 
   constructor(redis: RedisLike, identity: string, opts: LeaderLockOptions = {}) {
+    const ttlMs = opts.ttlMs ?? 30_000;
+    const renewMs = opts.renewMs ?? 10_000;
+    const pollMs = opts.pollMs ?? 5_000;
+
+    // #377: fail fast at construction. A lock built on unsafe timings cannot
+    // provide the guarantee its callers assume, so refusing to boot is the only
+    // safe outcome — the alternative is a silently split-brained keeper.
+    validateTiming(ttlMs, renewMs, pollMs);
+
+    // Renewal must also survive being LATE. A renewal firing at renewMs still
+    // has to complete a Redis round-trip before ttlMs, so a margin thinner than
+    // half the TTL leaves little room for a slow round-trip or event-loop stall.
+    // This is a judgement call, not an invariant, so it warns rather than throws.
+    if (renewMs > ttlMs / 2) {
+      logger.warn("LeaderLock renew margin is thin — a slow Redis round-trip or event-loop stall could let the lease lapse", {
+        ttlMs,
+        renewMs,
+        recommendedMaxRenewMs: ttlMs / 2,
+      });
+    }
+
     this.redis = redis;
     this.identity = identity;
-    this.ttlMs = opts.ttlMs ?? 30_000;
-    this.renewMs = opts.renewMs ?? 10_000;
-    this.pollMs = opts.pollMs ?? 5_000;
+    this.ttlMs = ttlMs;
+    this.renewMs = renewMs;
+    this.pollMs = pollMs;
   }
 
   role(): LeaderRole {
