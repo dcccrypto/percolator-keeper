@@ -56,11 +56,11 @@ const sendWarningAlert = hoisted.sendWarningAlert;
 
 import { OracleService } from "../../src/services/oracle.js";
 
-function mockDexResponse(priceUsd: string, liquidityUsd = 100_000) {
+function mockDexResponse(priceUsd: string, mint: string, liquidityUsd = 100_000) {
   vi.mocked(fetch).mockResolvedValueOnce({
     ok: true,
     json: async () => ({
-      pairs: [{ priceUsd, liquidity: { usd: liquidityUsd } }],
+      pairs: [{ priceUsd, liquidity: { usd: liquidityUsd }, baseToken: { address: mint } }],
     }),
   } as any);
 }
@@ -84,14 +84,14 @@ describe("oracle B-fixes — B8 priceE6===0n short-circuit", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("DexScreener: rejects sub-precision prices that would round to 0n", async () => {
-    mockDexResponse("0.0000001"); // 0.0000001 * 1e6 = 0.1 → rounds to 0
+    mockDexResponse("0.0000001", "MINT_B8_1"); // 0.0000001 * 1e6 = 0.1 → rounds to 0
     const p = await svc.fetchDexScreenerPrice("MINT_B8_1");
     expect(p).toBeNull();
   });
 
   it("DexScreener: cached-hit branch also rejects 0n prices", async () => {
     // first call fills cache (sub-precision)
-    mockDexResponse("0.0000004");
+    mockDexResponse("0.0000004", "MINT_B8_2");
     const first = await svc.fetchDexScreenerPrice("MINT_B8_2");
     expect(first).toBeNull();
 
@@ -107,7 +107,7 @@ describe("oracle B-fixes — B8 priceE6===0n short-circuit", () => {
   });
 
   it("DexScreener: still returns the price for legit values", async () => {
-    mockDexResponse("0.5"); // 500_000
+    mockDexResponse("0.5", "MINT_B8_4"); // 500_000
     const p = await svc.fetchDexScreenerPrice("MINT_B8_4");
     expect(p).toBe(500_000n);
   });

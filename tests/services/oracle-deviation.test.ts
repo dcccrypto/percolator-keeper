@@ -72,7 +72,7 @@ function freshSlab(): string {
 function mockBothSources(dexUsd: number | null, jupUsd: number | null, mint?: string) {
   const jupKey = mint ?? `MINT_${mintCounter}`;
   const dexResp = dexUsd !== null && dexUsd > 0
-    ? { pairs: [{ priceUsd: String(dexUsd), liquidity: { usd: 500_000 } }] }
+    ? { pairs: [{ priceUsd: String(dexUsd), liquidity: { usd: 500_000 }, baseToken: { address: jupKey } }] }
     : { pairs: [] };
 
   const jupResp = jupUsd !== null && jupUsd > 0
@@ -198,7 +198,7 @@ describe('Cross-source deviation — actual boundary conditions', () => {
     const mint = freshMint();
     // priceUsd='0' → parseFloat=0 → fails >0 check → treated as null → fallback to Jupiter
     vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ pairs: [{ priceUsd: '0', liquidity: { usd: 500_000 } }] }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ pairs: [{ priceUsd: '0', liquidity: { usd: 500_000 }, baseToken: { address: mint } }] }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as Response);
     const r = await svc.fetchPrice(mint, freshSlab());
     expect(r).not.toBeNull();

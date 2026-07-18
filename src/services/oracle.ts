@@ -40,12 +40,32 @@ const DEX_SCREENER_CACHE_TTL_MS = 10_000;
 const DEX_SCREENER_CACHE_MAX_SIZE = 1_000;
 
 interface DexScreenerResponse {
-  pairs?: Array<{ priceUsd?: string; liquidity?: { usd?: number } }>;
+  pairs?: Array<{
+    priceUsd?: string;
+    liquidity?: { usd?: number };
+    baseToken?: { address?: string };
+    quoteToken?: { address?: string };
+  }>;
 }
 
-function sortPairsByLiquidity(pairs: DexScreenerResponse["pairs"]): DexScreenerResponse["pairs"] {
-  if (!pairs) return pairs;
-  return [...pairs].sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+/**
+ * #380: DexScreener's token endpoint returns every pair the mint appears in —
+ * including pairs where it is the *quote* side. `priceUsd` always describes the
+ * pair's BASE token, so a high-liquidity SOL/USDC pair returned for a USDC query
+ * would otherwise hand back SOL's price as USDC's. Filter to pairs where the
+ * queried mint is the base token before ranking by liquidity.
+ *
+ * Match is exact: Solana mint addresses are base58 and case-significant, so
+ * case-insensitive comparison would risk conflating distinct mints.
+ */
+function selectPairForMint(
+  pairs: DexScreenerResponse["pairs"],
+  mint: string,
+): NonNullable<DexScreenerResponse["pairs"]>[number] | undefined {
+  if (!pairs) return undefined;
+  return pairs
+    .filter((p) => p.baseToken?.address === mint)
+    .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
 }
 
 interface JupiterResponse {
@@ -158,7 +178,7 @@ export class OracleService {
         const age = now - cached.fetchedAt;
         if (age < DEX_SCREENER_CACHE_TTL_MS) {
           // Cache hit — return cached value
-          const pair = sortPairsByLiquidity(cached.data.pairs)?.[0];
+          const pair = selectPairForMint(cached.data.pairs, mint);
           if (!pair?.priceUsd) return null;
           if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY_USD) return null;
           const p = parseFloat(pair.priceUsd);
@@ -190,7 +210,7 @@ export class OracleService {
 
       // M7: Validate BEFORE caching — don't cache bad responses that would
       // suppress fresh fetches for the full TTL window.
-      const pair = sortPairsByLiquidity(json.pairs)?.[0];
+      const pair = selectPairForMint(json.pairs, mint);
       if (!pair?.priceUsd) return null;
       if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY_USD) return null;
       const parsed = parseFloat(pair.priceUsd);

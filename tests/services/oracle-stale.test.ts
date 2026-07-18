@@ -65,7 +65,11 @@ describe('OracleService.getStaleMarkets', () => {
     vi.mocked(fetch).mockImplementation(async (input: any) => {
       const url = String(input);
       if (url.includes('dexscreener')) {
-        return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }) } as any;
+        // Thread the queried mint out of the request URL so the fixture's
+        // baseToken always matches whichever mint is being fetched (MINT_A,
+        // MINT_C, MINT_E, MINT_X, MINT_Y, ...).
+        const dexMint = decodeURIComponent(url.split('/tokens/')[1] ?? '');
+        return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: dexMint } }] }) } as any;
       }
       const mint = decodeURIComponent(url.split('ids=')[1] ?? '');
       return { ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as any;
