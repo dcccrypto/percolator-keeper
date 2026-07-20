@@ -74,17 +74,19 @@ jobs:
 
       # Install dependencies from the *existing* lockfile first so all other
       # packages (vitest, @solana/web3.js …) are present, then override
-      # only the SDK dep to the target npm version.  --no-frozen-lockfile is
-      # intentional: we are mutating one dep, not reproducing a build.
+      # only the SDK dep to the target npm version.
       - name: Install dependencies (frozen lockfile for non-SDK packages)
         run: pnpm install --frozen-lockfile
 
+      # `pnpm add` rewrites the lockfile by design and does NOT accept
+      # --no-frozen-lockfile (that flag belongs to `pnpm install`). Passing it
+      # made pnpm 10 abort with `Unknown option: 'frozen-lockfile'`, failing
+      # this job on every nightly run.
       - name: Override SDK dep with published npm version
         env:
           TARGET_VER: ${{ steps.sdk_ver.outputs.version }}
         run: |
-          pnpm add "@percolatorct/sdk@${TARGET_VER}" \
-            --no-frozen-lockfile
+          pnpm add "@percolatorct/sdk@${TARGET_VER}"
 
       - name: Verify installed SDK version
         env:
