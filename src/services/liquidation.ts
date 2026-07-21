@@ -1107,6 +1107,25 @@ export class LiquidationService {
       if (v17PortfolioPubkey) {
         // v17 verification: re-fetch portfolio and confirm still undercollateralized.
         // Skip the slab bitmap path (parseUsedIndices/parseAccount) which doesn't apply.
+        //
+        // #373: the try below wraps ONLY the fetch/parse of re-verification data,
+        // and fails CLOSED. It previously wrapped the drift guard and the margin
+        // recheck too, with an empty catch — so any throw (a malformed wrapper
+        // blob in parseWrapperConfigV17, a fetchClusterUnixTimeSec error, the
+        // M-6 owner-check failure in fetchSlabWithRetry) fell straight through to
+        // the send with NO checks applied.
+        //
+        // That mattered most for the oracle-drift guard, which has no on-chain
+        // counterpart: "The on-chain Liquidate instruction carries no price bound,
+        // so keeper-side drift detection is the only available mitigation." Losing
+        // it means submitting at unbounded drift with no backstop anywhere.
+        //
+        // The v12.x path below is unwrapped and already fails closed; this makes
+        // the live v17 mainnet path match it.
+        let pf: ReturnType<typeof parsePortfolioV17>;
+        let freshMarketData: Uint8Array;
+        let freshPrice: bigint;
+        let freshRiskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint } | null = null;
         try {
           const pfInfo = await withTimeout(
             connection.getAccountInfo(v17PortfolioPubkey),
@@ -1120,7 +1139,7 @@ export class LiquidationService {
             });
             return null;
           }
-          const pf = parsePortfolioV17(new Uint8Array(pfInfo.data));
+          pf = parsePortfolioV17(new Uint8Array(pfInfo.data));
           // Check there's still an active position
           const hasActive = pf.legs.some(l => l.active && l.basisPosQ !== 0n);
           if (!hasActive) {
@@ -1136,7 +1155,7 @@ export class LiquidationService {
           // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
           // unavailable (0) we keep the leg-active check + rely on the on-chain program.
           // #287 (M-6): pass programId so fetchSlab enforces the on-chain owner check.
-          const freshMarketData = await fetchSlabWithRetry(slabAddress, programId);
+          freshMarketData = await fetchSlabWithRetry(slabAddress, programId);
           // H-8: isolate this call from the outer "proceed cautiously" catch --
           // that catch's fail-open posture is meant for transient RPC failures
           // preventing re-verification entirely, not for "we got data back but
@@ -1144,7 +1163,6 @@ export class LiquidationService {
           // (which would fall through to submitting the liquidation
           // unconditionally) -- degrade to relying on the equity<=0n signal
           // alone instead.
-          let freshRiskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint } | null = null;
           try {
             const parsed = parseV17RiskParams(freshMarketData);
             freshRiskParams = {
@@ -1160,7 +1178,23 @@ export class LiquidationService {
             }
           }
           const freshNowSec = await fetchClusterUnixTimeSec(connection);
-          const freshPrice = resolveV17WrapperPrice(parseWrapperConfigV17(freshMarketData), freshNowSec);
+          freshPrice = resolveV17WrapperPrice(parseWrapperConfigV17(freshMarketData), freshNowSec);
+        } catch (err) {
+          // #373: FAIL CLOSED. We could not obtain the data the drift guard and
+          // margin recheck depend on, so we cannot assert either. Skipping this
+          // submit costs one liquidation attempt (the next scan cycle retries);
+          // proceeding would submit at unbounded drift with no on-chain bound.
+          logger.warn("v17 liquidate: pre-submit re-verification failed, aborting (fail closed)", {
+            portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+            slabAddress: slabAddress.toBase58().slice(0, 8),
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        }
+
+        // ── Checks below run OUTSIDE the try: a throw here must abort the
+        //    submit, never be swallowed into proceeding. ──────────────────────
+        {
           if (freshPrice === 0n) {
             logger.warn("v17 liquidate: no fresh price available for pre-submit recheck, aborting", {
               portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
@@ -1241,9 +1275,6 @@ export class LiquidationService {
               instructions[0] = buildIx({ programId, keys: crankKeys, data: updatedCrankData });
             }
           }
-        } catch {
-          // If we can't re-verify, proceed cautiously — the on-chain program
-          // will reject if the portfolio is already closed.
         }
       } else {
       // Bug 3: Re-read slab data and verify account before submitting (v12.x path)
