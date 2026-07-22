@@ -1071,13 +1071,16 @@ export class LiquidationService {
       // for single-asset markets). For v12.x markets, accountIdx is the slab slot.
       // #329: use the scan-time closeQ; it will be re-derived from the fresh portfolio
       // in the pre-submit recheck below and the instruction data rebuilt if changed.
+      // ABI: close_q/fee_bps were REMOVED from the PermissionlessCrank wire
+      // upstream (#206) — the program derives the close size from on-chain
+      // portfolio state at execution time rather than trusting a caller-supplied
+      // quantity. `closeQ` is therefore still used for the keeper's OWN
+      // scan/eligibility decisions below, but it no longer reaches the chain.
       let effectiveCloseQ = closeQ;
       const crankData = encodePermissionlessCrank({
         action: CrankAction.Liquidate,
         assetIndex: accountIdx, // v17: leg.assetIndex; v12: slab slot
         nowSlot,
-        closeQ: effectiveCloseQ,
-        feeBps: 0n,
         recoveryReason: 0,
       });
 
@@ -1225,20 +1228,16 @@ export class LiquidationService {
               });
               return null;
             }
-            // #329: If the fresh closeQ differs from the scan-time value (position
-            // partially closed), rebuild the crank instruction with the updated value
-            // so the on-chain close_q matches the actual remaining position size.
+            // #329 (SUPERSEDED BY UPSTREAM #206): this used to rebuild the crank
+            // instruction when the position had partially closed between scan and
+            // submit, so the encoded close_q matched the remaining size. close_q
+            // is no longer part of the wire — the program reads the portfolio and
+            // derives the close size itself — so the rebuilt bytes would be
+            // identical to the original and the whole hazard #329 addressed is
+            // now handled on-chain. The fresh read is kept because the tracked
+            // value still feeds the keeper's post-submit accounting below.
             if (freshCloseQ > 0n && freshCloseQ !== effectiveCloseQ) {
               effectiveCloseQ = freshCloseQ;
-              const updatedCrankData = encodePermissionlessCrank({
-                action: CrankAction.Liquidate,
-                assetIndex: accountIdx,
-                nowSlot,
-                closeQ: effectiveCloseQ,
-                feeBps: 0n,
-                recoveryReason: 0,
-              });
-              instructions[0] = buildIx({ programId, keys: crankKeys, data: updatedCrankData });
             }
           }
         } catch {
