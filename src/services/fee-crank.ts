@@ -56,6 +56,7 @@ import {
   deriveLpBackingLedger,
   deriveLpVaultRegistry,
   deriveStakePool,
+  deriveCanonicalVault,
   deriveVaultAuthority,
   encodeExpireBackingBucket,
   encodeLpVaultCrankFees,
@@ -506,13 +507,7 @@ export const insuranceReserveToStakeLeg: CrankLeg = {
 
     const cfg = parseWrapperConfigV17(data);
     const [vaultAuthority] = deriveVaultAuthority(programId, address);
-    const marketVaultToken = resolveMarketVaultToken(cfg);
-    if (marketVaultToken === null) {
-      logger.debug("market vault token account unresolved, skipping tag 87", {
-        market: address.toBase58().slice(0, 8),
-      });
-      return [];
-    }
+    const marketVaultToken = resolveMarketVaultToken(programId, address, cfg);
 
     const ix = buildIx({
       programId,
@@ -579,8 +574,7 @@ export const protocolFeeLeg: CrankLeg = {
       return [];
     }
 
-    const marketVaultToken = resolveMarketVaultToken(cfg);
-    if (marketVaultToken === null) return [];
+    const marketVaultToken = resolveMarketVaultToken(programId, address, cfg);
     const [vaultAuthority] = deriveVaultAuthority(programId, address);
 
     const ix = buildIx({
@@ -625,31 +619,38 @@ function resolveProtocolFeeDestination(): PublicKey | null {
 }
 
 /**
- * The market's collateral vault token account.
+ * The market's collateral vault token account — DERIVED, per market.
  *
- * ⚠ DEPENDENCY. The v17 wrapper config does not carry the vault token account
- * pubkey directly — the program derives/validates it via
- * `verify_withdrawable_token_accounts` against the vault authority PDA and the
- * collateral mint. Resolving it correctly means computing the canonical ATA of
- * `collateralMint` under the vault-authority PDA. Rather than reimplement ATA
- * derivation (and its Token-2022 branch) here, this reads an operator-provided
- * override and returns null otherwise, which makes the affected legs skip
- * rather than send a malformed transaction.
+ * The v17 wrapper config does not store the vault token pubkey; the program
+ * computes it (`canonical_vault_address`, v16_program.rs) as the Associated
+ * Token Account of the market's `["vault", market]` authority PDA for the
+ * collateral mint, and pins the market to that single address (F-VAULT-FRAG) in
+ * `verify_withdrawable_token_accounts`. `deriveCanonicalVault` (SDK >= 4.2.0)
+ * reproduces that derivation seed-for-seed, so we derive it here rather than
+ * being told it.
  *
- * See the report: this is the one remaining piece that must be wired before
- * tags 84/87 can run for real. Tag 89 — the liveness-critical one — does not
- * need it, because it touches no token accounts.
+ * There is no Token-2022 branch to handle: `verify_token_program` rejects any
+ * token program that is not `spl_token::ID`, and `unpack_token_account` rejects
+ * any token account not OWNED by `spl_token::ID`, so the ATA's middle seed is
+ * always legacy SPL Token. The SDK pins the same constant.
+ *
+ * PREVIOUSLY this read a single global `KEEPER_MARKET_VAULT_TOKEN` env var and
+ * returned null when unset. That was wrong in two ways, both observed on the
+ * first real v17 market:
+ *   1. Unset (the default) silently disabled BOTH revenue legs — tags 84 and 87
+ *      no-opped forever while fees accrued, with only a debug line.
+ *   2. Set, it is a per-PROCESS constant standing in for a per-MARKET address.
+ *      With more than one market it would send some other market's vault, which
+ *      the F-VAULT-FRAG pin rejects as InvalidVaultAccount (12) — a guaranteed
+ *      revert on every market but one.
  */
 function resolveMarketVaultToken(
-  _cfg: ReturnType<typeof parseWrapperConfigV17>,
-): PublicKey | null {
-  const raw = (process.env.KEEPER_MARKET_VAULT_TOKEN ?? "").trim();
-  if (raw === "") return null;
-  try {
-    return new PublicKey(raw);
-  } catch {
-    return null;
-  }
+  programId: PublicKey,
+  market: PublicKey,
+  cfg: ReturnType<typeof parseWrapperConfigV17>,
+): PublicKey {
+  const [vaultToken] = deriveCanonicalVault(programId, market, cfg.collateralMint);
+  return vaultToken;
 }
 
 // ─── The driver ───────────────────────────────────────────────────────────────

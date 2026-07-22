@@ -216,20 +216,26 @@ export async function keeperSend(
 
   // v17 cutover (issue #176): the wrapper program installs a custom 128KB heap
   // allocator and aborts ("Access violation in heap section") on its first heap
-  // allocation unless the transaction requests the matching heap frame. Every
-  // keeper send path (crank InitUser/CrankLpVaultFees/RestartAssetOracle/
-  // PermissionlessCrank + liquidation Liquidate) carries a wrapper instruction,
-  // so prepend the request here as the FIRST instruction. 131072 = 128*1024 ==
-  // the program's V16_HEAP_FRAME_BYTES. The CU limit is left to estimateCost /
-  // simulatedCu, so no setComputeUnitLimit is added here.
-  instructions = [
+  // allocation unless the transaction requests the matching heap frame.
+  // 131072 = 128*1024 == the program's V16_HEAP_FRAME_BYTES.
+  //
+  // This is prepended for SIMULATION ONLY. `sendWithRetryKeeper` builds its own
+  // transaction and already prepends the heap frame itself — unconditionally, as
+  // `DEFAULT_KEEPER_OPTS.heapFrameBytes` is always set — plus setComputeUnitLimit
+  // and setComputeUnitPrice. Prepending a second copy into the array handed to it
+  // produced TWO identical requestHeapFrame instructions and the runtime rejected
+  // the whole transaction: "Transaction contains a duplicate instruction (3)"
+  // ([0] heapFrame, [1] cuLimit, [2] cuPrice, [3] the duplicate). That aborted
+  // every keeperSend path, all four fee-crank legs included, before it ever
+  // reached the program.
+  const simulationInstructions = [
     ComputeBudgetProgram.requestHeapFrame({ bytes: 131072 }),
     ...instructions,
   ];
 
   const { estimatedCost, simulatedCu, provenToFail, simError } = await estimateCost(
     connection,
-    instructions,
+    simulationInstructions,
     signers,
     txType,
     extraLamports,
