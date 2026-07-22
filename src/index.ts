@@ -12,6 +12,7 @@ import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { CURRENT_NETWORK } from "./network.js";
 import { assertMainnetProgramId, assertProgramIdAllowList } from "./lib/boot-assertions.js";
+import { assertV17LayoutGeneration } from "./lib/v17-layout.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
 import * as metricsServer from "./lib/metrics-server.js";
@@ -83,6 +84,13 @@ assertMainnetProgramId({ isMainnet: isMainnet(), programId: config.programId });
 // Validate the full discovery/signing program set (config.allProgramIds), not
 // just the single config.programId — discovery scans and signs against every entry.
 assertProgramIdAllowList({ isMainnet: isMainnet(), allProgramIds: config.allProgramIds });
+// Refuse to start against an SDK whose v17 account layout does not match the
+// deployed wrapper. The keeper reads market accounts by raw byte offset — there
+// is no discriminator and no error return on a wrong-offset read, it just
+// yields plausible garbage. A stale SDK pin is exactly how the keeper ended up
+// reading every v17 market at the 432-byte (two generations old) layout, so a
+// mismatch has to be a startup crash rather than a silent misparse.
+assertV17LayoutGeneration();
 if (isMainnet()) {
   logger.info("Running in MAINNET mode", { programId: config.programId });
 }

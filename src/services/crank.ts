@@ -37,6 +37,7 @@ import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
+import { isFeeCrankEnabled, runFeeCrankPass } from "./fee-crank.js";
 
 export type CrankResult = "success" | "skipped" | "failed";
 
@@ -246,7 +247,10 @@ async function discoverV17Markets(
       const data = new Uint8Array(account.data);
       if (!isV17Account(data)) continue;
 
-      // Parse the v17 wrapper config (starts at offset 16, 432 bytes)
+      // Parse the v17 wrapper config (starts at V17_HEADER_LEN, spans
+      // V17_WRAPPER_CONFIG_LEN bytes — currently 576, was 496 pre-fee-split and
+      // 432 before the protocol-fee change; the SDK owns the number, see
+      // lib/v17-layout.ts).
       const wrapperCfg = parseWrapperConfigV17(data);
       const marketConfig = wrapperConfigV17ToMarketConfig(wrapperCfg);
 
@@ -1488,12 +1492,14 @@ export class CrankService {
         return "skipped";
       }
 
+      // ABI: close_q/fee_bps were REMOVED from the PermissionlessCrank wire
+      // upstream (#206) — the program derives the close size itself and rejects
+      // a nonzero funding rate. Passing them was a no-op at best; the SDK now
+      // rejects them at compile time.
       const crankData = encodePermissionlessCrank({
         action: CrankAction.FeeSweep,
         assetIndex: 0,
         nowSlot,
-        closeQ: 0n,
-        feeBps: 0n,
         recoveryReason: 0,
       });
 
@@ -1795,7 +1801,34 @@ export class CrankService {
     // of toCrank, which includes markets whose own crank failed this batch).
     // Uses Promise.allSettled so failures don't block the cycle but work IS
     // tracked so shutdown can complete before new enqueues race the drain.
-    if (succeededSlabs.size > 0 && this._isRunning) {
+    // ─── v17 fee-split + backing-bucket recovery (tags 89/78/87/84) ──────────
+    // Supersedes the blind per-market crankLpVault() call below for v17 markets:
+    // that one fired tag 78 at every market every cycle without reading state,
+    // paying for a guaranteed revert whenever there were no fees and logging
+    // every rejection — including genuine faults — as "no fees to crank".
+    // runFeeCrankPass reads each market once and only sends where there is
+    // pending work. OFF unless KEEPER_FEE_CRANK_ENABLED=true.
+    if (succeededSlabs.size > 0 && this._isRunning && isFeeCrankEnabled()) {
+      const feeCrankMarkets: { address: PublicKey; programId: PublicKey }[] = [];
+      for (const slabAddress of succeededSlabs) {
+        const state = this.markets.get(slabAddress);
+        if (!state) continue;
+        feeCrankMarkets.push({
+          address: state.market.slabAddress,
+          programId: state.market.programId,
+        });
+      }
+      try {
+        await runFeeCrankPass(getConnection(), this._keypair, feeCrankMarkets);
+      } catch (err) {
+        // Whole-pass failure must never abort the crank cycle.
+        logger.warn("fee-crank pass threw (isolated)", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (succeededSlabs.size > 0 && this._isRunning && !isFeeCrankEnabled()) {
       const connection = getConnection();
       const keypair = this._keypair;
       const lpVaultTasks: Promise<void | string | null>[] = [];
