@@ -5,11 +5,19 @@ import {
   V17RiskParamsCorruptedError,
 } from "../src/lib/v17-risk.js";
 
-const V17_HEADER_LEN = 16;
-const V17_WRAPPER_CONFIG_LEN = 432;
-const V17_MARKET_GROUP_OFF = V17_HEADER_LEN + V17_WRAPPER_CONFIG_LEN;
-const V17_MARKET_GROUP_ID_LEN = 32;
-const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_ID_LEN;
+// Layout constants come from the SDK via v17-layout.ts. This test previously
+// duplicated the stale `V17_WRAPPER_CONFIG_LEN = 432` literal, so it wrote its
+// fixture bytes at exactly the same wrong offsets the parser read them from —
+// the test passed while the parser was misreading every live account. A test
+// that shares the bug under test cannot detect it; both sides now derive from
+// one source.
+import {
+  MG_CONFIG_OFF,
+  V17_HEADER_LEN,
+  V17_MARKET_GROUP_OFF,
+} from "../src/lib/v17-layout.js";
+
+const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + MG_CONFIG_OFF;
 
 function writeU64LE(data: Uint8Array, offset: number, value: bigint): void {
   for (let i = 0; i < 8; i++) {
