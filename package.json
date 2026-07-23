@@ -12,7 +12,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@percolatorct/sdk": "file:../percolator-sdk",
+    "@percolatorct/sdk": "github:dcccrypto/percolator-sdk#ac68ac3f45fb3a069866308727c0fd40e8293d2e",
     "@percolatorct/shared": "github:dcccrypto/percolator-shared#052edb592023de7c097f46edf8fba9a1cb20423f",
     "@solana/web3.js": "^1.98.0",
     "@upstash/redis": "^1.38.0",
