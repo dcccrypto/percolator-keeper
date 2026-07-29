@@ -227,7 +227,8 @@ export async function keeperSend(
   // the whole transaction: "Transaction contains a duplicate instruction (3)"
   // ([0] heapFrame, [1] cuLimit, [2] cuPrice, [3] the duplicate). That aborted
   // every keeperSend path, all four fee-crank legs included, before it ever
-  // reached the program.
+  // reached the program. So the ORIGINAL `instructions` (no local heap frame) is
+  // what gets handed to sendWithRetryKeeper below.
   const simulationInstructions = [
     ComputeBudgetProgram.requestHeapFrame({ bytes: 131072 }),
     ...instructions,
