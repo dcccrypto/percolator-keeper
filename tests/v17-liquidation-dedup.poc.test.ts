@@ -1,3 +1,4 @@
+import { LRUCache } from "lru-cache";
 import { PublicKey } from "@solana/web3.js";
 import { describe, expect, it, vi } from "vitest";
 import { LiquidationService } from "../src/services/liquidation.js";
@@ -30,6 +31,12 @@ function makeHarness(): {
   // H-1: bypassing the constructor via Object.create skips class field
   // initializers, so this must be seeded explicitly too.
   service._inFlightPositions = new Set<string>();
+  // BUG-103 added a _positionBackoff field that gatedLiquidate dereferences on
+  // its first line, so it has to be seeded here for the same reason as above.
+  service._positionBackoff = new LRUCache<string, { failures: number; retryAfter: number }>({
+    max: 2_000,
+  });
+  service._submitAttempts = 0;
   service.liquidate = vi.fn(async () => `sig-${service.liquidate.mock.calls.length}`);
   return { service };
 }

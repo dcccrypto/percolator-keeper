@@ -1791,9 +1791,13 @@ describe('LiquidationService', () => {
       const market = makeMarketAt(slab);
       const candidate = makeCandidate(slab, 1, owner);
 
+      // Model a transaction that was actually broadcast and failed. liquidate()
+      // calls recordAttempt() (bumping _submitAttempts) immediately before handing
+      // the tx to keeperSend, and every earlier `return null` sits above that line.
+      // Only a post-submit failure costs a fee, so only that arms the backoff.
       const liquidateSpy = vi
         .spyOn(svc, 'liquidate')
-        .mockResolvedValueOnce(null)
+        .mockImplementationOnce(async () => { (svc as any)._submitAttempts++; return null; })
         .mockResolvedValueOnce('sig-ok');
 
       const first = await (svc as any).gatedLiquidate(market, candidate);
@@ -1811,7 +1815,9 @@ describe('LiquidationService', () => {
       const market = makeMarketAt(slab);
       const candidate = makeCandidate(slab, 1, owner);
 
-      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue(null);
+      const liquidateSpy = vi
+        .spyOn(svc, 'liquidate')
+        .mockImplementation(async () => { (svc as any)._submitAttempts++; return null; });
 
       // Failure 1: free retry (matches existing single-abort semantics).
       expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull();
@@ -1838,8 +1844,8 @@ describe('LiquidationService', () => {
 
       const liquidateSpy = vi
         .spyOn(svc, 'liquidate')
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce(null)
+        .mockImplementationOnce(async () => { (svc as any)._submitAttempts++; return null; })
+        .mockImplementationOnce(async () => { (svc as any)._submitAttempts++; return null; })
         .mockResolvedValueOnce('sig-final');
 
       expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull(); // failure 1 (free)
@@ -1856,6 +1862,109 @@ describe('LiquidationService', () => {
       expect(await (svc as any).gatedLiquidate(market, candidate)).toBe('sig-final');
       expect(liquidateSpy).toHaveBeenCalledTimes(3);
       expect((svc as any)._positionBackoff.has(positionKey)).toBe(false);
+    });
+
+    it('does NOT arm backoff when liquidate aborts before broadcasting anything', async () => {
+      // Every pre-submit `return null` in liquidate() -- the oracle-drift guard,
+      // the #373 fail-closed re-verification, "no longer undercollateralized" --
+      // sits ABOVE recordAttempt(), so none of them costs a transaction fee.
+      // Backing off on those would blind the keeper to a genuinely underwater
+      // position because an RPC call happened to fail, which is the opposite of
+      // what a liquidator should do during the volatility that causes bad debt.
+      const svc = new LiquidationService(mockOracleService as any);
+      const slab = 'SlabAbort11111111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 1, 'OwnerAbort11111111111111111111111111111111');
+
+      // No _submitAttempts bump: nothing reached the wire.
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue(null);
+
+      for (let i = 0; i < 3; i++) {
+        expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull();
+        clearCycleState(svc);
+      }
+
+      expect(liquidateSpy).toHaveBeenCalledTimes(3);
+      expect((svc as any)._positionBackoff.size).toBe(0);
+    });
+
+    it('does NOT arm backoff while the budget circuit breaker is halted', async () => {
+      // A halted budget makes keeperSend return null for EVERY position
+      // (keeper-send.ts: `if (!budget.canSpend(...)) return null`). Arming backoff
+      // there would put every tracked position into escalating cooldown
+      // simultaneously, so the keeper would still be refusing to liquidate long
+      // after an operator resumed it -- turning one halt into a much longer outage.
+      const svc = new LiquidationService(mockOracleService as any);
+      const slab = 'SlabHalt111111111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 1, 'OwnerHalt111111111111111111111111111111111');
+
+      const liquidateSpy = vi
+        .spyOn(svc, 'liquidate')
+        .mockImplementation(async () => { (svc as any)._submitAttempts++; return null; });
+
+      keeperSendModule.sharedBudget.haltManually('test cordon');
+      try {
+        for (let i = 0; i < 3; i++) {
+          expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull();
+          clearCycleState(svc);
+        }
+      } finally {
+        keeperSendModule.sharedBudget.resume('test');
+      }
+
+      expect(liquidateSpy).toHaveBeenCalledTimes(3);
+      expect((svc as any)._positionBackoff.size).toBe(0);
+    });
+
+    it('caps the escalating cooldown at 60s rather than 5 minutes', async () => {
+      // 300s was chosen to "match maxBackoffMs", but a position that is genuinely
+      // liquidatable must not be ignored for five minutes -- that is long enough
+      // for a cascade to accrue bad debt the protocol then eats.
+      const svc = new LiquidationService(mockOracleService as any);
+      const slab = 'SlabCap1111111111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 1, 'OwnerCap1111111111111111111111111111111111');
+      const positionKey = `${slab}:v12:1`;
+
+      vi.spyOn(svc, 'liquidate')
+        .mockImplementation(async () => { (svc as any)._submitAttempts++; return null; });
+
+      let lastDelay = 0;
+      for (let i = 0; i < 8; i++) {
+        const t = Date.now();
+        await (svc as any).gatedLiquidate(market, candidate);
+        clearCycleState(svc);
+        const entry = (svc as any)._positionBackoff.get(positionKey);
+        lastDelay = entry.retryAfter - t;
+        entry.retryAfter = Date.now() - 1; // expire so the next call escalates
+      }
+
+      expect(lastDelay).toBeLessThanOrEqual(60_000);
+      // ...and it really did escalate rather than the cap being trivially met.
+      expect(lastDelay).toBeGreaterThan(30_000);
+    });
+
+    it('bounds the backoff map so positions that vanish cannot leak', async () => {
+      // Entries are only deleted on a landed liquidation. A position that is
+      // closed by its owner, or liquidated by somebody else, leaves its entry
+      // behind forever -- an unbounded Map on a long-running process.
+      const svc = new LiquidationService(mockOracleService as any);
+      const slab = 'SlabLeak111111111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+
+      vi.spyOn(svc, 'liquidate')
+        .mockImplementation(async () => { (svc as any)._submitAttempts++; return null; });
+
+      const cap = (svc as any)._positionBackoff.max;
+      expect(cap).toBeTypeOf('number'); // a plain Map has no `max`
+
+      for (let i = 0; i < cap + 50; i++) {
+        await (svc as any).gatedLiquidate(market, makeCandidate(slab, i, `Owner${i}`));
+        clearCycleState(svc);
+      }
+
+      expect((svc as any)._positionBackoff.size).toBeLessThanOrEqual(cap);
     });
   });
 });
