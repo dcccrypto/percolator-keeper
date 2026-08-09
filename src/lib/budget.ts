@@ -25,6 +25,7 @@
  * concurrent canSpend() / recordTx() callers.
  */
 
+import fs from "node:fs";
 import { createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("keeper:budget");
@@ -111,6 +112,16 @@ export interface KeeperBudgetDeps {
   /** Fired when a latched halt is cleared (resume()). Lets callers reset a
    *  halted gauge without coupling this class to the metrics layer. */
   onResume?: () => void;
+  /**
+   * BUG-106: when set, a latched halt is persisted to this local file (and
+   * restored from it at construction) so a process crash/restart does not
+   * silently resume spending into whatever condition caused the halt.
+   * Unset by default -- every existing/test instance is unaffected unless it
+   * opts in explicitly. Covers process-level restarts that reuse the same
+   * filesystem (the common automatic-restart case); a full container
+   * recreate on an ephemeral filesystem is not covered.
+   */
+  haltStatePath?: string;
 }
 
 interface SpendEvent {
@@ -203,6 +214,7 @@ export class KeeperBudget {
   private _isHalted = false;
   private _haltKind: HaltKind | undefined;
   private _haltReason: string | undefined;
+  private readonly _haltStatePath: string | undefined;
 
   // M12: realized-cost reconciliation telemetry.
   private _realizedCostDriftLamports = 0;
@@ -214,6 +226,76 @@ export class KeeperBudget {
     this._now = deps.now ?? (() => Date.now());
     this._onHalt = deps.onHalt;
     this._onResume = deps.onResume;
+    this._haltStatePath = deps.haltStatePath;
+    this._restoreHaltState();
+  }
+
+  /**
+   * BUG-106: restore a latched halt persisted by a previous process, if any.
+   * A halt that was never resumed before a restart must keep the keeper
+   * halted -- silently resuming would defeat the entire point of a
+   * manual-resume-only breaker. Fires onHalt again so paging/metrics react
+   * exactly as if the halt had just occurred.
+   */
+  private _restoreHaltState(): void {
+    if (!this._haltStatePath) return;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this._haltStatePath, "utf8");
+    } catch {
+      return; // no persisted halt — start clean
+    }
+    try {
+      const parsed = JSON.parse(raw) as { kind?: HaltKind; reason?: string };
+      if (!parsed.kind || !parsed.reason) return;
+      this._isHalted = true;
+      this._haltKind = parsed.kind;
+      this._haltReason = parsed.reason;
+      logger.error(
+        "Restored a latched budget halt from a previous run — keeper is starting " +
+          "halted. This halt was never resume()d before the process restarted; " +
+          "investigate the original cause before calling resume().",
+        { kind: parsed.kind, reason: parsed.reason, path: this._haltStatePath },
+      );
+      try {
+        this._onHalt?.(parsed.kind, parsed.reason);
+      } catch (err) {
+        logger.warn("onHalt hook threw while restoring a persisted halt — ignoring", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } catch (err) {
+      logger.warn("Failed to parse persisted budget halt state — starting clean", {
+        path: this._haltStatePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private _persistHaltState(): void {
+    if (!this._haltStatePath) return;
+    try {
+      fs.writeFileSync(
+        this._haltStatePath,
+        JSON.stringify({ kind: this._haltKind, reason: this._haltReason, haltedAt: this._now() }),
+        "utf8",
+      );
+    } catch (err) {
+      logger.warn("Failed to persist budget halt state — a restart will not remember this halt", {
+        path: this._haltStatePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private _clearHaltStateFile(): void {
+    if (!this._haltStatePath) return;
+    try {
+      fs.unlinkSync(this._haltStatePath);
+    } catch {
+      // Nothing to remove, or removal failed — not critical; the next halt
+      // (if any) overwrites it, and a missing file is treated as no-halt.
+    }
   }
 
   /**
@@ -538,6 +620,7 @@ export class KeeperBudget {
     this._isHalted = false;
     this._haltKind = undefined;
     this._haltReason = undefined;
+    this._clearHaltStateFile();
     try {
       this._onResume?.();
     } catch (err) {
@@ -560,6 +643,7 @@ export class KeeperBudget {
     this._isHalted = true;
     this._haltKind = kind;
     this._haltReason = reason;
+    this._persistHaltState();
     logger.error("Keeper budget halted — refusing further sends until manual resume()", {
       kind,
       reason,

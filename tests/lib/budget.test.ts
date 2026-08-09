@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { KeeperBudget, type TxResult } from "../../src/lib/budget.js";
 
 function makeClock(start = 1_700_000_000_000) {
@@ -746,5 +749,84 @@ describe("KeeperBudget — M12 adjustForRealizedCost", () => {
       expect(s.realizedCostDriftLamports).toBe(75);
       expect(s.realizedCostSamples).toBe(1);
     });
+  });
+});
+
+// BUG-106: a latched halt was purely in-memory -- a process crash/restart
+// silently resumed spending into whatever condition tripped the breaker,
+// with no record that it was ever halted. haltStatePath is opt-in (undefined
+// by default) so every test above, and every consumer that doesn't pass it,
+// is completely unaffected.
+describe("KeeperBudget — BUG-106: halt-state persistence", () => {
+  function tempHaltPath(): string {
+    return path.join(os.tmpdir(), `keeper-budget-halt-test-${Math.random().toString(36).slice(2)}.json`);
+  }
+
+  it("does not touch the filesystem when haltStatePath is not set", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+    b.haltManually("cordon");
+    expect(b.isHalted()).toBe(true);
+    // No haltStatePath was given — nothing to assert on disk, just confirms
+    // the existing in-memory-only behavior is unchanged when opted out.
+  });
+
+  it("persists a halt to disk and restores it in a fresh instance constructed with the same path", () => {
+    const haltStatePath = tempHaltPath();
+    try {
+      const clock = makeClock();
+      const b1 = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath });
+      b1.haltManually("cordoning for deploy");
+      expect(fs.existsSync(haltStatePath)).toBe(true);
+
+      // Simulates a process restart: a brand-new instance, same path.
+      const onHalt = vi.fn();
+      const b2 = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath, onHalt });
+      expect(b2.isHalted()).toBe(true);
+      expect(b2.haltKind).toBe("operator");
+      expect(b2.canSpend(1, "crank")).toBe(false);
+      // The restore re-fires onHalt so paging/metrics react as if it just happened.
+      expect(onHalt).toHaveBeenCalledWith("operator", "cordoning for deploy");
+    } finally {
+      fs.rmSync(haltStatePath, { force: true });
+    }
+  });
+
+  it("clears the persisted file on resume — a later restart starts clean", () => {
+    const haltStatePath = tempHaltPath();
+    try {
+      const clock = makeClock();
+      const b1 = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath });
+      b1.haltManually("cordon");
+      expect(fs.existsSync(haltStatePath)).toBe(true);
+      b1.resume("op");
+      expect(fs.existsSync(haltStatePath)).toBe(false);
+
+      const b2 = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath });
+      expect(b2.isHalted()).toBe(false);
+      expect(b2.canSpend(1, "crank")).toBe(true);
+    } finally {
+      fs.rmSync(haltStatePath, { force: true });
+    }
+  });
+
+  it("starts clean when the configured path has no file yet", () => {
+    const haltStatePath = tempHaltPath(); // never written
+    const clock = makeClock();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath });
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("starts clean and logs rather than throwing when the persisted file is malformed", () => {
+    const haltStatePath = tempHaltPath();
+    try {
+      fs.writeFileSync(haltStatePath, "{not valid json", "utf8");
+      const clock = makeClock();
+      expect(() => new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath })).not.toThrow();
+      const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, haltStatePath });
+      expect(b.isHalted()).toBe(false);
+    } finally {
+      fs.rmSync(haltStatePath, { force: true });
+    }
   });
 });

@@ -39,7 +39,12 @@ vi.mock('@solana/web3.js', async () => {
 });
 
 // Mock external dependencies
-vi.mock('@percolatorct/sdk', () => ({
+// Partial mock: real exports fill anything this factory does not override.
+// A full-replacement mock silently breaks whenever the source under test
+// imports a new SDK export (e.g. the v17 layout constants), and the failure
+// surfaces as an unrelated "no export defined on the mock" at import time.
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   fetchSlab: vi.fn(),
   parseConfig: vi.fn(),
   parseEngine: vi.fn(),
@@ -165,6 +170,7 @@ import { LiquidationService } from '../../src/services/liquidation.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
 import * as keeperSendModule from '../../src/lib/keeper-send.js';
+import * as v17risk from '../../src/lib/v17-risk.js';
 
 // Zero key (all zeros) - used for Pyth-pinned oracleAuthority and Hyperp indexFeedId
 const ZERO_KEY = (() => {
@@ -684,6 +690,156 @@ describe('LiquidationService', () => {
   });
 
   describe('liquidate', () => {
+    // #373: the v17 pre-submit re-verification used to wrap the drift guard and
+    // the margin recheck in `try { … } catch { /* proceed cautiously */ }`. Any
+    // throw inside it fell through to the send with NO checks applied — and the
+    // oracle-drift guard has no on-chain counterpart, so a drifted liquidation
+    // had no backstop anywhere. It must fail CLOSED instead.
+    describe('#373: pre-submit re-verification fails closed', () => {
+      function v17Fixture() {
+        const nowSec = BigInt(Math.floor(Date.now() / 1000));
+        const clockData = Buffer.alloc(40);
+        clockData.writeBigInt64LE(nowSec, 32);
+        const slabAddress = new PublicKey('11111111111111111111111111111111');
+        const portfolioPubkey = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+        const connection = {
+          getSlot: vi.fn(async () => 200),
+          getAccountInfo: vi.fn(async (pubkey: PublicKey) => {
+            if (pubkey.toBase58() === portfolioPubkey.toBase58()) {
+              return { data: new Uint8Array([1, 2, 3]) };
+            }
+            return { data: clockData };
+          }),
+        };
+
+        vi.mocked(shared.getConnection)
+          .mockReturnValueOnce(connection as any)
+          .mockReturnValueOnce(connection as any);
+        vi.mocked(core.fetchSlab).mockResolvedValueOnce(new Uint8Array(512));
+        vi.mocked(core.parsePortfolioV17).mockReturnValueOnce({
+          owner: new PublicKey('So11111111111111111111111111111111111111112'),
+          capital: 1_000_000n,
+          pnl: 0n,
+          feeCredits: 0n,
+          legs: [{ active: true, basisPosQ: 100_000_000_000n, assetIndex: 0 }],
+        } as any);
+
+        const market = {
+          slabAddress,
+          programId: slabAddress,
+          config: {
+            collateralMint: slabAddress,
+            oracleAuthority: mockNonZeroKey(),
+            indexFeedId: mockZeroKey(),
+          },
+          params: { maintenanceMarginBps: 500n },
+          header: { admin: mockZeroKey() },
+        };
+
+        return { market, portfolioPubkey, nowSec };
+      }
+
+      it('does NOT submit when parseWrapperConfigV17 throws on malformed wrapper bytes', async () => {
+        const { market, portfolioPubkey } = v17Fixture();
+
+        // The exact trigger from the report: malformed/edge wrapper bytes. The
+        // throw lands before the drift guard, the freshPrice===0 abort and the
+        // margin recheck have run.
+        vi.mocked(core.parseWrapperConfigV17).mockImplementationOnce(() => {
+          throw new RangeError('offset is out of bounds');
+        });
+
+        const sig = await liquidationService.liquidate(
+          market as any,
+          0,
+          portfolioPubkey,
+          1_000_000n,
+          100_000_000_000n,
+        );
+
+        expect(sig).toBeNull();
+        expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
+      });
+
+      it('does NOT submit when the slab re-fetch throws (M-6 owner-check failure)', async () => {
+        const { market, portfolioPubkey } = v17Fixture();
+
+        // fetchSlabWithRetry surfaces the on-chain owner-check failure as a
+        // throw; swallowing it would submit against an unverified slab.
+        vi.mocked(core.fetchSlab).mockReset();
+        vi.mocked(core.fetchSlab).mockRejectedValue(
+          new Error('slab account not owned by expected program'),
+        );
+
+        const sig = await liquidationService.liquidate(
+          market as any,
+          0,
+          portfolioPubkey,
+          1_000_000n,
+          100_000_000_000n,
+        );
+
+        expect(sig).toBeNull();
+        expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
+      });
+
+      it('still RUNS the drift + margin checks when re-verification succeeds', async () => {
+        // The contrast case. Without it, "fail closed" could be implemented as
+        // "always return null" and the two tests above would still pass.
+        //
+        // Asserted via readRawOracleTargetPriceForAsset, which
+        // evaluateV17PortfolioHealth reads (#335) — it is only reachable once
+        // execution gets PAST the fetch/parse block into the margin recheck.
+        // (Asserting an actual submit would need a realistic v17 slab buffer;
+        // no test in this suite has one, and a fake would prove nothing.)
+        const { market, portfolioPubkey, nowSec } = v17Fixture();
+
+        vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+          oracleMode: 2, // EWMA_MARK
+          maxStalenessSecs: 60n,
+          oracleTargetPriceE6: 0n,
+          // Must be fresh: resolveV17WrapperPrice returns 0n for a stale EWMA,
+          // which would abort on the freshPrice===0 guard before the drift and
+          // margin checks — i.e. this test would pass for the wrong reason.
+          oracleTargetPublishTime: nowSec,
+          markEwmaE6: 1_000_000n, // == scanPriceE6 → zero drift, so the guard passes
+        } as any);
+        vi.mocked(v17risk.readRawOracleTargetPriceForAsset).mockClear();
+
+        await liquidationService.liquidate(
+          market as any,
+          0,
+          portfolioPubkey,
+          1_000_000n,
+          100_000_000_000n,
+        );
+
+        expect(v17risk.readRawOracleTargetPriceForAsset).toHaveBeenCalled();
+      });
+
+      it('never reaches the margin recheck when re-verification throws', async () => {
+        // Mirror of the assertion above — proves the fail-closed path really
+        // does skip the downstream work, rather than the two just differing by
+        // return value.
+        const { market, portfolioPubkey } = v17Fixture();
+
+        vi.mocked(core.parseWrapperConfigV17).mockImplementationOnce(() => {
+          throw new RangeError('offset is out of bounds');
+        });
+        vi.mocked(v17risk.readRawOracleTargetPriceForAsset).mockClear();
+
+        await liquidationService.liquidate(
+          market as any,
+          0,
+          portfolioPubkey,
+          1_000_000n,
+          100_000_000_000n,
+        );
+
+        expect(v17risk.readRawOracleTargetPriceForAsset).not.toHaveBeenCalled();
+      });
+    });
+
     it('aborts v17 liquidation when fresh wrapper price drifts beyond the configured limit', async () => {
       const nowSec = BigInt(Math.floor(Date.now() / 1000));
       const clockData = Buffer.alloc(40);
@@ -721,7 +877,12 @@ describe('LiquidationService', () => {
         oracleMode: 2, // EWMA_MARK
         maxStalenessSecs: 60n,
         oracleTargetPriceE6: 0n,
-        oracleTargetPublishTime: 0n,
+        // Was 0n, which makes resolveV17WrapperPrice treat the EWMA as stale and
+        // return 0n — so this test aborted on the freshPrice===0 guard and never
+        // reached the drift check. It passed with the drift guard entirely
+        // disabled. A fresh publish time makes the price resolve so the 100%
+        // drift below (1.0 -> 2.0 vs a 150bps limit) is what actually aborts.
+        oracleTargetPublishTime: nowSec,
         markEwmaE6: 2_000_000n,
       } as any);
 
@@ -1464,6 +1625,121 @@ describe('LiquidationService', () => {
 
       release('sig-first');
       expect(await firstCall).toBe('sig-first');
+    });
+  });
+
+  // BUG-104: the LaserStream event path's 1s debounce only coalesces updates
+  // *within* one window -- it does not bound the sustained rate of distinct
+  // windows. Rapid open/close/reopen on a single account re-arms a fresh
+  // debounce timer each time, forcing a full scanMarket() RPC fan-out far
+  // more often than the 60s polling cycle would, with no breaker noticing
+  // (no liquidation tx is ever sent, so the SOL-spend budget is untouched --
+  // only RPC quota/CPU is burned).
+  describe('BUG-104: per-market event-scan rate limit', () => {
+    function makeMarketAt(slabAddr: string) {
+      return {
+        slabAddress: { toBase58: () => slabAddr, equals: () => false },
+        programId: { toBase58: () => 'ProgramId1111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'Mint111111111111111111111111111111111111' },
+          oracleAuthority: mockZeroKey(),
+          indexFeedId: mockNonZeroKey('feed'),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+    }
+
+    function setupEventDrivenService(slab: string) {
+      const market = makeMarketAt(slab);
+      let onAccountCb: ((update: { pubkey: string }) => void) | undefined;
+      const accountLoader = {
+        onAccount: (cb: (update: { pubkey: string }) => void) => {
+          onAccountCb = cb;
+          return () => {};
+        },
+      };
+      const svc = new LiquidationService(mockOracleService as any, 60_000, accountLoader as any);
+      const scanMarketSpy = vi.spyOn(svc, 'scanMarket').mockResolvedValue([]);
+      const getMarkets = () => new Map([[slab, { market: market as any }]]);
+      process.env.KEEPER_USE_LASERSTREAM = 'true';
+      svc.start(getMarkets);
+      return {
+        svc,
+        scanMarketSpy,
+        fireUpdate: () => onAccountCb!({ pubkey: slab }),
+      };
+    }
+
+    afterEach(() => {
+      delete process.env.KEEPER_USE_LASERSTREAM;
+    });
+
+    it('debounces a burst of rapid updates into a single scan (existing behavior, unaffected)', async () => {
+      vi.useFakeTimers();
+      try {
+        const { scanMarketSpy, fireUpdate } = setupEventDrivenService(
+          'SlabEvtBurst1111111111111111111111111111111',
+        );
+        fireUpdate();
+        await vi.advanceTimersByTimeAsync(200);
+        fireUpdate(); // re-arms the 1s debounce before it fires
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(scanMarketSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('defers (does not drop) a second event-scan that arrives within MIN_EVENT_SCAN_INTERVAL_MS of the last one', async () => {
+      vi.useFakeTimers();
+      try {
+        const { scanMarketSpy, fireUpdate } = setupEventDrivenService(
+          'SlabEvtRate1111111111111111111111111111111',
+        );
+
+        // First update: debounce settles after 1s, scan #1 runs immediately
+        // (no prior scan recorded for this market).
+        fireUpdate();
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(scanMarketSpy).toHaveBeenCalledTimes(1);
+
+        // Second update arrives well over 1s later (debounce settles cleanly)
+        // but under the 5s minimum event-scan interval -- must be deferred,
+        // not executed immediately.
+        fireUpdate();
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(scanMarketSpy).toHaveBeenCalledTimes(1);
+
+        // Once the remainder of the 5s window elapses, the deferred scan runs.
+        await vi.advanceTimersByTimeAsync(4_000);
+        expect(scanMarketSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('continuous churn produces no more than one scan per rate-limit window, never zero forever', async () => {
+      vi.useFakeTimers();
+      try {
+        const { scanMarketSpy, fireUpdate } = setupEventDrivenService(
+          'SlabEvtChurn1111111111111111111111111111111',
+        );
+
+        // Simulate an attacker toggling state just over the 1s debounce
+        // window, repeatedly, for 12 seconds straight.
+        for (let i = 0; i < 10; i++) {
+          fireUpdate();
+          await vi.advanceTimersByTimeAsync(1_100);
+        }
+        // Bounded: far fewer scans than the 10 updates/11s of churn would
+        // produce with no rate limit (which would be ~10).
+        expect(scanMarketSpy.mock.calls.length).toBeLessThanOrEqual(3);
+        // Not permanently starved either -- at least one scan got through.
+        expect(scanMarketSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
