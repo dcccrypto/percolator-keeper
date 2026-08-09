@@ -22,6 +22,7 @@ import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
 import { computeHealthStatus } from "./lib/health-status.js";
+import { decideHealthExposure } from "./lib/health-auth.js";
 import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
 import { sharedBudget, setLeaderCheck } from "./lib/keeper-send.js";
 import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
@@ -390,50 +391,36 @@ const secureJsonHeaders = {
 };
 
 const healthServer = http.createServer((req, res) => {
-  // KEEPER-10: Unauthenticated liveness probe — returns 200 if the server is up,
-  // no operational data exposed. Use ?probe=liveness for Railway health checks
-  // when KEEPER_HEALTH_BIND_ADDR is remote and KEEPER_REGISTER_SECRET is set.
-  if (req.url === "/health?probe=liveness" && req.method === "GET") {
-    res.writeHead(200, secureJsonHeaders);
-    res.end(JSON.stringify({ alive: true }));
-    return;
-  }
+  // KEEPER-10 / #358: decide how much detail this caller may see. On a remote
+  // bind with no KEEPER_REGISTER_SECRET configured the endpoints previously
+  // failed OPEN, publishing keeperWallet.solBalance, budget circuit-breaker
+  // state and the stale-oracle market list to anyone who asked.
+  //
+  // That case now REDUCES the payload rather than rejecting the request. A 503
+  // or 401 would close the leak but break deploys: railway.toml probes /health,
+  // and the handler maps status "down" to 503 and everything else to 200, so the
+  // platform restarts a genuinely-down keeper. Rejecting unauthenticated probes
+  // fails every healthcheck, and repointing the probe at a liveness-only URL
+  // discards restart-on-unhealthy -- which railway.toml records as deliberately
+  // restored (M-2) after previously being removed as a workaround.
+  //
+  // When a secret IS configured, a remote caller must present it.
+  const healthExposure = decideHealthExposure({
+    bindAddr: healthBindAddr,
+    registerSecret: process.env.KEEPER_REGISTER_SECRET ?? "",
+    providedSecret: String(req.headers["x-shared-secret"] ?? ""),
+  });
+  const isGuardedRead =
+    (req.url === "/health" ||
+      req.url === "/pause-status" ||
+      req.url === "/shadow/report" ||
+      req.url?.startsWith("/shadow/report?")) &&
+    req.method === "GET";
 
-  // Authentication check for health and sensitive endpoints when exposed remotely
-  if (healthBindAddr !== "127.0.0.1" && healthBindAddr !== "localhost" && healthBindAddr !== "::1") {
-    if ((req.url === "/health" || req.url === "/pause-status" || req.url === "/shadow/report" || req.url?.startsWith("/shadow/report?")) && req.method === "GET") {
-      const registerSecret = process.env.KEEPER_REGISTER_SECRET ?? "";
-      const provided = String(req.headers["x-shared-secret"] ?? "");
-      let contentMatch = false;
-      if (registerSecret && provided) {
-        const secretBuf = Buffer.from(registerSecret, "utf8");
-        const providedBuf = Buffer.from(provided, "utf8");
-        const maxLen = Math.max(secretBuf.length, providedBuf.length, 1);
-        const secretPad = Buffer.alloc(maxLen);
-        const providedPad = Buffer.alloc(maxLen);
-        secretBuf.copy(secretPad);
-        providedBuf.copy(providedPad);
-        const lengthMatch = secretBuf.length === providedBuf.length;
-        contentMatch = lengthMatch && timingSafeEqual(secretPad, providedPad);
-      }
-      
-      // KEEPER-10: Fail CLOSED on remote bind regardless of whether a secret is set.
-      // The previous fail-open posture (#321) exposed keeperWallet.solBalance,
-      // budget circuit-breaker state, and stale-oracle market lists to any internet
-      // client when KEEPER_REGISTER_SECRET was unset. Operators using a remote bind
-      // must set KEEPER_REGISTER_SECRET; /health with ?probe=liveness provides an
-      // unauthenticated liveness signal for Railway health checks.
-      if (!registerSecret) {
-        res.writeHead(503, secureJsonHeaders);
-        res.end(JSON.stringify({ error: "KEEPER_REGISTER_SECRET must be set when KEEPER_HEALTH_BIND_ADDR is a remote address" }));
-        return;
-      }
-      if (!contentMatch) {
-        res.writeHead(401, secureJsonHeaders);
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
-      }
-    }
+  if (isGuardedRead && healthExposure === "unauthorized") {
+    res.writeHead(401, secureJsonHeaders);
+    res.end(JSON.stringify({ error: "Unauthorized" }));
+    return;
   }
 
   // POST /register — hot-register a new market without waiting for discovery cycle
@@ -536,7 +523,16 @@ res.writeHead(401, secureJsonHeaders);
   // GET /pause-status — returns markets paused due to stale oracle
   if (req.url === "/pause-status" && req.method === "GET") {
     res.writeHead(200, secureJsonHeaders);
-    res.end(JSON.stringify({ pausedMarkets: [...stalePausedMarkets] }));
+    // KEEPER-10 / #358: the market list itself is the sensitive part — it tells
+    // an observer exactly which markets the keeper has stopped cranking. An
+    // unauthenticated remote caller gets the count only.
+    res.end(
+      JSON.stringify(
+        healthExposure === "reduced"
+          ? { pausedMarketCount: stalePausedMarkets.size }
+          : { pausedMarkets: [...stalePausedMarkets] },
+      ),
+    );
     return;
   }
 
@@ -708,11 +704,30 @@ res.writeHead(401, secureJsonHeaders);
     // Standby nodes are healthy by definition — services intentionally not running
     const statusCode = currentRole === "standby" ? 200 : status === "down" ? 503 : 200; // "starting", "ok", "degraded" → 200
     res.writeHead(statusCode, secureJsonHeaders);
-    res.end(JSON.stringify(healthData));
+    // KEEPER-10 / #358: an unauthenticated caller on a remote bind gets status
+    // and role only. The status CODE is unchanged, so a platform healthcheck
+    // still distinguishes healthy from down; what it no longer receives is
+    // keeperWallet.solBalance, budget circuit-breaker state, per-market crank
+    // timings and the stale-oracle market list.
+    res.end(
+      JSON.stringify(
+        healthExposure === "reduced"
+          ? { status, role: currentRole, ready: startupTracker.isReady() }
+          : healthData,
+      ),
+    );
   } else if (req.url !== null && req.url !== undefined && (req.url === "/shadow/report" || req.url.startsWith("/shadow/report?")) && req.method === "GET") {
     // GET /shadow/report?from=<epoch_ms>&to=<epoch_ms>
     // Returns the current shadow-keeper comparison report.
     // Only meaningful when SHADOW_HARNESS_ENABLED=true (DRY_RUN shadow deploy).
+    // KEEPER-10 / #358: the report enumerates the keeper's decisions and their
+    // divergence from live behaviour, which is strictly more revealing than
+    // /health. An unauthenticated remote caller gets nothing but the flag.
+    if (healthExposure === "reduced") {
+      res.writeHead(200, secureJsonHeaders);
+      res.end(JSON.stringify({ enabled: process.env.SHADOW_HARNESS_ENABLED === "true" }));
+      return;
+    }
     if (process.env.SHADOW_HARNESS_ENABLED !== "true") {
       res.writeHead(200, secureJsonHeaders);
       res.end(JSON.stringify({ enabled: false, message: "SHADOW_HARNESS_ENABLED is not set to true" }));
