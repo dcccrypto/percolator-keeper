@@ -3,3 +3,4 @@ dist/
 .env
 *.tsbuildinfo
 .pnpm-store/
+.claude/

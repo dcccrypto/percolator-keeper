@@ -168,6 +168,7 @@ describe("validateKeeperEnvGuards", () => {
         KEEPER_REDIS_URL: "https://fake-host.upstash.io",
         KEEPER_REDIS_TOKEN: "fake-token",
         DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+        USE_HELIUS_SENDER: "true",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -357,6 +358,7 @@ describe("validateKeeperEnvGuards", () => {
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
         RPC_URL: "https://mainnet.helius-rpc.com/?api-key=xxx",
         DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+        USE_HELIUS_SENDER: "true",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -514,6 +516,7 @@ describe("validateKeeperEnvGuards", () => {
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
         RPC_URL: MAINNET,
         DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+        USE_HELIUS_SENDER: "true",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -527,6 +530,7 @@ describe("validateKeeperEnvGuards", () => {
         RPC_URL: "https://my-devnet-migration.example.com",
         FALLBACK_RPC_URL: "https://my-devnet-migration.example.com",
         DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+        USE_HELIUS_SENDER: "true",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -613,11 +617,59 @@ describe("validateKeeperEnvGuards", () => {
         RPC_URL: MAINNET,
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
         DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+        USE_HELIUS_SENDER: "true",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
 
     it("does NOT require DISCORD_ALERT_WEBHOOK off mainnet (devnet/unset)", () => {
+      expect(() =>
+        validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv),
+      ).not.toThrow();
+      expect(() => validateKeeperEnvGuards({} as NodeJS.ProcessEnv)).not.toThrow();
+    });
+  });
+
+  // BUG-101: keeper-send.ts's isMainnetSender() is a literal `=== "true"` check
+  // with no NETWORK-based default -- unset silently degrades to a public,
+  // unprotected sendRawTransaction broadcast on mainnet.
+  describe("BUG-101: USE_HELIUS_SENDER required on mainnet", () => {
+    const MAINNET = "https://mainnet.helius-rpc.com/?api-key=test";
+    const baseMainnetEnv = {
+      NETWORK: "mainnet",
+      SOLANA_RPC_URL: MAINNET,
+      RPC_URL: MAINNET,
+      FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+      DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+    };
+
+    it("throws when USE_HELIUS_SENDER is unset on mainnet", () => {
+      const env = { ...baseMainnetEnv } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /USE_HELIUS_SENDER must be set to 'true'.*NETWORK=mainnet/i,
+      );
+    });
+
+    it("throws when USE_HELIUS_SENDER=false on mainnet", () => {
+      const env = { ...baseMainnetEnv, USE_HELIUS_SENDER: "false" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /USE_HELIUS_SENDER must be set to 'true'/i,
+      );
+    });
+
+    it("throws when USE_HELIUS_SENDER is an arbitrary non-'true' string on mainnet", () => {
+      const env = { ...baseMainnetEnv, USE_HELIUS_SENDER: "1" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /USE_HELIUS_SENDER must be set to 'true'/i,
+      );
+    });
+
+    it("accepts USE_HELIUS_SENDER=true on mainnet", () => {
+      const env = { ...baseMainnetEnv, USE_HELIUS_SENDER: "true" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("does NOT require USE_HELIUS_SENDER off mainnet (devnet/unset)", () => {
       expect(() =>
         validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv),
       ).not.toThrow();

@@ -17,7 +17,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("@solana/web3.js", async () => ({ ...(await vi.importActual("@solana/web3.js")) }));
-vi.mock("@percolatorct/sdk", () => ({
+// Partial mock: real exports fill anything this factory does not override.
+// A full-replacement mock silently breaks whenever the source under test
+// imports a new SDK export (e.g. the v17 layout constants), and the failure
+// surfaces as an unrelated "no export defined on the mock" at import time.
+vi.mock("@percolatorct/sdk", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   fetchSlab: vi.fn(), parseConfig: vi.fn(), parseEngine: vi.fn(), parseParams: vi.fn(),
   parseAccount: vi.fn(), parseUsedIndices: vi.fn(), detectLayout: vi.fn(),
   buildAccountMetas: vi.fn(() => []), buildIx: vi.fn(() => ({})),
