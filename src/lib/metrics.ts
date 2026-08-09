@@ -308,6 +308,84 @@ export const shadowDivergencePct = new Gauge({
   registers: [registry],
 });
 
+// ─── v17 fee-split + backing-bucket-recovery crank ────────────────────────────
+// These are what the runbook reads to answer "is the crank actually working?".
+// The key pairing is attempts vs. atoms_moved (revenue legs) and lapsed vs.
+// expired (the liveness leg): a leg attempting work but moving nothing, or a
+// lapsed gauge that never returns to zero, is the failure mode that otherwise
+// looks exactly like a healthy idle keeper.
+
+export const feeCrankLegAttemptsTotal = new Counter({
+  name: "keeper_fee_crank_leg_attempts_total",
+  help: "Fee-crank transactions attempted, partitioned by leg (tags 78/84/87/89)",
+  labelNames: ["leg"] as const,
+  registers: [registry],
+});
+
+export const feeCrankLegSkippedTotal = new Counter({
+  name: "keeper_fee_crank_leg_skipped_total",
+  help: "Fee-crank legs that found no pending work (never sent a transaction), by leg",
+  labelNames: ["leg"] as const,
+  registers: [registry],
+});
+
+// Benign rejections are counted SEPARATELY from errors on purpose. Custom(19),
+// Custom(21), Custom(27), Custom(38), Custom(41), Custom(53) and Custom(61) are
+// by-design outcomes of a permissionless crank racing another keeper or hitting
+// a mode gate. Folding them into the error counter would make a healthy keeper
+// look like it was failing constantly and make the error rate useless as an alarm.
+export const feeCrankLegBenignRejectsTotal = new Counter({
+  name: "keeper_fee_crank_leg_benign_rejects_total",
+  help: "Fee-crank sends rejected by design (mode gates, nothing-to-do, lost races), by leg and program error code",
+  labelNames: ["leg", "code"] as const,
+  registers: [registry],
+});
+
+export const feeCrankLegErrorsTotal = new Counter({
+  name: "keeper_fee_crank_leg_errors_total",
+  help: "Fee-crank genuine failures (unrecognised program errors, RPC faults), by leg and phase",
+  labelNames: ["leg", "phase"] as const,
+  registers: [registry],
+});
+
+export const feeCrankAtomsMovedTotal = new Counter({
+  name: "keeper_fee_crank_atoms_moved_total",
+  help: "Collateral atoms swept per fee leg per market (expected amount at send time; the program clamps and may partial-fill)",
+  labelNames: ["leg", "market"] as const,
+  registers: [registry],
+});
+
+export const feeCrankPendingClaimAtoms = new Gauge({
+  name: "keeper_fee_crank_pending_claim_atoms",
+  help: "Outstanding (accrued - withdrawn) atoms per fee leg per market. A monotonically rising value means the leg is not being cranked",
+  labelNames: ["market", "leg"] as const,
+  registers: [registry],
+});
+
+export const feeCrankBucketsExpiredTotal = new Counter({
+  name: "keeper_fee_crank_buckets_expired_total",
+  help: "Backing buckets recovered via tag 89 ExpireBackingBucket, by market",
+  labelNames: ["market"] as const,
+  registers: [registry],
+});
+
+// ⚠ ALARM ON THIS. A non-zero lapsed gauge that persists across cycles means
+// domains are bricked right now: settling a loss fails Custom(21), settling a
+// gain fails Custom(19), and top-up fails Custom(21). Losing accounts strand.
+export const feeCrankBucketsLapsedGauge = new Gauge({
+  name: "keeper_fee_crank_buckets_lapsed",
+  help: "Backing buckets currently Fresh-and-lapsed (bricked domains awaiting tag 89), by market",
+  labelNames: ["market"] as const,
+  registers: [registry],
+});
+
+export const feeCrankBucketsLapsingSoonGauge = new Gauge({
+  name: "keeper_fee_crank_buckets_lapsing_soon",
+  help: "Backing buckets that will lapse within the warning horizon, by market. Leading indicator for tag 89 cadence",
+  labelNames: ["market"] as const,
+  registers: [registry],
+});
+
 export function registerDefaultMetrics(): void {
   collectDefaultMetrics({ register: registry, prefix: "nodejs_" });
 }
