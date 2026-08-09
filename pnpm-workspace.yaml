@@ -1,2 +1,11 @@
 overrides:
   vite: 8.0.8
+  # GHSA-8988-4f7v-96qf / CVE-2026-54285 (#378): W3CBaggagePropagator.extract()
+  # in @opentelemetry/core < 2.8.0 does not enforce the W3C baggage limits
+  # (8192 bytes / 180 entries) on inbound headers, so it allocates and parses
+  # every entry of an oversized `baggage` header. Reached transitively via
+  # @sentry/node, which the keeper initialises before creating its HTTP
+  # health/admin server — so on a remotely bound deployment the parser sits on
+  # an unauthenticated request path. Pulled in at 2.6.0 and 2.6.1 by different
+  # Sentry sub-dependencies, hence an override rather than a direct bump.
+  "@opentelemetry/core": ">=2.8.0"

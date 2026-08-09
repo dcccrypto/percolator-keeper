@@ -13,7 +13,12 @@ vi.mock('@solana/web3.js', async () => {
 });
 
 // Mock all external dependencies
-vi.mock('@percolatorct/sdk', () => ({
+// Partial mock: real exports fill anything this factory does not override.
+// A full-replacement mock silently breaks whenever the source under test
+// imports a new SDK export (e.g. the v17 layout constants), and the failure
+// surfaces as an unrelated "no export defined on the mock" at import time.
+vi.mock('@percolatorct/sdk', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   discoverMarkets: vi.fn(),
   encodePermissionlessCrank: vi.fn(() => Buffer.from([5, 0, 0, 0, 0, 0])),
   CrankAction: { FeeSweep: 0, Liquidate: 1 },
@@ -55,50 +60,65 @@ vi.mock('../../src/lib/v17-risk.js', () => ({
   })),
 }));
 
-vi.mock('@percolatorct/shared', () => ({
-  config: {
-    crankIntervalMs: 30000,
-    crankInactiveIntervalMs: 120000,
-    discoveryIntervalMs: 300000,
-    allProgramIds: ['11111111111111111111111111111111', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'],
-    crankKeypair: 'mock-keypair-path',
-  },
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  getConnection: vi.fn(() => ({
-    getAccountInfo: vi.fn(),
-    getSlot: vi.fn().mockResolvedValue(200),
-  })),
-  getFallbackConnection: vi.fn(() => ({
-    getProgramAccounts: vi.fn(),
-  })),
-  loadKeypair: vi.fn(() => ({
-    publicKey: {
-      toBase58: () => '11111111111111111111111111111111',
-      // Use string-based equality so foreign oracle authorities correctly return false.
-      equals: (other: any) => other?.toBase58?.() === '11111111111111111111111111111111',
+vi.mock('@percolatorct/shared', () => {
+  const makeMonitor = () => ({
+    recordSuccess: vi.fn(async () => {}),
+    recordFailure: vi.fn(async () => {}),
+    getErrorRate: vi.fn(() => 0),
+    getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })),
+  });
+  return {
+    config: {
+      crankIntervalMs: 30000,
+      crankInactiveIntervalMs: 120000,
+      discoveryIntervalMs: 300000,
+      allProgramIds: ['11111111111111111111111111111111', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'],
+      crankKeypair: 'mock-keypair-path',
     },
-    secretKey: new Uint8Array(64),
-  })),
-  sendWithRetry: vi.fn(async () => 'mock-signature-' + Date.now()),
-  sendWithRetryKeeper: vi.fn(async () => 'mock-keeper-sig-' + Date.now()),
-  rateLimitedCall: vi.fn((fn) => fn()),
-  sendCriticalAlert: vi.fn(),
-  getSupabase: vi.fn(() => ({
-    from: vi.fn(() => ({
-      select: vi.fn(() => ({
-        in: vi.fn(() => ({ data: [], error: null })),
+    createLogger: vi.fn(() => ({
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    })),
+    getConnection: vi.fn(() => ({
+      getAccountInfo: vi.fn(),
+      getSlot: vi.fn().mockResolvedValue(200),
+    })),
+    getFallbackConnection: vi.fn(() => ({
+      getProgramAccounts: vi.fn(),
+    })),
+    loadKeypair: vi.fn(() => ({
+      publicKey: {
+        toBase58: () => '11111111111111111111111111111111',
+        // Use string-based equality so foreign oracle authorities correctly return false.
+        equals: (other: any) => other?.toBase58?.() === '11111111111111111111111111111111',
+      },
+      secretKey: new Uint8Array(64),
+    })),
+    sendWithRetry: vi.fn(async () => 'mock-signature-' + Date.now()),
+    sendWithRetryKeeper: vi.fn(async () => 'mock-keeper-sig-' + Date.now()),
+    rateLimitedCall: vi.fn((fn) => fn()),
+    sendCriticalAlert: vi.fn(),
+    getSupabase: vi.fn(() => ({
+      from: vi.fn(() => ({
+        select: vi.fn(() => ({
+          in: vi.fn(() => ({ data: [], error: null })),
+        })),
       })),
     })),
-  })),
-  eventBus: {
-    publish: vi.fn(),
-  },
-}));
+    eventBus: {
+      publish: vi.fn(),
+    },
+    // BUG-110: src/lib/service-monitors.ts calls this at import time.
+    createServiceMonitors: vi.fn(() => ({
+      rpc: makeMonitor(),
+      scan: makeMonitor(),
+      oracle: makeMonitor(),
+      db: makeMonitor(),
+    })),
+  };
+});
 
 vi.mock('../../src/lib/keeper-send.js', async () => {
   const { KeeperBudget } = await vi.importActual<typeof import('../../src/lib/budget.js')>('../../src/lib/budget.js');
@@ -113,6 +133,7 @@ import { CrankService } from '../../src/services/crank.js';
 import * as core from '@percolatorct/sdk';
 import * as shared from '@percolatorct/shared';
 import * as keeperSendModule from '../../src/lib/keeper-send.js';
+import { monitors } from '../../src/lib/service-monitors.js';
 
 const MOCK_PORTFOLIO = new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
 
@@ -183,6 +204,87 @@ describe('CrankService', () => {
       expect(crankService.getMarkets().size).toBe(1);
     });
 
+    // BUG-110: monitors.db was never wired to a real outcome -- /health's
+    // monitors.db sub-object was permanently-green placeholder data.
+    it('BUG-110: records monitors.db success on a clean Supabase query', async () => {
+      vi.mocked(core.discoverMarkets).mockResolvedValue([] as any);
+
+      await crankService.discover();
+
+      expect(monitors.db.recordSuccess).toHaveBeenCalled();
+      expect(monitors.db.recordFailure).not.toHaveBeenCalled();
+    });
+
+    it('BUG-110: records monitors.db failure on a Supabase query error', async () => {
+      vi.mocked(core.discoverMarkets).mockResolvedValue([] as any);
+      vi.mocked(shared.getSupabase).mockReturnValueOnce({
+        from: vi.fn(() => ({
+          select: vi.fn(() => ({
+            in: vi.fn(() => ({ data: null, error: { message: 'connection refused' } })),
+          })),
+        })),
+      } as any);
+
+      await crankService.discover();
+
+      expect(monitors.db.recordFailure).toHaveBeenCalledWith('connection refused');
+      expect(monitors.db.recordSuccess).not.toHaveBeenCalled();
+    });
+
+    it('BUG-110: records monitors.db failure when the Supabase call throws', async () => {
+      vi.mocked(core.discoverMarkets).mockResolvedValue([] as any);
+      vi.mocked(shared.getSupabase).mockImplementationOnce(() => {
+        throw new Error('supabase client init failed');
+      });
+
+      await crankService.discover();
+
+      expect(monitors.db.recordFailure).toHaveBeenCalledWith('supabase client init failed');
+      expect(monitors.db.recordSuccess).not.toHaveBeenCalled();
+    });
+
+  });
+
+  // BUG-110: monitors.scan was never wired to a real outcome -- /health's
+  // monitors.scan sub-object was permanently-green placeholder data.
+  describe('BUG-110: monitors.scan wiring in the periodic cycle', () => {
+    it('records success after a cycle completes without throwing', async () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketMonScan111111111111111111111111111' },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'Mint1111111111111111111111111111111111' },
+          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111', equals: () => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n, initialMarginBps: 1000n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
+      const svc = new CrankService(mockOracleService, 1_000);
+      // Populate markets + lastDiscoveryTime under REAL timers first, so the
+      // periodic tick below takes the "markets pre-loaded" path and sees
+      // needsDiscovery===false -- avoiding crank.ts's real inter-program
+      // discovery delay (a setTimeout) while fake timers are active, which
+      // would otherwise hang this test and leak fake timers into every test
+      // that runs after it in this file.
+      await svc.discover();
+      vi.mocked(core.discoverMarkets).mockClear();
+
+      vi.useFakeTimers();
+      try {
+        await svc.start();
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(monitors.scan.recordSuccess).toHaveBeenCalled();
+        expect(monitors.scan.recordFailure).not.toHaveBeenCalled();
+      } finally {
+        svc.stop();
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('discover (LaserStream)', () => {
     it('LaserStream fast-path retries v17 keeper portfolio provisioning when keeperPortfolio is null', async () => {
       const prevLaserStream = process.env.KEEPER_USE_LASERSTREAM;
       process.env.KEEPER_USE_LASERSTREAM = 'true';

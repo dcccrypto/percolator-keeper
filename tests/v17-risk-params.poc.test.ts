@@ -5,11 +5,19 @@ import {
   V17RiskParamsCorruptedError,
 } from "../src/lib/v17-risk.js";
 
-const V17_HEADER_LEN = 16;
-const V17_WRAPPER_CONFIG_LEN = 432;
-const V17_MARKET_GROUP_OFF = V17_HEADER_LEN + V17_WRAPPER_CONFIG_LEN;
-const V17_MARKET_GROUP_ID_LEN = 32;
-const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_ID_LEN;
+// Layout constants come from the SDK via v17-layout.ts. This test previously
+// duplicated the stale `V17_WRAPPER_CONFIG_LEN = 432` literal, so it wrote its
+// fixture bytes at exactly the same wrong offsets the parser read them from —
+// the test passed while the parser was misreading every live account. A test
+// that shares the bug under test cannot detect it; both sides now derive from
+// one source.
+import {
+  MG_CONFIG_OFF,
+  V17_HEADER_LEN,
+  V17_MARKET_GROUP_OFF,
+} from "../src/lib/v17-layout.js";
+
+const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + MG_CONFIG_OFF;
 
 function writeU64LE(data: Uint8Array, offset: number, value: bigint): void {
   for (let i = 0; i < 8; i++) {
@@ -50,8 +58,8 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
   // H-8: a zero (or implausibly large) maintenanceMarginBps makes the
   // liquidation-candidacy comparison `marginRatioBps < maintenanceMarginBps`
   // unsatisfiable (0n<0n is always false) or trivially satisfied for every
-  // position (>=10000n), silently. Neither is a real on-chain config --
-  // reject both at parse time.
+  // position (>10000n), silently. The engine permits exactly 100% margin as
+  // a fast-path config, so the valid parser range is (0, 10000].
   describe("H-8: maintenanceMarginBps sanity validation", () => {
     function buildData(maintenanceMarginBps: bigint): Uint8Array {
       const data = new Uint8Array(V17_RISK_PARAMS_MIN_DATA_LEN);
@@ -68,8 +76,8 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
       expect(() => parseV17RiskParams(buildData(0n))).toThrow(/maintenanceMarginBps=0/);
     });
 
-    it("throws when maintenanceMarginBps decodes to >= 10_000 (>= 100% margin)", () => {
-      expect(() => parseV17RiskParams(buildData(10_000n))).toThrow(V17RiskParamsCorruptedError);
+    it("throws when maintenanceMarginBps decodes above 10_000 (> 100% margin)", () => {
+      expect(() => parseV17RiskParams(buildData(10_001n))).toThrow(V17RiskParamsCorruptedError);
     });
 
     it("throws when maintenanceMarginBps decodes to an implausibly huge corrupted value", () => {
@@ -78,9 +86,10 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
       );
     });
 
-    it("accepts the boundary values 1 and 9999 bps", () => {
+    it("accepts the boundary values 1, 9999, and 10000 bps", () => {
       expect(parseV17RiskParams(buildData(1n)).maintenanceMarginBps).toBe(1n);
       expect(parseV17RiskParams(buildData(9_999n)).maintenanceMarginBps).toBe(9_999n);
+      expect(parseV17RiskParams(buildData(10_000n)).maintenanceMarginBps).toBe(10_000n);
     });
   });
 });
