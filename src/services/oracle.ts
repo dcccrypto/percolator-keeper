@@ -122,18 +122,33 @@ export class OracleService {
   private deviationRejections = new Map<string, number>();
   private deviationFirstRejectedAt = new Map<string, number>();
   private static readonly DEVIATION_ACCEPT_AFTER = 5;
-  // Minimum elapsed time since the first consecutive rejection before H1 fires.
-  // Default: 5 minutes — ensures a sustained legitimate move, not a 25-second trade.
-  private static readonly DEVIATION_ACCEPT_AFTER_MS =
-    Number(process.env.ORACLE_DEVIATION_ACCEPT_AFTER_MS ?? 5 * 60 * 1000);
+  /**
+   * Minimum elapsed time since the first rejection of the current streak before
+   * H1 fires. Instance state, read at construction rather than at module load,
+   * so it can be injected in tests — matching the `now` clock beside it. A
+   * `static readonly` initialised from process.env is fixed the moment the
+   * module is first imported, which no test can influence.
+   *
+   * 60s, not the 5 minutes first proposed. The gate trades liveness for
+   * manipulation resistance and these are memecoin perps: a legitimate >30% move
+   * inside five minutes is ordinary, and while the price is rejected the market
+   * ages into staleness, gets paused, and stops cranking — suppressing
+   * liquidations during exactly the volatility that produces bad debt. 60s still
+   * forces an attacker to hold a dual-source manipulation across 5+ fetches
+   * rather than the ~25s the count-only gate allowed.
+   */
+  private readonly _deviationAcceptAfterMs: number;
 
   /** Injectable clock — defaults to Date.now() in production; overridden in
    *  tests so price freshness / staleness is deterministic without faking the
    *  global Date around the async fetch path. */
   private readonly now: () => number;
 
-  constructor(opts?: { now?: () => number }) {
+  constructor(opts?: { now?: () => number; deviationAcceptAfterMs?: number }) {
     this.now = opts?.now ?? (() => Date.now());
+    this._deviationAcceptAfterMs =
+      opts?.deviationAcceptAfterMs ??
+      Number(process.env.ORACLE_DEVIATION_ACCEPT_AFTER_MS ?? 60_000);
     // M5: DexScreener and Jupiter REST APIs return prices with NO publisher
     // signature and NO slot field. Cross-source validation (10% deviation) +
     // min-liquidity filter ($1000) + historical deviation cap (30%) mitigate
@@ -513,7 +528,7 @@ export class OracleService {
           const firstRejectedAt = this.deviationFirstRejectedAt.get(slabAddress) ?? this.now();
           const elapsedMs = this.now() - firstRejectedAt;
           const countGate = consecutiveCount >= OracleService.DEVIATION_ACCEPT_AFTER;
-          const timeGate = elapsedMs >= OracleService.DEVIATION_ACCEPT_AFTER_MS;
+          const timeGate = elapsedMs >= this._deviationAcceptAfterMs;
           if (!countGate || !timeGate) {
             logger.warn("Price deviation exceeds threshold", {
               mint,
@@ -524,7 +539,7 @@ export class OracleService {
               source,
               consecutiveRejections: consecutiveCount,
               acceptAfterCount: OracleService.DEVIATION_ACCEPT_AFTER,
-              acceptAfterMs: OracleService.DEVIATION_ACCEPT_AFTER_MS,
+              acceptAfterMs: this._deviationAcceptAfterMs,
               elapsedMs: Math.round(elapsedMs),
             });
             return null;
