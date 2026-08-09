@@ -30,8 +30,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: build-and-test
-    if: github.ref == 'refs/heads/main'
+    # #384: this was gated to `refs/heads/main`, so the image was only built
+    # AFTER merge and image-build breakage passed PR review invisibly. It then
+    # failed on every push to main from 2026-06-22 to 2026-07-18 (~4 weeks) with
+    # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH, and the PR that introduced it could not
+    # have caught it: build-and-test passes there, because actions/checkout
+    # supplies the whole repo while the docker build context is narrower. The
+    # two jobs disagree on exactly the thing that broke, and only the invisible
+    # one failed.
+    #
+    # The job only builds — it never pushes to a registry — so running it on
+    # pull requests needs no push-gating.
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build Docker image
         run: docker build -t percolator-keeper .
+
+      # K-NEW-1 in the Dockerfile installs production deps only, to keep vitest,
+      # tsx, @types/* and their CVEs out of the runtime image. Nothing verified
+      # that. A regression to a full install would still build green, so assert
+      # the outcome rather than the exit code.
+      - name: Assert devDependencies are absent from the runtime image
+        run: |
+          set -euo pipefail
+          for pkg in vitest tsx typescript fast-check; do
+            if docker run --rm --entrypoint sh percolator-keeper -c "test -e /app/node_modules/$pkg"; then
+              echo "::error::devDependency '$pkg' is present in the runtime image (K-NEW-1 regression)"
+              exit 1
+            fi
+          done
+          echo "OK: vitest, tsx, typescript and fast-check are absent from the runtime image"
+
+      - name: Assert production dependencies survived
+        run: |
+          set -euo pipefail
+          # Mirror check: an install that dropped real dependencies would also
+          # satisfy the assertion above, so it has to be paired with this one.
+          for pkg in @solana/web3.js @upstash/redis p-queue lru-cache; do
+            docker run --rm --entrypoint sh percolator-keeper -c "test -e /app/node_modules/$pkg" \
+              || { echo "::error::production dependency '$pkg' missing from the runtime image"; exit 1; }
+          done
+          echo "OK: production dependencies are present"

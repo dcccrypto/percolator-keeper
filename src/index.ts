@@ -1,7 +1,8 @@
 import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, createServiceMonitors, getConnection } from "@percolatorct/shared";
+import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, getConnection } from "@percolatorct/shared";
+import { monitors } from "./lib/service-monitors.js";
 import { getKeeperKeypair } from "./lib/keypair-singleton.js";
 import { OracleService } from "./services/oracle.js";
 import { CrankService } from "./services/crank.js";
@@ -13,6 +14,7 @@ import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { CURRENT_NETWORK } from "./network.js";
 import { assertMainnetProgramId, assertProgramIdAllowList } from "./lib/boot-assertions.js";
+import { assertV17LayoutGeneration } from "./lib/v17-layout.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
 import * as metricsServer from "./lib/metrics-server.js";
@@ -27,8 +29,8 @@ import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harne
 import { sharedDecisionLog } from "./lib/decision-log.js";
 import { createLaserStreamAccountLoader } from "./lib/laserstream-entrypoint.js";
 
-// Monitoring — alerts to Discord on threshold breaches
-export const monitors = createServiceMonitors("Keeper");
+// Monitoring — alerts to Discord on threshold breaches (see src/lib/service-monitors.ts)
+export { monitors };
 
 // Initialize Sentry first
 initSentry("keeper");
@@ -84,6 +86,13 @@ assertMainnetProgramId({ isMainnet: isMainnet(), programId: config.programId });
 // Validate the full discovery/signing program set (config.allProgramIds), not
 // just the single config.programId — discovery scans and signs against every entry.
 assertProgramIdAllowList({ isMainnet: isMainnet(), allProgramIds: config.allProgramIds });
+// Refuse to start against an SDK whose v17 account layout does not match the
+// deployed wrapper. The keeper reads market accounts by raw byte offset — there
+// is no discriminator and no error return on a wrong-offset read, it just
+// yields plausible garbage. A stale SDK pin is exactly how the keeper ended up
+// reading every v17 market at the 432-byte (two generations old) layout, so a
+// mismatch has to be a startup crash rather than a silent misparse.
+assertV17LayoutGeneration();
 if (isMainnet()) {
   logger.info("Running in MAINNET mode", { programId: config.programId });
 }
@@ -158,6 +167,10 @@ const solBalanceCheckInterval = setInterval(async () => {
     _keeperSolBalanceLamports = lamports;
     const solBalance = lamports / 1e9;
     walletBalanceSol.set(solBalance);
+    // BUG-110: this periodic getBalance is a real, regular RPC round trip —
+    // record it so /health's monitors.rpc reflects actual connectivity
+    // instead of permanently-green placeholder data.
+    monitors.rpc.recordSuccess().catch(() => {});
 
     if (solBalance < SOL_BALANCE_WARN_THRESHOLD) {
       // Rate-limit alerts to once per 5 minutes to avoid Discord spam
@@ -181,6 +194,7 @@ const solBalanceCheckInterval = setInterval(async () => {
     logger.warn("Failed to fetch keeper SOL balance", {
       error: err instanceof Error ? err.message : String(err),
     });
+    monitors.rpc.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
   }
 }, 60_000);
 solBalanceCheckInterval.unref();

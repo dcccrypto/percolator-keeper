@@ -12,34 +12,49 @@ vi.mock('@percolatorct/sdk', () => ({
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
-vi.mock('@percolatorct/shared', () => ({
-  config: {
-    programId: '11111111111111111111111111111111',
-    crankKeypair: 'mock-keypair-path',
-  },
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  getConnection: vi.fn(() => ({
-    getAccountInfo: vi.fn(),
-  })),
-  loadKeypair: vi.fn(() => ({
-    publicKey: new PublicKey('11111111111111111111111111111111'),
-    secretKey: new Uint8Array(64),
-  })),
-  sendWithRetry: vi.fn(async () => 'mock-signature'),
-  eventBus: {
-    publish: vi.fn(),
-  },
-  getErrorMessage: vi.fn((err: unknown) => {
-    if (err instanceof Error) return err.message;
-    return String(err);
-  }),
-  sendWarningAlert: vi.fn(() => Promise.resolve()),
-}));
+vi.mock('@percolatorct/shared', () => {
+  const makeMonitor = () => ({
+    recordSuccess: vi.fn(async () => {}),
+    recordFailure: vi.fn(async () => {}),
+    getErrorRate: vi.fn(() => 0),
+    getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })),
+  });
+  return {
+    config: {
+      programId: '11111111111111111111111111111111',
+      crankKeypair: 'mock-keypair-path',
+    },
+    createLogger: vi.fn(() => ({
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    })),
+    getConnection: vi.fn(() => ({
+      getAccountInfo: vi.fn(),
+    })),
+    loadKeypair: vi.fn(() => ({
+      publicKey: new PublicKey('11111111111111111111111111111111'),
+      secretKey: new Uint8Array(64),
+    })),
+    sendWithRetry: vi.fn(async () => 'mock-signature'),
+    eventBus: {
+      publish: vi.fn(),
+    },
+    getErrorMessage: vi.fn((err: unknown) => {
+      if (err instanceof Error) return err.message;
+      return String(err);
+    }),
+    sendWarningAlert: vi.fn(() => Promise.resolve()),
+    // BUG-110: src/lib/service-monitors.ts calls this at import time.
+    createServiceMonitors: vi.fn(() => ({
+      rpc: makeMonitor(),
+      scan: makeMonitor(),
+      oracle: makeMonitor(),
+      db: makeMonitor(),
+    })),
+  };
+});
 
 import { OracleService } from '../../src/services/oracle.js';
 
@@ -65,7 +80,11 @@ describe('OracleService.getStaleMarkets', () => {
     vi.mocked(fetch).mockImplementation(async (input: any) => {
       const url = String(input);
       if (url.includes('dexscreener')) {
-        return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }) } as any;
+        // Thread the queried mint out of the request URL so the fixture's
+        // baseToken always matches whichever mint is being fetched (MINT_A,
+        // MINT_C, MINT_E, MINT_X, MINT_Y, ...).
+        const dexMint = decodeURIComponent(url.split('/tokens/')[1] ?? '');
+        return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: dexMint } }] }) } as any;
       }
       const mint = decodeURIComponent(url.split('ids=')[1] ?? '');
       return { ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as any;

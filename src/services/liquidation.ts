@@ -20,6 +20,7 @@ import { config, getConnection, sendWithRetry, pollSignatureStatus, getRecentPri
 import { getKeeperKeypair } from "../lib/keypair-singleton.js";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
+import { isCustomProgramError } from "../lib/program-error.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -624,6 +625,17 @@ export class LiquidationService {
   /** Per-account debounce timers: slab pubkey → setTimeout handle. */
   private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly _DEBOUNCE_MS = 1_000;
+  // BUG-104: the debounce above only coalesces updates *within* one window --
+  // it does not bound the sustained rate of distinct windows. Rapid
+  // open/close/reopen on a single account re-arms a fresh 1s timer each time,
+  // so an owner toggling state just over 1s apart (well under the 60s polling
+  // interval) can force a full scanMarket() + pre-submit RPC fan-out on every
+  // window, far more often than one polling cycle would. This map tracks the
+  // last time an event-driven scan actually ran per market, so a window that
+  // fires too soon after the previous one is deferred (not dropped) instead
+  // of executing immediately.
+  private readonly _lastEventScanAt = new Map<string, number>();
+  private static readonly MIN_EVENT_SCAN_INTERVAL_MS = 5_000;
   private _unsubLoader?: () => void;
   // C1 (post-mainnet-audit): per-cycle dedup keyed on the unique on-chain
   // liquidation target. Legacy slabs use (slabAddress, accountIdx); v17 markets
@@ -1072,13 +1084,16 @@ export class LiquidationService {
       // for single-asset markets). For v12.x markets, accountIdx is the slab slot.
       // #329: use the scan-time closeQ; it will be re-derived from the fresh portfolio
       // in the pre-submit recheck below and the instruction data rebuilt if changed.
+      // ABI: close_q/fee_bps were REMOVED from the PermissionlessCrank wire
+      // upstream (#206) — the program derives the close size from on-chain
+      // portfolio state at execution time rather than trusting a caller-supplied
+      // quantity. `closeQ` is therefore still used for the keeper's OWN
+      // scan/eligibility decisions below, but it no longer reaches the chain.
       let effectiveCloseQ = closeQ;
       const crankData = encodePermissionlessCrank({
         action: CrankAction.Liquidate,
         assetIndex: accountIdx, // v17: leg.assetIndex; v12: slab slot
         nowSlot,
-        closeQ: effectiveCloseQ,
-        feeBps: 0n,
         recoveryReason: 0,
       });
 
@@ -1108,6 +1123,25 @@ export class LiquidationService {
       if (v17PortfolioPubkey) {
         // v17 verification: re-fetch portfolio and confirm still undercollateralized.
         // Skip the slab bitmap path (parseUsedIndices/parseAccount) which doesn't apply.
+        //
+        // #373: the try below wraps ONLY the fetch/parse of re-verification data,
+        // and fails CLOSED. It previously wrapped the drift guard and the margin
+        // recheck too, with an empty catch — so any throw (a malformed wrapper
+        // blob in parseWrapperConfigV17, a fetchClusterUnixTimeSec error, the
+        // M-6 owner-check failure in fetchSlabWithRetry) fell straight through to
+        // the send with NO checks applied.
+        //
+        // That mattered most for the oracle-drift guard, which has no on-chain
+        // counterpart: "The on-chain Liquidate instruction carries no price bound,
+        // so keeper-side drift detection is the only available mitigation." Losing
+        // it means submitting at unbounded drift with no backstop anywhere.
+        //
+        // The v12.x path below is unwrapped and already fails closed; this makes
+        // the live v17 mainnet path match it.
+        let pf: ReturnType<typeof parsePortfolioV17>;
+        let freshMarketData: Uint8Array;
+        let freshPrice: bigint;
+        let freshRiskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint } | null = null;
         try {
           const pfInfo = await withTimeout(
             connection.getAccountInfo(v17PortfolioPubkey),
@@ -1121,7 +1155,7 @@ export class LiquidationService {
             });
             return null;
           }
-          const pf = parsePortfolioV17(new Uint8Array(pfInfo.data));
+          pf = parsePortfolioV17(new Uint8Array(pfInfo.data));
           // Check there's still an active position
           const hasActive = pf.legs.some(l => l.active && l.basisPosQ !== 0n);
           if (!hasActive) {
@@ -1137,7 +1171,7 @@ export class LiquidationService {
           // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
           // unavailable (0) we keep the leg-active check + rely on the on-chain program.
           // #287 (M-6): pass programId so fetchSlab enforces the on-chain owner check.
-          const freshMarketData = await fetchSlabWithRetry(slabAddress, programId);
+          freshMarketData = await fetchSlabWithRetry(slabAddress, programId);
           // H-8: isolate this call from the outer "proceed cautiously" catch --
           // that catch's fail-open posture is meant for transient RPC failures
           // preventing re-verification entirely, not for "we got data back but
@@ -1145,7 +1179,6 @@ export class LiquidationService {
           // (which would fall through to submitting the liquidation
           // unconditionally) -- degrade to relying on the equity<=0n signal
           // alone instead.
-          let freshRiskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint } | null = null;
           try {
             const parsed = parseV17RiskParams(freshMarketData);
             freshRiskParams = {
@@ -1161,7 +1194,23 @@ export class LiquidationService {
             }
           }
           const freshNowSec = await fetchClusterUnixTimeSec(connection);
-          const freshPrice = resolveV17WrapperPrice(parseWrapperConfigV17(freshMarketData), freshNowSec);
+          freshPrice = resolveV17WrapperPrice(parseWrapperConfigV17(freshMarketData), freshNowSec);
+        } catch (err) {
+          // #373: FAIL CLOSED. We could not obtain the data the drift guard and
+          // margin recheck depend on, so we cannot assert either. Skipping this
+          // submit costs one liquidation attempt (the next scan cycle retries);
+          // proceeding would submit at unbounded drift with no on-chain bound.
+          logger.warn("v17 liquidate: pre-submit re-verification failed, aborting (fail closed)", {
+            portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+            slabAddress: slabAddress.toBase58().slice(0, 8),
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        }
+
+        // ── Checks below run OUTSIDE the try: a throw here must abort the
+        //    submit, never be swallowed into proceeding. ──────────────────────
+        {
           if (freshPrice === 0n) {
             logger.warn("v17 liquidate: no fresh price available for pre-submit recheck, aborting", {
               portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
@@ -1226,25 +1275,18 @@ export class LiquidationService {
               });
               return null;
             }
-            // #329: If the fresh closeQ differs from the scan-time value (position
-            // partially closed), rebuild the crank instruction with the updated value
-            // so the on-chain close_q matches the actual remaining position size.
+            // #329 (SUPERSEDED BY UPSTREAM #206): this used to rebuild the crank
+            // instruction when the position had partially closed between scan and
+            // submit, so the encoded close_q matched the remaining size. close_q
+            // is no longer part of the wire — the program reads the portfolio and
+            // derives the close size itself — so the rebuilt bytes would be
+            // identical to the original and the whole hazard #329 addressed is
+            // now handled on-chain. The fresh read is kept because the tracked
+            // value still feeds the keeper's post-submit accounting below.
             if (freshCloseQ > 0n && freshCloseQ !== effectiveCloseQ) {
               effectiveCloseQ = freshCloseQ;
-              const updatedCrankData = encodePermissionlessCrank({
-                action: CrankAction.Liquidate,
-                assetIndex: accountIdx,
-                nowSlot,
-                closeQ: effectiveCloseQ,
-                feeBps: 0n,
-                recoveryReason: 0,
-              });
-              instructions[0] = buildIx({ programId, keys: crankKeys, data: updatedCrankData });
             }
           }
-        } catch {
-          // If we can't re-verify, proceed cautiously — the on-chain program
-          // will reject if the portfolio is already closed.
         }
       } else {
       // Bug 3: Re-read slab data and verify account before submitting (v12.x path)
@@ -1385,8 +1427,10 @@ export class LiquidationService {
 
       // PERC-484: InvalidSlabLen (0x4) means the slab has wrong size for the program.
       // These are test/corrupt markets that will never succeed — permanently skip them
-      // so the liquidation service stops retrying every 60 seconds.
-      if (errMsg.includes("custom program error: 0x4")) {
+      // so the liquidation service stops retrying every 60 seconds. Exact-code match:
+      // a substring check would also catch 0x40–0x4f / 0x400+ and permanently drop a
+      // healthy market from liquidation on an unrelated engine error.
+      if (isCustomProgramError(errMsg, 0x4)) {
         this.permanentlySkipped.add(slabAddress.toBase58());
         logger.warn(
           "Market slab size mismatch (0x4 InvalidSlabLen) — permanently skipping for liquidation. " +
@@ -1527,6 +1571,50 @@ export class LiquidationService {
     return { scanned, candidates: candidateCount, liquidated };
   }
 
+  /**
+   * BUG-104: runs (or defers) the event-driven scan for one market once its
+   * debounce window has settled. If a scan for this market already ran more
+   * recently than MIN_EVENT_SCAN_INTERVAL_MS, reschedules for the remaining
+   * wait instead of firing immediately or dropping the trigger -- bounding
+   * the worst-case event-scan rate per market without ever silently missing
+   * an update.
+   */
+  private _maybeRunEventScan(slabKey: string, market: DiscoveredMarket): void {
+    const now = Date.now();
+    const last = this._lastEventScanAt.get(slabKey) ?? 0;
+    const elapsed = now - last;
+    if (elapsed < LiquidationService.MIN_EVENT_SCAN_INTERVAL_MS) {
+      const remaining = LiquidationService.MIN_EVENT_SCAN_INTERVAL_MS - elapsed;
+      this._debounceTimers.set(
+        slabKey,
+        setTimeout(() => this._maybeRunEventScan(slabKey, market), remaining),
+      );
+      return;
+    }
+    this._lastEventScanAt.set(slabKey, now);
+    this._debounceTimers.delete(slabKey);
+    // Single-market scan — fire-and-forget; errors logged inside scanMarket.
+    this.scanMarket(market).then(async (candidates) => {
+      for (const c of candidates) {
+        // #218: route through the shared gate so the event path honors the same
+        // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
+        const sig = await this.gatedLiquidate(market, c);
+        if (sig) {
+          logger.info("Event-driven liquidation complete", {
+            slabAddress: slabKey,
+            accountIdx: c.accountIdx,
+            signature: sig,
+          });
+        }
+      }
+    }).catch((err: unknown) => {
+      logger.warn("Event-driven scan/liquidate failed", {
+        slabAddress: slabKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
   start(getMarkets: () => Map<string, { market: DiscoveredMarket }>): void {
     if (this.timer) return;
     logger.info("Liquidation service starting", { intervalMs: this.intervalMs });
@@ -1611,29 +1699,7 @@ export class LiquidationService {
         if (existing) clearTimeout(existing);
         this._debounceTimers.set(
           slabKey,
-          setTimeout(() => {
-            this._debounceTimers.delete(slabKey);
-            // Single-market scan — fire-and-forget; errors logged inside scanMarket.
-            this.scanMarket(market.market).then(async (candidates) => {
-              for (const c of candidates) {
-                // #218: route through the shared gate so the event path honors the same
-                // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
-                const sig = await this.gatedLiquidate(market.market, c);
-                if (sig) {
-                  logger.info("Event-driven liquidation complete", {
-                    slabAddress: slabKey,
-                    accountIdx: c.accountIdx,
-                    signature: sig,
-                  });
-                }
-              }
-            }).catch((err: unknown) => {
-              logger.warn("Event-driven scan/liquidate failed", {
-                slabAddress: slabKey,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            });
-          }, this._DEBOUNCE_MS),
+          setTimeout(() => this._maybeRunEventScan(slabKey, market.market), this._DEBOUNCE_MS),
         );
       });
       logger.info("Liquidation service: event-driven mode active", {

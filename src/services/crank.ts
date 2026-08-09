@@ -26,6 +26,7 @@ import { config, getConnection, getFallbackConnection, eventBus, createLogger, s
 import { getKeeperKeypair } from "../lib/keypair-singleton.js";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
+import { isCustomProgramError } from "../lib/program-error.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
 import {
   txSentTotal,
@@ -34,10 +35,12 @@ import {
   txLandTimeSeconds,
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
+import { monitors } from "../lib/service-monitors.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
+import { isFeeCrankEnabled, runFeeCrankPass } from "./fee-crank.js";
 
 export type CrankResult = "success" | "skipped" | "failed";
 
@@ -247,7 +250,10 @@ async function discoverV17Markets(
       const data = new Uint8Array(account.data);
       if (!isV17Account(data)) continue;
 
-      // Parse the v17 wrapper config (starts at offset 16, 432 bytes)
+      // Parse the v17 wrapper config (starts at V17_HEADER_LEN, spans
+      // V17_WRAPPER_CONFIG_LEN bytes — currently 576, was 496 pre-fee-split and
+      // 432 before the protocol-fee change; the SDK owns the number, see
+      // lib/v17-layout.ts).
       const wrapperCfg = parseWrapperConfigV17(data);
       const marketConfig = wrapperConfigV17ToMarketConfig(wrapperCfg);
 
@@ -508,7 +514,9 @@ async function provisionKeeperPortfolio(
   } catch (provisionErr) {
     const errMsg = provisionErr instanceof Error ? provisionErr.message : String(provisionErr);
     // AlreadyInitialized: a concurrent provision beat us; re-query for the existing portfolio.
-    if (errMsg.includes("AlreadyInitialized") || errMsg.includes("custom program error: 0x0")) {
+    // Exact-code match on 0x0 — a substring check also caught 0x00–0x0f (codes 1–15),
+    // misrouting an unrelated failure into this re-query path.
+    if (errMsg.includes("AlreadyInitialized") || isCustomProgramError(errMsg, 0x0)) {
       logger.info("provisionKeeperPortfolio: AlreadyInitialized — re-querying for existing portfolio", {
         market: marketKeyBase58.slice(0, 8),
       });
@@ -603,13 +611,25 @@ async function crankLpVault(
     domainIdx = 0;
   }
 
+  // v17 dual-domain: tag 78 names the pot the fees land in and needs BOTH
+  // ledgers. We credit the registry's own domain; a rebalance (tag 91) can move
+  // the resulting backing if the house is drawing on the other pot. The target
+  // ledger is created on first use, so the cranker must be writable (it pays the
+  // rent) and the system program is required.
   const [ledgerPda] = deriveLpBackingLedger(programId, market.slabAddress, domainIdx);
-  const data = encodeLpVaultCrankFees();
+  const [siblingLedgerPda] = deriveLpBackingLedger(
+    programId,
+    market.slabAddress,
+    domainIdx ^ 1,
+  );
+  const data = encodeLpVaultCrankFees({ domain: domainIdx });
   const keys = [
-    { pubkey: keypair.publicKey, isSigner: true,  isWritable: false },
+    { pubkey: keypair.publicKey, isSigner: true,  isWritable: true  },
     { pubkey: market.slabAddress, isSigner: false, isWritable: true  },
     { pubkey: registryPda,        isSigner: false, isWritable: true  },
     { pubkey: ledgerPda,          isSigner: false, isWritable: true  },
+    { pubkey: siblingLedgerPda,   isSigner: false, isWritable: true  },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
   ];
   const ix = buildIx({ programId, keys, data });
 
@@ -1190,6 +1210,10 @@ export class CrankService {
         .in("slab_address", slabAddresses);
       if (error) {
         logger.warn("Supabase market metadata query error", { error: error.message });
+        // BUG-110: record so /health's monitors.db reflects real DB outcomes.
+        monitors.db.recordFailure(error.message).catch(() => {});
+      } else {
+        monitors.db.recordSuccess().catch(() => {});
       }
       if (data) {
         const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1208,6 +1232,7 @@ export class CrankService {
       logger.warn("Failed to fetch market metadata from Supabase", {
         error: err instanceof Error ? err.message : String(err),
       });
+      monitors.db.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
     }
 
     const discoveredKeys = new Set<string>();
@@ -1489,12 +1514,14 @@ export class CrankService {
         return "skipped";
       }
 
+      // ABI: close_q/fee_bps were REMOVED from the PermissionlessCrank wire
+      // upstream (#206) — the program derives the close size itself and rejects
+      // a nonzero funding rate. Passing them was a no-op at best; the SDK now
+      // rejects them at compile time.
       const crankData = encodePermissionlessCrank({
         action: CrankAction.FeeSweep,
         assetIndex: 0,
         nowSlot,
-        closeQ: 0n,
-        feeBps: 0n,
         recoveryReason: 0,
       });
 
@@ -1609,9 +1636,11 @@ export class CrankService {
         });
       }
 
-      // Detect NotInitialized (error 0x4) — permanently skip these markets
-      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery
-      if (errMsg.includes("custom program error: 0x4")) {
+      // Detect InvalidSlabLen (error 0x4) — permanently skip these markets.
+      // PERC-381: Track skip count and timestamp for exponential cooldown on rediscovery.
+      // Exact-code match: a substring check would also catch 0x40–0x4f / 0x400+
+      // and permanently skip a healthy market on an unrelated engine error.
+      if (isCustomProgramError(errMsg, 0x4)) {
         state.permanentlySkipped = true;
         state.permanentlySkippedAt = Date.now();
         state.skipCount = (state.skipCount ?? 0) + 1;
@@ -1796,7 +1825,34 @@ export class CrankService {
     // of toCrank, which includes markets whose own crank failed this batch).
     // Uses Promise.allSettled so failures don't block the cycle but work IS
     // tracked so shutdown can complete before new enqueues race the drain.
-    if (succeededSlabs.size > 0 && this._isRunning) {
+    // ─── v17 fee-split + backing-bucket recovery (tags 89/78/87/84) ──────────
+    // Supersedes the blind per-market crankLpVault() call below for v17 markets:
+    // that one fired tag 78 at every market every cycle without reading state,
+    // paying for a guaranteed revert whenever there were no fees and logging
+    // every rejection — including genuine faults — as "no fees to crank".
+    // runFeeCrankPass reads each market once and only sends where there is
+    // pending work. OFF unless KEEPER_FEE_CRANK_ENABLED=true.
+    if (succeededSlabs.size > 0 && this._isRunning && isFeeCrankEnabled()) {
+      const feeCrankMarkets: { address: PublicKey; programId: PublicKey }[] = [];
+      for (const slabAddress of succeededSlabs) {
+        const state = this.markets.get(slabAddress);
+        if (!state) continue;
+        feeCrankMarkets.push({
+          address: state.market.slabAddress,
+          programId: state.market.programId,
+        });
+      }
+      try {
+        await runFeeCrankPass(getConnection(), this._keypair, feeCrankMarkets);
+      } catch (err) {
+        // Whole-pass failure must never abort the crank cycle.
+        logger.warn("fee-crank pass threw (isolated)", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (succeededSlabs.size > 0 && this._isRunning && !isFeeCrankEnabled()) {
       const connection = getConnection();
       const keypair = this._keypair;
       const lpVaultTasks: Promise<void | string | null>[] = [];
@@ -2066,8 +2122,12 @@ export class CrankService {
             });
           }
         }
+        // BUG-110: the cycle (discovery + crank pass) completed without
+        // throwing — record so /health's monitors.scan reflects real outcomes.
+        monitors.scan.recordSuccess().catch(() => {});
       } catch (err) {
         logger.error("Crank cycle failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
+        monitors.scan.recordFailure(err instanceof Error ? err.message : String(err)).catch(() => {});
       } finally {
         this._cycling = false;
         // H4: disarm the watchdog on natural recovery so a transient slow

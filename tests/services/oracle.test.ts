@@ -12,38 +12,54 @@ vi.mock('@percolatorct/sdk', () => ({
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
-vi.mock('@percolatorct/shared', () => ({
-  config: {
-    programId: '11111111111111111111111111111111',
-    crankKeypair: 'mock-keypair-path',
-  },
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  getConnection: vi.fn(() => ({
-    getAccountInfo: vi.fn(),
-  })),
-  loadKeypair: vi.fn(() => ({
-    publicKey: new PublicKey('11111111111111111111111111111111'),
-    secretKey: new Uint8Array(64),
-  })),
-  sendWithRetry: vi.fn(async () => 'mock-signature'),
-  eventBus: {
-    publish: vi.fn(),
-  },
-  getErrorMessage: vi.fn((err: unknown) => {
-    if (err instanceof Error) return err.message;
-    return String(err);
-  }),
-  sendWarningAlert: vi.fn(),
-  sendCriticalAlert: vi.fn(),
-}));
+vi.mock('@percolatorct/shared', () => {
+  const makeMonitor = () => ({
+    recordSuccess: vi.fn(async () => {}),
+    recordFailure: vi.fn(async () => {}),
+    getErrorRate: vi.fn(() => 0),
+    getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })),
+  });
+  return {
+    config: {
+      programId: '11111111111111111111111111111111',
+      crankKeypair: 'mock-keypair-path',
+    },
+    createLogger: vi.fn(() => ({
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    })),
+    getConnection: vi.fn(() => ({
+      getAccountInfo: vi.fn(),
+    })),
+    loadKeypair: vi.fn(() => ({
+      publicKey: new PublicKey('11111111111111111111111111111111'),
+      secretKey: new Uint8Array(64),
+    })),
+    sendWithRetry: vi.fn(async () => 'mock-signature'),
+    eventBus: {
+      publish: vi.fn(),
+    },
+    getErrorMessage: vi.fn((err: unknown) => {
+      if (err instanceof Error) return err.message;
+      return String(err);
+    }),
+    sendWarningAlert: vi.fn(),
+    sendCriticalAlert: vi.fn(),
+    // BUG-110: src/lib/service-monitors.ts calls this at import time.
+    createServiceMonitors: vi.fn(() => ({
+      rpc: makeMonitor(),
+      scan: makeMonitor(),
+      oracle: makeMonitor(),
+      db: makeMonitor(),
+    })),
+  };
+});
 
 import { OracleService } from '../../src/services/oracle.js';
 import * as shared from '@percolatorct/shared';
+import { monitors } from '../../src/lib/service-monitors.js';
 
 describe('OracleService', () => {
   let oracleService: OracleService;
@@ -64,6 +80,7 @@ describe('OracleService', () => {
           {
             priceUsd: '1.23',
             liquidity: { usd: 100000 },
+            baseToken: { address: 'MINT_UNIQUE_1' },
           },
         ],
       };
@@ -96,6 +113,7 @@ describe('OracleService', () => {
           {
             priceUsd: 'invalid',
             liquidity: { usd: 100000 },
+            baseToken: { address: 'MINT_INVALID' },
           },
         ],
       };
@@ -123,6 +141,38 @@ describe('OracleService', () => {
 
       expect(price).toBeNull();
     });
+
+    // BUG-110: monitors.oracle was never wired to a real outcome -- /health's
+    // monitors.oracle sub-object was permanently-green placeholder data.
+    it('BUG-110: records monitors.oracle success on a reachable fetch', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ pairs: [{ priceUsd: '1.23', liquidity: { usd: 100000 } }] }),
+      } as any);
+
+      await oracleService.fetchDexScreenerPrice('MINT_MONITOR_OK');
+
+      expect(monitors.oracle.recordSuccess).toHaveBeenCalledTimes(1);
+      expect(monitors.oracle.recordFailure).not.toHaveBeenCalled();
+    });
+
+    it('BUG-110: records monitors.oracle failure on a network error', async () => {
+      vi.mocked(fetch).mockRejectedValueOnce(new Error('Network error'));
+
+      await oracleService.fetchDexScreenerPrice('MINT_MONITOR_FAIL');
+
+      expect(monitors.oracle.recordFailure).toHaveBeenCalledTimes(1);
+      expect(monitors.oracle.recordSuccess).not.toHaveBeenCalled();
+    });
+
+    it('BUG-110: records monitors.oracle failure on a non-ok HTTP response', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 429 } as any);
+
+      await oracleService.fetchDexScreenerPrice('MINT_MONITOR_429');
+
+      expect(monitors.oracle.recordFailure).toHaveBeenCalledWith('DexScreener HTTP 429');
+      expect(monitors.oracle.recordSuccess).not.toHaveBeenCalled();
+    });
   });
 
   describe('DexScreener cache', () => {
@@ -132,6 +182,7 @@ describe('OracleService', () => {
           {
             priceUsd: '2.50',
             liquidity: { usd: 200000 },
+            baseToken: { address: 'MINT_CACHE_TEST' },
           },
         ],
       };
@@ -154,10 +205,10 @@ describe('OracleService', () => {
 
     it('should refetch after cache TTL expires', async () => {
       const mockResponse1 = {
-        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
+        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_TTL_TEST' } }],
       };
       const mockResponse2 = {
-        pairs: [{ priceUsd: '2.00', liquidity: { usd: 200000 } }],
+        pairs: [{ priceUsd: '2.00', liquidity: { usd: 200000 }, baseToken: { address: 'MINT_TTL_TEST' } }],
       };
 
       let callCount = 0;
@@ -219,7 +270,7 @@ describe('OracleService', () => {
     it('should reject prices with >10% divergence between sources', async () => {
       // DexScreener: $1.00
       const dexResponse = {
-        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
+        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT999' } }],
       };
 
       // Jupiter: $1.50 (50% divergence)
@@ -241,7 +292,7 @@ describe('OracleService', () => {
     it('should accept prices with <10% divergence', async () => {
       // DexScreener: $1.00
       const dexResponse = {
-        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
+        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT888' } }],
       };
 
       // Jupiter: $1.05 (5% divergence)
@@ -267,7 +318,7 @@ describe('OracleService', () => {
       // Seed history with $1.00 for SLAB_HISTDEV
       vi.mocked(fetch)
         .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }),
+          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV_A' } }] }),
         } as any)
         .mockResolvedValueOnce({
           ok: true, json: async () => ({ data: { MINT_HISTDEV_A: { price: '1.00' } } }),
@@ -282,7 +333,7 @@ describe('OracleService', () => {
       // but fails the >30% historical deviation check.
       vi.mocked(fetch)
         .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.50', liquidity: { usd: 100000 } }] }),
+          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.50', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV_B' } }] }),
         } as any)
         .mockResolvedValueOnce({
           ok: true, json: async () => ({ data: { MINT_HISTDEV_B: { price: '1.50' } } }),
@@ -296,7 +347,7 @@ describe('OracleService', () => {
       // Seed history with $1.00 for SLAB_HISTDEV2
       vi.mocked(fetch)
         .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }),
+          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV2_A' } }] }),
         } as any)
         .mockResolvedValueOnce({
           ok: true, json: async () => ({ data: { MINT_HISTDEV2_A: { price: '1.00' } } }),
@@ -308,7 +359,7 @@ describe('OracleService', () => {
       // New price = $1.20 (20% above history) — within 30% threshold → accepted
       vi.mocked(fetch)
         .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.20', liquidity: { usd: 100000 } }] }),
+          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.20', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV2_B' } }] }),
         } as any)
         .mockResolvedValueOnce({
           ok: true, json: async () => ({ data: { MINT_HISTDEV2_B: { price: '1.20' } } }),
@@ -323,7 +374,7 @@ describe('OracleService', () => {
       // First call for a brand-new slab → no history → no deviation check → accepted
       vi.mocked(fetch)
         .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '9999.00', liquidity: { usd: 100000 } }] }),
+          ok: true, json: async () => ({ pairs: [{ priceUsd: '9999.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV3' } }] }),
         } as any)
         .mockResolvedValueOnce({
           ok: true, json: async () => ({ data: { MINT_HISTDEV3: { price: '9999.00' } } }),
@@ -351,7 +402,10 @@ describe('OracleService', () => {
       vi.mocked(fetch).mockImplementation(async (url) => {
         const u = typeof url === 'string' ? url : (url as Request).toString();
         if (u.includes('dexscreener')) {
-          return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }) } as any;
+          // Thread the queried mint out of the request URL so the fixture's
+          // baseToken always matches whichever mint is being fetched.
+          const dexMint = decodeURIComponent(u.split('/tokens/')[1] ?? 'UNKNOWN');
+          return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: dexMint } }] }) } as any;
         }
         const m = u.match(/ids=([^&]+)/);
         const mint = m ? decodeURIComponent(m[1]!) : 'UNKNOWN';
@@ -426,7 +480,7 @@ describe('OracleService', () => {
   describe('price history tracking', () => {
     it('should track price history up to max entries per market', async () => {
       const mockResponse = {
-        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
+        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTORY' } }],
       };
 
       vi.mocked(fetch).mockResolvedValue({
@@ -447,14 +501,17 @@ describe('OracleService', () => {
     });
 
     it('should track up to max markets (500)', async () => {
-      const mockResponse = {
-        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
-      };
-
-      vi.mocked(fetch).mockResolvedValue({
-        ok: true,
-        json: async () => mockResponse,
-      } as any);
+      // Different mints are fetched across this loop (MINT0..MINT500), so the
+      // fixture must thread the actual queried mint out of the request URL
+      // rather than hardcoding a single baseToken address.
+      vi.mocked(fetch).mockImplementation(async (url) => {
+        const u = typeof url === 'string' ? url : (url as Request).toString();
+        const mint = decodeURIComponent(u.split('/tokens/')[1] ?? 'UNKNOWN');
+        return {
+          ok: true,
+          json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: mint } }] }),
+        } as any;
+      });
 
       // Add first market
       await oracleService.fetchPrice('MINT0', 'SLAB0');
@@ -479,7 +536,7 @@ describe('OracleService', () => {
   describe('in-flight request deduplication', () => {
     it('should deduplicate concurrent DexScreener requests', async () => {
       const mockResponse = {
-        pairs: [{ priceUsd: '3.14', liquidity: { usd: 100000 } }],
+        pairs: [{ priceUsd: '3.14', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_DEDUP' } }],
       };
 
       let fetchCount = 0;
@@ -539,7 +596,7 @@ describe('OracleService', () => {
   describe('getCurrentPrice', () => {
     it('should return latest price from history', async () => {
       const mockResponse = {
-        pairs: [{ priceUsd: '4.56', liquidity: { usd: 100000 } }],
+        pairs: [{ priceUsd: '4.56', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_CURRENT' } }],
       };
 
       vi.mocked(fetch).mockResolvedValue({
