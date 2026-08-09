@@ -649,7 +649,28 @@ export class LiquidationService {
   // scan budget. Residual positions above the cap are picked up next cycle.
   private _cycleSeenPositions = new Set<string>();
   private _cycleOwnerCounts = new Map<string, number>();
-  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE = 3;
+  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE =
+    Number(process.env.KEEPER_MAX_LIQ_PER_OWNER_PER_CYCLE ?? 3);
+  /**
+   * KEEPER-11: the event path gets its OWN per-owner budget rather than sharing
+   * the polling scan's.
+   *
+   * The bug being fixed is that a LaserStream burst covering several positions of
+   * one owner consumed the shared cap before the polling scan reached those
+   * positions, so genuinely underwater accounts were skipped. Exempting the event
+   * path entirely would fix that but leave it unbounded — and it is the one path
+   * an attacker can provoke on demand by touching their own account. The cap is
+   * defence-in-depth against the KEEPER's own mispricing, not against the
+   * attacker, so removing it multiplies the blast radius of a keeper-side price
+   * bug on precisely the cheapest path to trigger.
+   *
+   * Two counters, two limits: a burst can no longer starve the scan, and neither
+   * path is unbounded. Both are env-tunable so the limits can be raised during a
+   * genuine cascade without a redeploy.
+   */
+  private _eventCycleOwnerCounts = new Map<string, number>();
+  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT =
+    Number(process.env.KEEPER_MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT ?? 10);
   // H-1: positions with a liquidate() call currently in flight (added before
   // awaiting liquidate(), removed in a finally once it settles). Intentionally
   // separate from _cycleSeenPositions above: that Set is cleared at the start
@@ -989,17 +1010,25 @@ export class LiquidationService {
       });
       return null;
     }
-    if (source === "polling") {
-      const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
-      if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
-        logger.debug("Owner hit per-cycle liquidation cap", {
-          owner: candidate.owner.slice(0, 8),
-          cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
-        });
-        return null;
-      }
-      this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
+    // KEEPER-11: independent budgets per source. An event burst draws on
+    // _eventCycleOwnerCounts, so it cannot exhaust the polling scan's allowance
+    // for the same owner — and it is still bounded.
+    const counts =
+      source === "laserstream" ? this._eventCycleOwnerCounts : this._cycleOwnerCounts;
+    const cap =
+      source === "laserstream"
+        ? LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT
+        : LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE;
+    const ownerCount = counts.get(candidate.owner) ?? 0;
+    if (ownerCount >= cap) {
+      logger.debug("Owner hit per-cycle liquidation cap", {
+        owner: candidate.owner.slice(0, 8),
+        cap,
+        source,
+      });
+      return null;
     }
+    counts.set(candidate.owner, ownerCount + 1);
     this._cycleSeenPositions.add(positionKey);
     this._inFlightPositions.add(positionKey);
     try {
@@ -1486,6 +1515,9 @@ export class LiquidationService {
     // away part of the exposure; partial-fill retry is intentional).
     this._cycleSeenPositions.clear();
     this._cycleOwnerCounts.clear();
+    // KEEPER-11: the event budget resets on the same cycle boundary, so an
+    // exhausted event allowance recovers rather than latching for the process.
+    this._eventCycleOwnerCounts.clear();
 
     // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
     // Markets re-add themselves on next parse failure, so this is safe.

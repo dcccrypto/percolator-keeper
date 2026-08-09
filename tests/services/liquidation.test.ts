@@ -1743,3 +1743,125 @@ describe('LiquidationService', () => {
     });
   });
 });
+
+/**
+ * KEEPER-11: a LaserStream burst for several positions of one owner used to
+ * consume MAX_LIQ_PER_OWNER_PER_CYCLE before the polling scan could reach those
+ * positions, so genuinely underwater accounts were skipped.
+ *
+ * The original fix exempted the event path from the cap entirely. That is the
+ * one path an attacker can trigger on demand (by touching their own account),
+ * and the cap is defence-in-depth against the KEEPER's own mispricing rather
+ * than against the attacker -- so removing it multiplies the blast radius of a
+ * keeper-side price bug on exactly the path that is cheapest to provoke.
+ *
+ * Two independent budgets instead: the polling scan keeps its cap, and the event
+ * path gets its own, larger one. A burst can no longer starve the scan, and
+ * neither path is unbounded.
+ */
+describe('KEEPER-11: per-owner caps are independent per source', () => {
+  // mockOracleService lives inside the LiquidationService describe; this block
+  // is top-level, so it supplies its own. Only fetchPrice is reached here.
+  const oracleStub: any = {
+    fetchPrice: vi.fn().mockResolvedValue({
+      priceE6: 1_000_000n,
+      source: 'dexscreener',
+      timestamp: 1_700_000_000_000,
+    }),
+  };
+
+  function makeMarketAt(slabAddr: string) {
+    return {
+      slabAddress: { toBase58: () => slabAddr, equals: () => false },
+      programId: { toBase58: () => 'ProgramId1111111111111111111111111111111' },
+      config: {
+        collateralMint: { toBase58: () => 'Mint111111111111111111111111111111111111' },
+        oracleAuthority: mockZeroKey(),
+        indexFeedId: mockNonZeroKey('feed'),
+      },
+      params: { maintenanceMarginBps: 500n },
+      header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+    };
+  }
+
+  function candidateAt(slab: string, accountIdx: number, owner: string) {
+    return {
+      slabAddress: slab,
+      accountIdx,
+      owner,
+      positionSize: 1_000n,
+      capital: 100n,
+      pnl: -50n,
+      marginRatio: 4.0,
+      maintenanceMarginBps: 500n,
+    };
+  }
+
+  /** Distinct positions of ONE owner, so only the per-owner cap can stop them. */
+  async function drain(
+    svc: any, market: any, owner: string, n: number, source?: string, idxFrom = 0,
+  ) {
+    let landed = 0;
+    for (let i = 0; i < n; i++) {
+      // Distinct accountIdx per call: _cycleSeenPositions dedups by position, so
+      // reusing indices would mask the per-owner cap under the dedup guard.
+      const sig = await svc.gatedLiquidate(market, candidateAt('Slab', idxFrom + i, owner), source);
+      if (sig) landed++;
+    }
+    return landed;
+  }
+
+  it('still caps the polling path at MAX_LIQ_PER_OWNER_PER_CYCLE', async () => {
+    const svc: any = new LiquidationService(oracleStub);
+    vi.spyOn(svc, 'liquidate').mockResolvedValue('sig');
+    const cap = LiquidationService['MAX_LIQ_PER_OWNER_PER_CYCLE'];
+
+    expect(await drain(svc, makeMarketAt('Slab'), 'OwnerPoll', cap + 5, 'polling')).toBe(cap);
+  });
+
+  it('gives the event path its own, larger budget rather than no budget at all', async () => {
+    const svc: any = new LiquidationService(oracleStub);
+    vi.spyOn(svc, 'liquidate').mockResolvedValue('sig');
+    const eventCap = LiquidationService['MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT'];
+
+    expect(eventCap).toBeGreaterThan(LiquidationService['MAX_LIQ_PER_OWNER_PER_CYCLE']);
+    // Bounded: an event burst cannot liquidate an owner without limit.
+    expect(await drain(svc, makeMarketAt('Slab'), 'OwnerEvt', eventCap + 5, 'laserstream')).toBe(eventCap);
+  });
+
+  it('an event burst does not consume the polling scan budget (the original bug)', async () => {
+    const svc: any = new LiquidationService(oracleStub);
+    vi.spyOn(svc, 'liquidate').mockResolvedValue('sig');
+    const owner = 'OwnerShared';
+    const pollCap = LiquidationService['MAX_LIQ_PER_OWNER_PER_CYCLE'];
+
+    // Exhaust the event budget first...
+    await drain(svc, makeMarketAt('Slab'), owner, LiquidationService['MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT'], 'laserstream');
+    // ...the polling scan must still get its full allowance for the same owner,
+    // on positions the event path did not already take.
+    const polled = await drain(svc, makeMarketAt('Slab'), owner, pollCap + 3, 'polling', 1_000);
+
+    expect(polled).toBe(pollCap);
+  });
+
+  it('defaults to the polling budget when no source is given', async () => {
+    const svc: any = new LiquidationService(oracleStub);
+    vi.spyOn(svc, 'liquidate').mockResolvedValue('sig');
+    const cap = LiquidationService['MAX_LIQ_PER_OWNER_PER_CYCLE'];
+
+    expect(await drain(svc, makeMarketAt('Slab'), 'OwnerDefault', cap + 5)).toBe(cap);
+  });
+
+  it('clears both counters at the cycle boundary', async () => {
+    const svc: any = new LiquidationService(oracleStub);
+    vi.spyOn(svc, 'liquidate').mockResolvedValue('sig');
+    await drain(svc, makeMarketAt('Slab'), 'OwnerReset', 2, 'polling');
+    await drain(svc, makeMarketAt('Slab'), 'OwnerReset', 2, 'laserstream');
+
+    svc._cycleOwnerCounts.clear();
+    svc._eventCycleOwnerCounts.clear();
+
+    expect(svc._cycleOwnerCounts.size).toBe(0);
+    expect(svc._eventCycleOwnerCounts.size).toBe(0);
+  });
+});
