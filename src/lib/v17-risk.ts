@@ -1,18 +1,44 @@
-const V17_HEADER_LEN = 16;
-const V17_WRAPPER_CONFIG_LEN = 432;
-// V17_MARKET_GROUP_OFF is exported below for use by callers (per-asset price reading).
-const V17_MARKET_GROUP_ID_LEN = 32;
+/**
+ * ⚠ LAYOUT CONSTANTS COME FROM `v17-layout.ts` (which imports them from
+ * `@percolatorct/sdk`). They used to be hardcoded here, and
+ * `V17_WRAPPER_CONFIG_LEN` was stuck at 432 while the deployed wrapper moved to
+ * 496 and then 576. Since the wrapper config sits between the account header and
+ * the market-group header, every constant below it was 144 bytes off, and this
+ * module was silently parsing risk params out of the wrapper config's oracle-leg
+ * arrays instead of the engine config.
+ *
+ * Do not reintroduce a literal here. If an offset is missing, add it to
+ * `v17-layout.ts` where the boot-time structural assertions can police it.
+ */
+import {
+  ASSET_EFFECTIVE_PRICE_OFF,
+  ASSET_RAW_ORACLE_TARGET_PRICE_OFF,
+  ASSET_SLOT_WRAPPER_PREFIX_LEN,
+  ENGINE_ASSET_SLOT_DERIVED_LEN,
+  MG_CONFIG_OFF,
+  V16_CFG_H_MAX_OFF,
+  V16_CFG_H_MIN_OFF,
+  V16_CFG_LIQUIDATION_FEE_BPS_OFF,
+  V16_CFG_MAINTENANCE_MARGIN_BPS_OFF,
+  V16_CFG_MIN_NONZERO_MM_REQ_OFF,
+  V17_HEADER_LEN,
+  V17_MARKET_ASSET_SLOT_LEN,
+  V17_MARKET_GROUP_LEN,
+  V17_MARKET_GROUP_OFF,
+  engineConfigFieldOff,
+} from "./v17-layout.js";
 
-// ─── Exported layout constants ────────────────────────────────────────────────
+// ─── Exported layout constants (re-derived from the SDK, not hardcoded) ───────
 
-export const V17_MARKET_GROUP_OFF = V17_HEADER_LEN + V17_WRAPPER_CONFIG_LEN; // 448
-export const V17_MARKET_GROUP_LEN = 758; // MarketGroupV16HeaderAccount size
-export const V17_ENGINE_ASSET_SLOT_LEN = 1285; // EngineAssetSlotV16Account size
-export const V17_ASSET_ORACLE_WRAPPER_LEN = 512; // ASSET_ORACLE_WRAPPER_LEN constant
-export const V17_ASSET_SLOT_STRIDE = 1797; // ASSET_ORACLE_WRAPPER_LEN + ENGINE_ASSET_SLOT_LEN
-// offset of effective_price within EngineAssetSlotV16Account (after the ORACLE_WRAPPER prefix)
-// = 8 (market_id) + 8 (retired_slot) + 1 (lifecycle) + 8 (raw_oracle_target_price) = 25
-export const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = 25;
+export { V17_MARKET_GROUP_OFF, V17_MARKET_GROUP_LEN };
+/** `EngineAssetSlotV16Account` size. */
+export const V17_ENGINE_ASSET_SLOT_LEN = ENGINE_ASSET_SLOT_DERIVED_LEN;
+/** Wrapper-side oracle prefix preceding each engine asset slot. */
+export const V17_ASSET_ORACLE_WRAPPER_LEN = ASSET_SLOT_WRAPPER_PREFIX_LEN;
+/** Per-asset stride = oracle wrapper prefix + engine asset slot. */
+export const V17_ASSET_SLOT_STRIDE = V17_MARKET_ASSET_SLOT_LEN;
+/** Offset of `effective_price` within `EngineAssetSlotV16Account`. */
+export const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = ASSET_EFFECTIVE_PRICE_OFF;
 // #335: offset of raw_oracle_target_price within EngineAssetSlotV16Account (after the
 // ORACLE_WRAPPER prefix). It is the field immediately BEFORE effective_price:
 // = 8 (market_id) + 8 (retired_slot) + 1 (lifecycle) = 17.
@@ -20,18 +46,26 @@ export const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = 25;
 // struct is #[repr(C)] over alignment-1 byte-array fields (V16PodU64 = [u8;8], no
 // padding), so raw_oracle_target_price (V16PodU64) sits at byte 17 and effective_price
 // at byte 25. (src/v16.rs:1168 target_effective_lag_adverse_delta consumes both.)
-export const V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT = 17;
-// absolute offset of min_nonzero_mm_req in the market account data
-// = V17_ENGINE_CONFIG_OFF + V16PodU16(2) + V16PodU32(4) = 480 + 6 = 486
-export const V17_MIN_NONZERO_MM_REQ_OFF = 486;
+export const V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT = ASSET_RAW_ORACLE_TARGET_PRICE_OFF;
+/**
+ * Absolute offset of `min_nonzero_mm_req` in the market account data.
+ * = market group + V16ConfigAccount + max_portfolio_assets(u16) + max_market_slots(u32).
+ */
+export const V17_MIN_NONZERO_MM_REQ_OFF = engineConfigFieldOff(V16_CFG_MIN_NONZERO_MM_REQ_OFF);
 
-const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_ID_LEN;
+const V17_ENGINE_CONFIG_OFF = V17_MARKET_GROUP_OFF + MG_CONFIG_OFF;
 
-const V17_ENGINE_CONFIG_H_MIN_OFF = 38;
-const V17_ENGINE_CONFIG_H_MAX_OFF = 46;
-const V17_ENGINE_CONFIG_MAINTENANCE_MARGIN_BPS_OFF = 54;
-const V17_ENGINE_CONFIG_LIQUIDATION_FEE_BPS_OFF = 78;
+const V17_ENGINE_CONFIG_H_MIN_OFF = V16_CFG_H_MIN_OFF;
+const V17_ENGINE_CONFIG_H_MAX_OFF = V16_CFG_H_MAX_OFF;
+const V17_ENGINE_CONFIG_MAINTENANCE_MARGIN_BPS_OFF = V16_CFG_MAINTENANCE_MARGIN_BPS_OFF;
+const V17_ENGINE_CONFIG_LIQUIDATION_FEE_BPS_OFF = V16_CFG_LIQUIDATION_FEE_BPS_OFF;
 
+/**
+ * `maintenance_fee_per_slot` within the WRAPPER config (not the engine config),
+ * so this offset is relative to the account header and does NOT move when the
+ * wrapper config grows at its tail — all fee-split/protocol-fee additions were
+ * appended after this field.
+ */
 const V17_WRAPPER_MAINTENANCE_FEE_PER_SLOT_OFF = V17_HEADER_LEN + 96;
 
 export const V17_RISK_PARAMS_MIN_DATA_LEN = Math.max(

@@ -54,13 +54,24 @@ const ALERT_COOLDOWN_MS = 5 * 60_000;
 
 export interface MarketInvariantResult {
   slabAddress: string;
-  ok: boolean;
-  /** Actual SPL token balance in the vault token account */
-  vaultTokenBalance: string;
-  /** engine.vault — what the program believes is in the vault */
-  engineVault: string;
-  /** Shortfall: engineVault - vaultTokenBalance (0n when ok) */
-  shortfall: string;
+  /**
+   * true  = invariant evaluated and holds
+   * false = invariant evaluated and VIOLATED (funds may have leaked)
+   * null  = NOT EVALUATED — no conclusion available
+   *
+   * #347: `null` exists because this used to report `true` for v17 markets
+   * without checking anything. Since the v17 cutover that is every production
+   * market, so the only fund-conservation tripwire in the codebase was emitting
+   * a green signal it had never computed. An unevaluated check must never be
+   * indistinguishable from a passing one.
+   */
+  ok: boolean | null;
+  /** Actual SPL token balance in the vault token account. null when unevaluated. */
+  vaultTokenBalance: string | null;
+  /** engine.vault — what the program believes is in the vault. null when unevaluated. */
+  engineVault: string | null;
+  /** Shortfall: engineVault - vaultTokenBalance (0n when ok). null when unevaluated. */
+  shortfall: string | null;
   checkedAt: number;
   skippedReason?: string;
 }
@@ -196,14 +207,25 @@ export class MonitorService {
           `fetchSlab(${slabAddress.slice(0, 8)})`,
         );
         if (isV17Account(data)) {
+          // #347: report UNCHECKED, not healthy. The legacy formula reads
+          // engine.vault, a v12 field, so it genuinely cannot run here — but
+          // "the old formula doesn't apply" is not "the vault is fine". The
+          // zeroed balances were just as misleading as ok:true: a dashboard
+          // showing shortfall "0" reads as "checked, nothing missing".
+          //
+          // A real v17 invariant (sum insurance fund + Σ portfolio capital/pnl
+          // backing vs getTokenAccountBalance) still needs building — see #347.
+          // Until then this surfaces the gap instead of masking it.
           this._invariantResults.set(slabAddress, {
             slabAddress,
-            ok: true,
-            vaultTokenBalance: "0",
-            engineVault: "0",
-            shortfall: "0",
+            ok: null,
+            vaultTokenBalance: null,
+            engineVault: null,
+            shortfall: null,
             checkedAt: now,
-            skippedReason: "v17 market account: legacy engine.vault invariant is not applicable",
+            skippedReason:
+              "UNCHECKED — v17 market account: the legacy engine.vault invariant does not apply " +
+              "and no v17 equivalent is implemented yet (#347). This is NOT a passing check.",
           });
           this._adlStalenessResults.set(slabAddress, {
             slabAddress,

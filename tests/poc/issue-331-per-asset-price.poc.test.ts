@@ -1,18 +1,29 @@
 import { describe, it, expect } from "vitest";
 
-// Constants from v17-risk.ts (mirrored here to keep test self-contained)
-const V17_MARKET_GROUP_OFF = 448;
-const V17_MARKET_GROUP_LEN = 758;
-const V17_ASSET_ORACLE_WRAPPER_LEN = 512;
-const V17_ENGINE_ASSET_SLOT_LEN = 1285;
-const V17_ASSET_SLOT_STRIDE = V17_ASSET_ORACLE_WRAPPER_LEN + V17_ENGINE_ASSET_SLOT_LEN;
-const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = 25;
+// Offsets come from the PRODUCTION modules, not a local copy.
+//
+// This test used to mirror the constants "to keep the test self-contained",
+// which made it a tautology: it computed an offset from its own copies and
+// asserted the result equalled the same copies re-added by hand. It could not
+// fail no matter what the keeper actually did, and it happily kept passing
+// through the entire period when production was reading v17 markets at the
+// stale 432-byte-config layout. Importing the real functions is what makes this
+// a test rather than an arithmetic identity.
+import {
+  V17_MARKET_GROUP_OFF,
+  V17_MARKET_GROUP_LEN,
+  V17_ASSET_ORACLE_WRAPPER_LEN,
+  V17_ASSET_SLOT_STRIDE,
+  V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT,
+} from "../../src/lib/v17-risk.js";
+import { engineAssetSlotOff } from "../../src/lib/v17-layout.js";
 
 function computeEffectivePriceOffset(assetIndex: number): number {
-  return V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN
-    + assetIndex * V17_ASSET_SLOT_STRIDE
-    + V17_ASSET_ORACLE_WRAPPER_LEN
-    + V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT;
+  return engineAssetSlotOff(assetIndex) + V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT;
+}
+
+function off0Expected(): number {
+  return V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + V17_ASSET_ORACLE_WRAPPER_LEN + 25;
 }
 
 function readU64LE(data: Uint8Array, offset: number): bigint {
@@ -26,7 +37,10 @@ function readU64LE(data: Uint8Array, offset: number): bigint {
 describe("issue-331: per-asset effective_price byte offset", () => {
   it("reads effective_price at correct offset for asset 0", () => {
     const off0 = computeEffectivePriceOffset(0);
-    expect(off0).toBe(448 + 758 + 512 + 25); // 1743
+    // Post-fee-split: market group at 592 (was 448 under the stale 432-byte
+    // wrapper config), + header 758 + oracle wrapper prefix 512 + 25 = 1887.
+    expect(off0).toBe(V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + V17_ASSET_ORACLE_WRAPPER_LEN + 25);
+    expect(off0).toBe(1887);
 
     // Build a mock market data buffer with a known price at that offset
     const bufLen = off0 + 8;
@@ -41,7 +55,9 @@ describe("issue-331: per-asset effective_price byte offset", () => {
 
   it("reads effective_price at correct offset for asset 1", () => {
     const off1 = computeEffectivePriceOffset(1);
-    expect(off1).toBe(448 + 758 + 1797 + 512 + 25); // 1743 + 1797 = 3540
+    // One full stride (1797) past asset 0: 1887 + 1797 = 3684.
+    expect(off1).toBe(off0Expected() + V17_ASSET_SLOT_STRIDE);
+    expect(off1).toBe(3684);
 
     const bufLen = off1 + 8;
     const buf = new Uint8Array(bufLen);

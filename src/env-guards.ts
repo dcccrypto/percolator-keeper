@@ -279,5 +279,27 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
           "would fire and vanish with no operator-visible signal.",
       );
     }
+
+    // BUG-101: keeper-send.ts's isMainnetSender() is a literal
+    // `USE_HELIUS_SENDER === "true"` check with no NETWORK-based default --
+    // unset or any non-"true" value silently falls back to plain
+    // sendRawTransaction broadcast (skipPreflight, no Jito bundle) to public
+    // RPCs, exposing the liquidation target pubkey and close size to any RPC
+    // operator or mempool listener before confirmation (front-running /
+    // liquidation-sniping). .env.example documents USE_HELIUS_SENDER=true as
+    // the mainnet default, but nothing enforced it -- a deployment built from
+    // a partial env (not copying that line) degraded silently with zero
+    // boot-time signal, unlike every other mainnet-critical setting in this
+    // file. Require it explicitly, mirroring the H-7 DISCORD_ALERT_WEBHOOK guard.
+    if (env.USE_HELIUS_SENDER !== "true") {
+      throw new Error(
+        "USE_HELIUS_SENDER must be set to 'true' when NETWORK=mainnet. It is " +
+          "unset or not 'true', and keeper-send.ts's isMainnetSender() would " +
+          "silently fall back to plain sendRawTransaction broadcast to public " +
+          "RPCs with no Jito-bundle protection -- exposing the liquidation " +
+          "target and size to front-running/sandwiching before confirmation. " +
+          "Set USE_HELIUS_SENDER=true (see .env.example) for mainnet.",
+      );
+    }
   }
 }

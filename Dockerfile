@@ -6,8 +6,12 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json pnpm-lock.yaml ./
+# Copy package files. pnpm-workspace.yaml is required: it is where pnpm.overrides
+# now live (moved out of package.json in 989d893), and --frozen-lockfile compares
+# the resolved overrides against the ones recorded in pnpm-lock.yaml. Without this
+# file pnpm sees no overrides, disagrees with the lockfile, and fails the build
+# with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # SDK is now on npm (@percolatorct/sdk) — no vendor directory needed
 
@@ -32,8 +36,9 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 
 WORKDIR /app
 
-# Copy package files for prod-only install
-COPY package.json pnpm-lock.yaml ./
+# Copy package files for prod-only install. pnpm-workspace.yaml carries the
+# overrides the lockfile was resolved with — see the builder stage above.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # K-NEW-1: install production deps only — excludes vitest, vite, tsx, @types/*
 # and their associated CVEs from the final image. (pnpm install --prod is deprecated;

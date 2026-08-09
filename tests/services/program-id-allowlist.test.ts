@@ -17,7 +17,12 @@ const C = vi.hoisted(() => ({
   ownerToReturn: "" as string, // set per test
 }));
 
-vi.mock("@percolatorct/sdk", () => ({
+// Partial mock: real exports fill anything this factory does not override.
+// A full-replacement mock silently breaks whenever the source under test
+// imports a new SDK export (e.g. the v17 layout constants), and the failure
+// surfaces as an unrelated "no export defined on the mock" at import time.
+vi.mock("@percolatorct/sdk", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   discoverMarkets: vi.fn(async () => []),
   // v17 SDK API (replaces encodeKeeperCrank / encodeUpdateHyperpMark)
   encodePermissionlessCrank: vi.fn(() => Buffer.from([5, 0, 0, 0, 0, 0])),
@@ -62,6 +67,11 @@ vi.mock("@percolatorct/shared", () => ({
   getSupabase: vi.fn(() => ({
     from: vi.fn(() => ({ select: vi.fn(() => ({ in: vi.fn(async () => ({ data: [], error: null })) })) })),
   })),
+  // BUG-110: src/lib/service-monitors.ts calls this at import time.
+  createServiceMonitors: vi.fn(() => {
+    const m = () => ({ recordSuccess: vi.fn(async () => {}), recordFailure: vi.fn(async () => {}), getErrorRate: vi.fn(() => 0), getStatus: vi.fn(() => ({ healthy: true, consecutiveFailures: 0, errorRate: 0, timeSinceSuccessMs: 0, alertActive: false })) });
+    return { rpc: m(), scan: m(), oracle: m(), db: m() };
+  }),
 }));
 vi.mock("../../src/lib/keeper-send.js", async () => {
   const { KeeperBudget } = await vi.importActual<typeof import("../../src/lib/budget.js")>("../../src/lib/budget.js");

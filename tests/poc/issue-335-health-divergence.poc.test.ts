@@ -22,18 +22,24 @@
 import { describe, it, expect } from "vitest";
 import { evaluateV17PortfolioHealth } from "../../src/services/liquidation.js";
 
-// Per-asset slot byte offsets (must match src/lib/v17-risk.ts).
-const V17_MARKET_GROUP_OFF = 448;
-const V17_MARKET_GROUP_LEN = 758;
-const V17_ASSET_ORACLE_WRAPPER_LEN = 512;
-const V17_ASSET_SLOT_STRIDE = 1797;
-const V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT = 25;
-const V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT = 17;
+// Per-asset slot byte offsets — IMPORTED, not copied.
+//
+// These used to be duplicated here as literals ("must match src/lib/v17-risk.ts"),
+// including V17_MARKET_GROUP_OFF = 448, which was derived from the stale
+// V17_WRAPPER_CONFIG_LEN = 432. Because the fixture builder and the code under
+// test shared the same wrong number, the test passed while the evaluator was
+// misreading every real market account. When the constant was corrected to 592
+// the fixture kept writing at 448 and the reader fell off the end of the buffer,
+// silently returning 0n ("unknown") and dropping the lag penalty — which is how
+// this duplication finally surfaced.
+import {
+  V17_EFFECTIVE_PRICE_OFF_IN_ASSET_SLOT,
+  V17_RAW_ORACLE_TARGET_PRICE_OFF_IN_ASSET_SLOT,
+} from "../../src/lib/v17-risk.js";
+import { engineAssetSlotOff } from "../../src/lib/v17-layout.js";
 
 function slotBase(assetIndex: number): number {
-  return V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN
-    + assetIndex * V17_ASSET_SLOT_STRIDE
-    + V17_ASSET_ORACLE_WRAPPER_LEN;
+  return engineAssetSlotOff(assetIndex);
 }
 
 /**
