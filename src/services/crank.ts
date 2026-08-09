@@ -1,5 +1,7 @@
 import { PublicKey, SystemProgram, Keypair } from "@solana/web3.js";
+import { Connection as SolanaConnection } from "@solana/web3.js";
 import type { Connection, TransactionInstruction } from "@solana/web3.js";
+import { resolveMainnetCAs, type MainnetAccountReader } from "../lib/mainnet-ca-validator.js";
 import {
   discoverMarkets,
   encodePermissionlessCrank,
@@ -44,6 +46,33 @@ import { isFeeCrankEnabled, runFeeCrankPass } from "./fee-crank.js";
 export type CrankResult = "success" | "skipped" | "failed";
 
 const logger = createLogger("keeper:crank");
+
+/**
+ * Lazily-built, cached mainnet connection used solely to verify `mainnet_ca`
+ * overrides (KEEPER-9). Deliberately separate from getConnection(): the keeper
+ * that actually uses mainnet_ca runs on devnet, so its own connection cannot
+ * resolve a mainnet mint. Returns null when MAINNET_RPC_URL is unset, in which
+ * case the validator degrades to a format check.
+ */
+let _mainnetReader: MainnetAccountReader | null | undefined;
+function getMainnetReader(): MainnetAccountReader | null {
+  if (_mainnetReader !== undefined) return _mainnetReader;
+  const url = process.env.MAINNET_RPC_URL;
+  if (!url) {
+    _mainnetReader = null;
+    return null;
+  }
+  const conn = new SolanaConnection(url, "confirmed");
+  _mainnetReader = {
+    getMultipleAccountsInfo: (keys) => conn.getMultipleAccountsInfo(keys, "confirmed"),
+  };
+  return _mainnetReader;
+}
+
+/** Test seam: drops the cached mainnet connection. */
+export function __resetMainnetReaderForTests(): void {
+  _mainnetReader = undefined;
+}
 
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
 const RPC_TIMEOUT_MS = 15_000;
@@ -1215,54 +1244,12 @@ export class CrankService {
         monitors.db.recordSuccess().catch(() => {});
       }
       if (data) {
-        const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-        // SPL Token program ID — mainnet_ca must be an account owned by this program.
-        // This prevents a poisoned Supabase row from redirecting the fraud-detector's
-        // price lookup to an attacker-controlled address (KEEPER-9).
-        const SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-        const conn = getConnection();
-
-        // Collect candidates that pass base58 check, then batch-validate on-chain ownership.
-        const candidates: Array<{ slabAddress: string; ca: string }> = [];
-        for (const row of data) {
-          const ca = row.mainnet_ca ?? undefined;
-          if (!ca) { dbMarkets.set(row.slab_address, {}); continue; }
-          if (!base58Re.test(ca)) {
-            logger.warn("Invalid mainnet_ca from Supabase (bad base58), ignoring", { slabAddress: row.slab_address, mainnetCA: ca });
-            dbMarkets.set(row.slab_address, {});
-            continue;
-          }
-          candidates.push({ slabAddress: row.slab_address, ca });
-        }
-
-        // Batch fetch account infos to verify each mainnet_ca is an SPL Token mint.
-        if (candidates.length > 0) {
-          try {
-            const pubkeys = candidates.map((c) => new PublicKey(c.ca));
-            const accountInfos = await conn.getMultipleAccountsInfo(pubkeys, "confirmed");
-            for (let i = 0; i < candidates.length; i++) {
-              const { slabAddress, ca } = candidates[i]!;
-              const info = accountInfos[i];
-              if (!info || info.owner.toBase58() !== SPL_TOKEN_PROGRAM) {
-                logger.warn("mainnet_ca is not an SPL Token mint — ignoring", {
-                  slabAddress,
-                  mainnetCA: ca,
-                  actualOwner: info?.owner.toBase58() ?? "not found",
-                });
-                dbMarkets.set(slabAddress, {});
-              } else {
-                dbMarkets.set(slabAddress, { mainnetCA: ca });
-              }
-            }
-          } catch (verifyErr) {
-            logger.warn("Failed to verify mainnet_ca mint ownership — ignoring all mainnet_ca overrides this cycle", {
-              error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
-            });
-            for (const { slabAddress } of candidates) {
-              dbMarkets.set(slabAddress, {});
-            }
-          }
-        }
+        // KEEPER-9: validate each mainnet_ca before it can become a price-lookup
+        // key in fraud-detector.ts. Verification runs against MAINNET, not
+        // getConnection(): mainnet_ca exists only for devnet mirror-mint markets,
+        // so checking it on the keeper's own network would look a mainnet mint up
+        // on devnet, find nothing, and reject every override.
+        dbMarkets = await resolveMainnetCAs(data, { reader: getMainnetReader() });
       }
     } catch (err) {
       logger.warn("Failed to fetch market metadata from Supabase", {
