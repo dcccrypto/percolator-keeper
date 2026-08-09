@@ -50,6 +50,25 @@ vi.mock("@percolatorct/shared", () => ({
   getErrorMessage: (err: unknown) => String(err),
   sendWarningAlert: hoisted.sendWarningAlert,
   sendCriticalAlert: hoisted.sendCriticalAlert,
+  // #369: src/lib/service-monitors.ts calls this at import time, and oracle.ts
+  // imports it — so every test file that mocks this module must supply it or
+  // the suite fails at collection. Intermittent without this: it only throws
+  // when this file is the first in its worker to load service-monitors.ts.
+  createServiceMonitors: vi.fn(() => {
+    const m = () => ({
+      recordSuccess: vi.fn(async () => {}),
+      recordFailure: vi.fn(async () => {}),
+      getErrorRate: vi.fn(() => 0),
+      getStatus: vi.fn(() => ({
+        healthy: true,
+        consecutiveFailures: 0,
+        errorRate: 0,
+        timeSinceSuccessMs: 0,
+        alertActive: false,
+      })),
+    });
+    return { rpc: m(), scan: m(), oracle: m(), db: m() };
+  }),
 }));
 
 import { OracleService } from "../../src/services/oracle.js";
