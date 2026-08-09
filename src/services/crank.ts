@@ -826,7 +826,12 @@ export class CrankService {
   private _inflightLpVaultMarkets = new Set<string>();
   private _stalePauseCheck?: (slabAddress: string) => boolean;
   // Use the process-wide keypair singleton — avoids a second secretKey allocation.
-  private get _keypair() { return getKeeperKeypair(); }
+  // Resolved eagerly at construction, not lazily via a getter: index.ts notes
+  // that loading at module scope means "a malformed keypair fails at boot
+  // (clean supervisor restart) instead of producing a 'keeper appears healthy
+  // but can't sign anything' degraded state". A getter would defer that failure
+  // to the first crank attempt and lose the property.
+  private readonly _keypair = getKeeperKeypair();
   // 6.2: Total crank cycles completed (exposed via getMetrics for health + MonitorService)
   private _totalCrankCycles = 0;
   // 6.2: Optional callback fired after each completed crank cycle

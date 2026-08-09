@@ -619,7 +619,10 @@ export class LiquidationService {
   private readonly _corruptedRiskParamsAlertedAt = new Map<string, number>();
   private static readonly RISK_PARAMS_ALERT_COOLDOWN_MS = 15 * 60_000; // 15 min
   // Use the process-wide keypair singleton — avoids a second secretKey allocation.
-  private get _keypair() { return getKeeperKeypair(); }
+  // Eager, not a lazy getter — see the matching note in crank.ts: deferring
+  // resolution would turn a boot-time misconfiguration into a first-liquidation
+  // failure, which is exactly the degraded state index.ts warns about.
+  private readonly _keypair = getKeeperKeypair();
   /** LaserStream account loader — injected for event-driven portfolio scanning. */
   private readonly _accountLoader?: AccountLoader;
   /** Per-account debounce timers: slab pubkey → setTimeout handle. */

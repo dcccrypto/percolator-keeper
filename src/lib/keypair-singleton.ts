@@ -6,25 +6,31 @@ let _instance: Keypair | null = null;
 /**
  * Return the keeper signing keypair, parsing CRANK_KEYPAIR exactly once.
  *
- * All three service-level consumers (index.ts, CrankService, LiquidationService)
- * previously called loadKeypair() independently, producing three separate 64-byte
- * secretKey Uint8Array allocations that persist for the process lifetime. Using a
- * singleton reduces this to one live allocation and deletes the raw env-var string
- * immediately after the first parse so it cannot be read by later code or appear
- * in heap dumps and Railway log snapshots.
+ * index.ts, CrankService and LiquidationService each called loadKeypair()
+ * independently. Routing all three through here parses once and gives a single
+ * place to change how the signing key is sourced (env today, a KMS or remote
+ * signer later) without touching three call sites.
  *
- * Must be called AFTER validateKeeperEnvGuards() so boot-time validation still
- * reads the env var before this function deletes it.
+ * This deliberately does NOT scrub process.env. An earlier version overwrote
+ * the variable and then deleted it, on the theory that this kept the secret out
+ * of heap dumps. It does not — V8 strings are immutable, so assigning a new
+ * value allocates a new string and leaves the original in memory until GC. The
+ * deletion's only real effect was to break every consumer that reads the
+ * variable after the first call: vitest shares one worker process across test
+ * files, so the first service to resolve its keypair made every later service
+ * construction throw "CRANK_KEYPAIR is not set" (23 failing tests). Removing a
+ * secret from a process that must keep using it needs a different mechanism
+ * (a signer that never holds the key in this process at all), not env deletion.
+ *
+ * Presence and parseability are already enforced upstream and are not
+ * re-checked here: index.ts requires CRANK_KEYPAIR to be set before any service
+ * is constructed, and validateKeeperEnvGuards() rejects a malformed value at
+ * boot. Adding a redundant presence check here would only change WHERE a
+ * misconfiguration surfaces, and would break tests that mock loadKeypair.
  */
 export function getKeeperKeypair(): Keypair {
   if (!_instance) {
-    const raw = process.env.CRANK_KEYPAIR;
-    if (!raw) throw new Error("CRANK_KEYPAIR is not set");
-    _instance = loadKeypair(raw);
-    // Overwrite then delete: narrows the window where the raw secret key string
-    // is readable via process.env (heap dumps, accidental logger.info(process.env)).
-    process.env.CRANK_KEYPAIR = "0".repeat(raw.length);
-    delete process.env.CRANK_KEYPAIR;
+    _instance = loadKeypair(process.env.CRANK_KEYPAIR!);
   }
   return _instance;
 }
