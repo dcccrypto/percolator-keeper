@@ -1,5 +1,23 @@
 overrides:
-  vite: 8.0.8
+  # GHSA-fx2h-pf6j-xcff: `server.fs.deny` bypass on Windows alternate data
+  # streams, covering vite >=8.0.0 <=8.0.15.
+  #
+  # This entry read `vite: 8.0.8` — an exact pin added before the advisory
+  # published, which was actively holding vite BELOW the fix. The override was
+  # the reason the advisory applied, not a defence against it. That is the
+  # argument for the audit gate added in ci.yml alongside it: a pin is a
+  # snapshot of what was safe on the day it was written, and nothing was
+  # re-checking it.
+  #
+  # Deliberately an exact version, not a `>=8.0.16` floor. A range override
+  # constrains what may be selected; it does not force an already-locked
+  # version to move. With `>=8.0.16` in config and 8.0.8 in the lockfile, pnpm
+  # reports "Lockfile is up to date, resolution step is skipped" and leaves
+  # 8.0.8 in place — `--force` and `pnpm update vite` do not shift it either,
+  # leaving a lockfile whose `overrides:` header disagrees with its own
+  # resolution entries. Measured from a clean lockfile: the range left all 6
+  # entries at 8.0.8, the exact pin moved all 6 to 8.0.16.
+  vite: 8.0.16
   # GHSA-8988-4f7v-96qf / CVE-2026-54285 (#378): W3CBaggagePropagator.extract()
   # in @opentelemetry/core < 2.8.0 does not enforce the W3C baggage limits
   # (8192 bytes / 180 entries) on inbound headers, so it allocates and parses
@@ -16,3 +34,17 @@ overrides:
   # transitively through jayson/isomorphic-ws. An override is required rather than
   # a direct bump because the keeper has no direct ws dependency of its own.
   ws: ^8.21.0
+  # GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg and GHSA-rgw5-rvv9-x895 — three
+  # successive DoS advisories against the same expansion logic, each raising the
+  # floor; >=5.0.9 is the highest of the three. Runtime-reachable via
+  # @percolatorct/shared > @sentry/node > @fastify/otel > minimatch.
+  #
+  # This is the only floor this PR adds. nanoid and postcss were also flagged
+  # (2 highs each, both build-time only via vitest > vite) but a plain
+  # `pnpm install` already resolves them to 3.3.18 and 8.5.26 within the ranges
+  # their parents ask for, so pinning them would record a requirement that
+  # nothing is enforcing. brace-expansion does NOT move on its own — it stays at
+  # 5.0.5 — so it needs the floor. Measured on this base, not assumed: with the
+  # vite fix and a refresh but no floors, the audit still reports 3 highs, all
+  # brace-expansion.
+  "brace-expansion": ">=5.0.9"

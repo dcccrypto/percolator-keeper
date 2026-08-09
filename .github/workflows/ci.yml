@@ -23,6 +23,28 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # #372: the keeper had no dependency-audit step at all. Every CVE fixed in
+      # this repo so far — #378's @opentelemetry/core, #407's ws — was found by
+      # hand, which means a regression, or a newly published advisory against a
+      # dependency we already ship, could sit here indefinitely. This is the
+      # service that holds a hot signing wallet, and it was the last of the four
+      # repos without a gate.
+      #
+      # One HIGH advisory is suppressed via pnpm.auditConfig.ignoreGhsas in
+      # package.json (which cannot carry comments), so the reasoning lives here:
+      #
+      #   GHSA-3gc7-fjrx-p6mg — buffer overflow in bigint-buffer's toBigIntLE().
+      #   Reached only as @percolatorct/sdk > @solana/spl-token >
+      #   @solana/buffer-layout-utils > bigint-buffer. The advisory lists NO
+      #   patched version ("<0.0.0"), and bigint-buffer's most recent release is
+      #   1.1.5 from 2019-10-17 — the package is unmaintained, so there is
+      #   nothing to override to and nothing in our control drops it.
+      #
+      # Suppressing it explicitly, rather than lowering --audit-level or leaving
+      # the gate off, keeps the exposure recorded and keeps every OTHER high
+      # advisory blocking. Revisit when @solana/spl-token drops
+      # @solana/buffer-layout-utils; #372 tracks it.
+      - run: pnpm audit --audit-level=high
       - run: pnpm build
       - run: pnpm test
 
