@@ -108,6 +108,10 @@ function toE6(usd: number): bigint {
 // Deviation is computed in basis points (10_000n multiplier) for precise comparison.
 // Effective rejection point: divergenceBps > 1000 (i.e. >10.00%).
 
+// Cross-source validation survived the #400 removal: it is the one guard that
+// still runs, inside peekPrice(), on the fraud detector's probe path. These
+// tests were written against the deleted fetchPrice() and are retargeted rather
+// than dropped, because the behaviour they cover is still live.
 describe('Cross-source deviation — actual boundary conditions', () => {
   let svc: OracleService;
 
@@ -119,7 +123,7 @@ describe('Cross-source deviation — actual boundary conditions', () => {
   it('0% divergence — accepted', async () => {
     const mint = freshMint();
     mockBothSources(1.00, 1.00, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
     expect(r!.priceE6).toBe(toE6(1.00));
   });
@@ -127,7 +131,7 @@ describe('Cross-source deviation — actual boundary conditions', () => {
   it('5% divergence — accepted', async () => {
     const mint = freshMint();
     mockBothSources(1.00, 1.05, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
     expect(r!.source).toBe('dexscreener');
   });
@@ -135,28 +139,28 @@ describe('Cross-source deviation — actual boundary conditions', () => {
   it('10% divergence — ACCEPTED (exactly 1000 bps, not > 1000)', async () => {
     const mint = freshMint();
     mockBothSources(1.00, 1.10, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
   });
 
   it('10.5% divergence — REJECTED (1050 bps > 1000)', async () => {
     const mint = freshMint();
     mockBothSources(1.00, 1.105, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).toBeNull();
   });
 
   it('11% divergence — REJECTED (1100 bps > 1000)', async () => {
     const mint = freshMint();
     mockBothSources(1.00, 1.11, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).toBeNull();
   });
 
   it('50% divergence (flash crash simulation) — REJECTED', async () => {
     const mint = freshMint();
     mockBothSources(0.60, 0.90, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).toBeNull();
   });
 
@@ -165,21 +169,21 @@ describe('Cross-source deviation — actual boundary conditions', () => {
     // 454_074 vs 0.000919 is astronomically large
     const mint = freshMint();
     mockBothSources(0.000919, 454_074.93, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).toBeNull(); // cross-source check catches this if both sources run
   });
 
   it('inverted: Jupiter higher than DexScreener by 15% — REJECTED', async () => {
     const mint = freshMint();
     mockBothSources(0.89, 1.00, mint); // 12.4% divergence → integer 12 > 10
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).toBeNull();
   });
 
   it('DexScreener null → falls back to Jupiter, no cross-check', async () => {
     const mint = freshMint();
     mockBothSources(null, 0.000919, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
     expect(r!.source).toBe('jupiter');
     expect(r!.priceE6).toBe(919n);
@@ -188,7 +192,7 @@ describe('Cross-source deviation — actual boundary conditions', () => {
   it('Jupiter null → uses DexScreener only', async () => {
     const mint = freshMint();
     mockBothSources(150.00, null, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
     expect(r!.source).toBe('dexscreener');
   });
@@ -196,14 +200,14 @@ describe('Cross-source deviation — actual boundary conditions', () => {
   it('both null → returns null', async () => {
     const mint = freshMint();
     mockBothSources(null, null, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).toBeNull();
   });
 
   it('DexScreener preferred over Jupiter when both valid and within threshold', async () => {
     const mint = freshMint();
     mockBothSources(1.00, 1.05, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
     expect(r!.source).toBe('dexscreener');
     expect(r!.priceE6).toBe(toE6(1.00));
@@ -215,194 +219,13 @@ describe('Cross-source deviation — actual boundary conditions', () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ pairs: [{ priceUsd: '0', liquidity: { usd: 500_000 }, baseToken: { address: mint } }] }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as Response);
-    const r = await svc.fetchPrice(mint, freshSlab());
+    const r = await svc.peekPrice(mint);
     expect(r).not.toBeNull();
     expect(r!.source).toBe('jupiter');
   });
 });
 
 // ─── 2. Historical deviation boundary tests ────────────────────────────────────
-
-describe('Historical deviation — boundary conditions', () => {
-  // KEEPER-12 added a wall-clock minimum alongside the consecutive-rejection
-  // count, so the two H1 escape-hatch tests below have to be able to advance
-  // time. Everything else in this block is time-independent.
-  let clockMs = 1_700_000_000_000;
-  const advanceClock = (ms: number) => { clockMs += ms; };
-  let svc: OracleService;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    clockMs = 1_700_000_000_000;
-    svc = new OracleService({ now: () => clockMs });
-  });
-
-  async function seedPrice(slab: string, usd: number): Promise<bigint> {
-    const mint = freshMint();
-    mockBothSources(usd, usd, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).not.toBeNull();
-    return r!.priceE6;
-  }
-
-  it('29% increase — accepted', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 1.00);
-    const mint = freshMint();
-    mockBothSources(1.29, 1.29, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).not.toBeNull();
-    expect(r!.priceE6).toBe(toE6(1.29));
-  });
-
-  it('30% increase — ACCEPTED (exactly 3000 bps, not > 3000)', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 1.00);
-    const mint = freshMint();
-    mockBothSources(1.30, 1.30, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).not.toBeNull();
-  });
-
-  it('31% increase — REJECTED', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 1.00);
-    const mint = freshMint();
-    mockBothSources(1.31, 1.31, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).toBeNull();
-  });
-
-  it('50% drop — REJECTED', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 2.00);
-    const mint = freshMint();
-    mockBothSources(1.00, 1.00, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).toBeNull();
-  });
-
-  it('29% drop — accepted', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 1.00);
-    const mint = freshMint();
-    mockBothSources(0.71, 0.71, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).not.toBeNull();
-  });
-
-  it('fresh slab (no history) — any price accepted including wild values', async () => {
-    const mint = freshMint();
-    mockBothSources(99_999.00, 99_999.00, mint);
-    const r = await svc.fetchPrice(mint, freshSlab());
-    expect(r).not.toBeNull();
-    expect(r!.priceE6).toBe(toE6(99_999.00));
-  });
-
-  it('sub-cent price ($0.000919): 20% increase accepted', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 0.000919);
-    const mint = freshMint();
-    mockBothSources(0.001103, 0.001103, mint); // ~20% up
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).not.toBeNull();
-  });
-
-  it('sub-cent price ($0.000919): 35% spike rejected', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 0.000919);
-    const mint = freshMint();
-    mockBothSources(0.001241, 0.001241, mint); // ~35% up
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).toBeNull();
-  });
-
-  it('consecutive cranks: step-up within 30% each time accumulates correctly', async () => {
-    const slab = freshSlab();
-    // Crank 1: $1.00
-    await seedPrice(slab, 1.00);
-    // Crank 2: $1.25 (25% up from $1.00 — ok)
-    const mint2 = freshMint();
-    mockBothSources(1.25, 1.25, mint2);
-    const r2 = await svc.fetchPrice(mint2, slab);
-    expect(r2).not.toBeNull();
-    // Crank 3: $1.62 (29.6% up from $1.25 — ok)
-    const mint3 = freshMint();
-    mockBothSources(1.62, 1.62, mint3);
-    const r3 = await svc.fetchPrice(mint3, slab);
-    expect(r3).not.toBeNull();
-    // Crank 4: $2.13 (31.5% up from $1.62 — REJECTED)
-    const mint4 = freshMint();
-    mockBothSources(2.13, 2.13, mint4);
-    const r4 = await svc.fetchPrice(mint4, slab);
-    expect(r4).toBeNull();
-  });
-
-  it('H1: accepts deviated price after 5 consecutive rejections (no permanent brick)', async () => {
-    const slab = freshSlab();
-    // Seed at $1.00
-    await seedPrice(slab, 1.00);
-
-    // Price jumps to $2.00 (100% deviation) — should be rejected 4 times, accepted on 5th
-    for (let i = 0; i < 4; i++) {
-      const mint = freshMint();
-      mockBothSources(2.00, 2.00, mint);
-      const r = await svc.fetchPrice(mint, slab);
-      expect(r).toBeNull();
-    }
-
-    // KEEPER-12: acceptance now needs the count AND a sustained deviation, so
-    // the move has to persist past the wall-clock gate as well. The property
-    // this test guards — H1 can still escape, the anchor is not permanently
-    // bricked — is unchanged; only the cost of escaping went up.
-    advanceClock(61_000);
-
-    // 5th consecutive rejection — should be accepted
-    const mintAccept = freshMint();
-    mockBothSources(2.00, 2.00, mintAccept);
-    const rAccept = await svc.fetchPrice(mintAccept, slab);
-    expect(rAccept).not.toBeNull();
-    expect(rAccept!.priceE6).toBe(toE6(2.00));
-  });
-
-  it('H1: resets rejection counter when a normal price is accepted', async () => {
-    const slab = freshSlab();
-    await seedPrice(slab, 1.00);
-
-    // 2 consecutive rejections at $2.00
-    for (let i = 0; i < 2; i++) {
-      const mint = freshMint();
-      mockBothSources(2.00, 2.00, mint);
-      expect(await svc.fetchPrice(mint, slab)).toBeNull();
-    }
-
-    // Normal price accepted ($1.10, within 30%)
-    const mintNormal = freshMint();
-    mockBothSources(1.10, 1.10, mintNormal);
-    const rNormal = await svc.fetchPrice(mintNormal, slab);
-    expect(rNormal).not.toBeNull();
-
-    // Counter should be reset — 4 more rejections at $2.00 should NOT accept
-    for (let i = 0; i < 4; i++) {
-      const mint = freshMint();
-      mockBothSources(2.00, 2.00, mint);
-      expect(await svc.fetchPrice(mint, slab)).toBeNull();
-    }
-
-    // KEEPER-12: the wall-clock gate also restarts with the streak, so the new
-    // streak has to age past it on its own — it inherits no credit from the
-    // rejections that preceded the accepted price.
-    advanceClock(61_000);
-
-    // 5th consecutive from fresh counter — NOW accepted
-    const mintFinal = freshMint();
-    mockBothSources(2.00, 2.00, mintFinal);
-    const rFinal = await svc.fetchPrice(mintFinal, slab);
-    expect(rFinal).not.toBeNull();
-  });
-});
-
-// ─── 3. Admin-oracle / pumpswap price computation (GH#1376 regression) ─────────
 
 describe('Admin-oracle pumpswap price computation — GH#1376 regression', () => {
   /**
@@ -553,7 +376,7 @@ describe('HYPERP vs Pyth scenario table', () => {
     it(`${label} — ${expectAccepted ? 'accepted' : 'rejected'} (${note})`, async () => {
       const mint = freshMint();
       mockBothSources(hyperp || null, pyth || null, mint);
-      const r = await svc.fetchPrice(mint, freshSlab());
+      const r = await svc.peekPrice(mint);
 
       if (expectAccepted) {
         expect(r).not.toBeNull();
@@ -577,82 +400,3 @@ describe('HYPERP vs Pyth scenario table', () => {
  * and stops cranking -- so an over-long gate suppresses liquidations during
  * exactly the volatility that creates bad debt.
  */
-describe('KEEPER-12: wall-clock gate on H1 deviation acceptance', () => {
-  function makeSvc(deviationAcceptAfterMs?: number) {
-    let t = 1_700_000_000_000;
-    const svc = new OracleService({ now: () => t, deviationAcceptAfterMs });
-    return { svc, advance: (ms: number) => { t += ms; } };
-  }
-
-  async function seed(svc: OracleService, slab: string, usd: number) {
-    const mint = freshMint();
-    mockBothSources(usd, usd, mint);
-    const r = await svc.fetchPrice(mint, slab);
-    expect(r).not.toBeNull();
-  }
-
-  async function offer(svc: OracleService, slab: string, usd: number) {
-    const mint = freshMint();
-    mockBothSources(usd, usd, mint);
-    return svc.fetchPrice(mint, slab);
-  }
-
-  it('keeps rejecting a deviated price while the burst is faster than the gate', async () => {
-    const { svc } = makeSvc(60_000);
-    const slab = freshSlab();
-    await seed(svc, slab, 1.0);
-
-    // Ten consecutive rejections, zero elapsed time: the count gate is long
-    // satisfied, so only the clock is holding the line.
-    for (let i = 0; i < 10; i++) {
-      expect(await offer(svc, slab, 2.0)).toBeNull();
-    }
-  });
-
-  it('accepts once the deviation has persisted past the gate', async () => {
-    const { svc, advance } = makeSvc(60_000);
-    const slab = freshSlab();
-    await seed(svc, slab, 1.0);
-
-    for (let i = 0; i < 4; i++) {
-      expect(await offer(svc, slab, 2.0)).toBeNull();
-    }
-    advance(61_000);
-
-    const accepted = await offer(svc, slab, 2.0);
-    expect(accepted).not.toBeNull();
-    expect(accepted!.priceE6).toBe(toE6(2.0));
-  });
-
-  it('defaults the gate to 60s rather than 5 minutes', async () => {
-    const { svc, advance } = makeSvc(); // no override — exercise the default
-    const slab = freshSlab();
-    await seed(svc, slab, 1.0);
-
-    for (let i = 0; i < 4; i++) {
-      expect(await offer(svc, slab, 2.0)).toBeNull();
-    }
-    advance(61_000);
-
-    expect(await offer(svc, slab, 2.0)).not.toBeNull();
-  });
-
-  it('restarts the clock when an in-band price resets the streak', async () => {
-    // The gate measures from the FIRST rejection of the current streak, so an
-    // accepted price in between must clear the timestamp too -- otherwise a
-    // later streak inherits credit for time it did not spend deviating.
-    const { svc, advance } = makeSvc(60_000);
-    const slab = freshSlab();
-    await seed(svc, slab, 1.0);
-
-    expect(await offer(svc, slab, 2.0)).toBeNull(); // streak starts here
-    advance(59_000);
-    await seed(svc, slab, 1.05);                    // in band -> streak reset
-
-    for (let i = 0; i < 4; i++) {
-      expect(await offer(svc, slab, 2.1)).toBeNull();
-    }
-    advance(30_000); // 89s since the ORIGINAL first rejection, 30s since reset
-    expect(await offer(svc, slab, 2.1)).toBeNull();
-  });
-});

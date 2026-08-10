@@ -3,7 +3,7 @@ import { decideHealthExposure } from "../../src/lib/health-auth.js";
 
 /**
  * KEEPER-10 / #358: when KEEPER_HEALTH_BIND_ADDR is a remote address and
- * KEEPER_REGISTER_SECRET is unset, /health, /pause-status and /shadow/report
+ * KEEPER_REGISTER_SECRET is unset, /health and /shadow/report
  * failed OPEN (#321) — exposing keeperWallet.solBalance, budget circuit-breaker
  * state and the stale-oracle market list to any internet client.
  *

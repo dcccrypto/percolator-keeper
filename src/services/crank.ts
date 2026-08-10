@@ -854,7 +854,6 @@ export class CrankService {
   private _inflightMarkets = new Set<string>();
   /** Per-market in-flight guard for LP-vault maintenance — mirrors _inflightMarkets. */
   private _inflightLpVaultMarkets = new Set<string>();
-  private _stalePauseCheck?: (slabAddress: string) => boolean;
   // Use the process-wide keypair singleton — avoids a second secretKey allocation.
   // Resolved eagerly at construction, not lazily via a getter: index.ts notes
   // that loading at module scope means "a malformed keypair fails at boot
@@ -885,11 +884,6 @@ export class CrankService {
 
   get isRunning(): boolean {
     return this._isRunning;
-  }
-
-  /** Register a callback to check if a market is paused due to stale oracle */
-  setStalePauseCheck(check: (slabAddress: string) => boolean): void {
-    this._stalePauseCheck = check;
   }
 
   /**
@@ -1760,7 +1754,6 @@ export class CrankService {
   let skippedPermanent = 0;
   let skippedForeignOracle = 0;
   let skippedNoPortfolio = 0;
-  let skippedStalePaused = 0;
   let skippedFailures = 0;
   let skippedNotDue = 0;
 
@@ -1802,12 +1795,6 @@ export class CrankService {
       continue;
     }
 
-    // Skip markets paused due to stale oracle (>10min without price push).
-    if (this._stalePauseCheck?.(slabAddress)) {
-      skippedStalePaused++;
-      continue;
-    }
-
     // B1: gate is `>=`, not `>`. The off-by-one previously let MAX-th failure
     // through (cranks at 10, skips at 11+). Now skips at MAX (10+).
     if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -1830,7 +1817,7 @@ export class CrankService {
   }
 
   // Meaningful accounting check.
-  const skipped = skippedPermanent + skippedForeignOracle + skippedNoPortfolio + skippedStalePaused + skippedFailures + skippedNotDue;
+  const skipped = skippedPermanent + skippedForeignOracle + skippedNoPortfolio + skippedFailures + skippedNotDue;
   const total = this.markets.size;
   const accounted = toCrank.length + skipped;
 
@@ -1842,7 +1829,6 @@ export class CrankService {
       skippedPermanent,
       skippedForeignOracle,
       skippedNoPortfolio,
-      skippedStalePaused,
       skippedFailures,
       skippedNotDue,
     });
@@ -1968,7 +1954,6 @@ export class CrankService {
       ...(skippedForeignOracle > 0 && { skippedForeignOracle }),
       ...(skippedNoPortfolio > 0 && { skippedNoPortfolio }),
       ...(skippedPermanent > 0 && { skippedPermanent }),
-      ...(skippedStalePaused > 0 && { skippedStalePaused }),
       ...(skippedNotDue > 0 && { skippedNotDue }),
     });
 

@@ -284,7 +284,7 @@ describe('OracleService', () => {
         .mockResolvedValueOnce({ ok: true, json: async () => dexResponse } as any)
         .mockResolvedValueOnce({ ok: true, json: async () => jupResponse } as any);
 
-      const priceEntry = await oracleService.fetchPrice('MINT999', 'SLAB999');
+      const priceEntry = await oracleService.peekPrice('MINT999');
 
       expect(priceEntry).toBeNull(); // Rejected due to divergence
     });
@@ -306,83 +306,10 @@ describe('OracleService', () => {
         .mockResolvedValueOnce({ ok: true, json: async () => dexResponse } as any)
         .mockResolvedValueOnce({ ok: true, json: async () => jupResponse } as any);
 
-      const priceEntry = await oracleService.fetchPrice('MINT888', 'SLAB888');
+      const priceEntry = await oracleService.peekPrice('MINT888');
 
       expect(priceEntry).not.toBeNull();
       expect(priceEntry?.priceE6).toBe(1_000_000n); // Uses DexScreener (preferred)
-    });
-  });
-
-  describe('historical price deviation check', () => {
-    it('should reject price with >30% deviation from last known price', async () => {
-      // Seed history with $1.00 for SLAB_HISTDEV
-      vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV_A' } }] }),
-        } as any)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ data: { MINT_HISTDEV_A: { price: '1.00' } } }),
-        } as any);
-
-      const price1 = await oracleService.fetchPrice('MINT_HISTDEV_A', 'SLAB_HISTDEV');
-      expect(price1?.priceE6).toBe(1_000_000n);
-
-      // Use a different mint to bypass the 10s DexScreener cache,
-      // but the SAME slabAddress so the history is shared.
-      // Both sources return $1.50 (50% above history) — passes cross-source check
-      // but fails the >30% historical deviation check.
-      vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.50', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV_B' } }] }),
-        } as any)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ data: { MINT_HISTDEV_B: { price: '1.50' } } }),
-        } as any);
-
-      const price2 = await oracleService.fetchPrice('MINT_HISTDEV_B', 'SLAB_HISTDEV');
-      expect(price2).toBeNull(); // Rejected: 50% historical deviation > 30% threshold
-    });
-
-    it('should accept price within 30% of last known price', async () => {
-      // Seed history with $1.00 for SLAB_HISTDEV2
-      vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV2_A' } }] }),
-        } as any)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ data: { MINT_HISTDEV2_A: { price: '1.00' } } }),
-        } as any);
-
-      const price1 = await oracleService.fetchPrice('MINT_HISTDEV2_A', 'SLAB_HISTDEV2');
-      expect(price1?.priceE6).toBe(1_000_000n);
-
-      // New price = $1.20 (20% above history) — within 30% threshold → accepted
-      vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '1.20', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV2_B' } }] }),
-        } as any)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ data: { MINT_HISTDEV2_B: { price: '1.20' } } }),
-        } as any);
-
-      const price2 = await oracleService.fetchPrice('MINT_HISTDEV2_B', 'SLAB_HISTDEV2');
-      expect(price2).not.toBeNull();
-      expect(price2?.priceE6).toBe(1_200_000n);
-    });
-
-    it('should skip historical check when no prior history exists', async () => {
-      // First call for a brand-new slab → no history → no deviation check → accepted
-      vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ pairs: [{ priceUsd: '9999.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTDEV3' } }] }),
-        } as any)
-        .mockResolvedValueOnce({
-          ok: true, json: async () => ({ data: { MINT_HISTDEV3: { price: '9999.00' } } }),
-        } as any);
-
-      const price = await oracleService.fetchPrice('MINT_HISTDEV3', 'SLAB_HISTDEV3_FRESH');
-      expect(price).not.toBeNull();
-      expect(price?.priceE6).toBe(9_999_000_000n);
     });
   });
 
@@ -391,148 +318,6 @@ describe('OracleService', () => {
   // own rate limits upstream and Hyperp reads the DEX directly.
 
   // M6: dual-source outage circuit breaker.
-  describe('M6: dual-null circuit breaker', () => {
-    const DUAL_NULL_THRESHOLD = 5;
-
-    function mockBothSourcesDown() {
-      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 503 } as any);
-    }
-
-    function mockBothSourcesUp() {
-      vi.mocked(fetch).mockImplementation(async (url) => {
-        const u = typeof url === 'string' ? url : (url as Request).toString();
-        if (u.includes('dexscreener')) {
-          // Thread the queried mint out of the request URL so the fixture's
-          // baseToken always matches whichever mint is being fetched.
-          const dexMint = decodeURIComponent(u.split('/tokens/')[1] ?? 'UNKNOWN');
-          return { ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: dexMint } }] }) } as any;
-        }
-        const m = u.match(/ids=([^&]+)/);
-        const mint = m ? decodeURIComponent(m[1]!) : 'UNKNOWN';
-        return { ok: true, json: async () => ({ data: { [mint]: { price: '1.00' } } }) } as any;
-      });
-    }
-
-    it('M6: does NOT fire critical alert below threshold', async () => {
-      mockBothSourcesDown();
-      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
-      criticalSpy.mockClear();
-
-      for (let i = 0; i < DUAL_NULL_THRESHOLD - 1; i++) {
-        await oracleService.fetchPrice('TESTMINT_M6_BELOW', 'SLAB_M6_BELOW');
-      }
-
-      expect(criticalSpy).not.toHaveBeenCalled();
-    });
-
-    it('M6: fires critical alert exactly once at threshold (no spam on repeated outages)', async () => {
-      mockBothSourcesDown();
-      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
-      criticalSpy.mockClear();
-
-      for (let i = 0; i < DUAL_NULL_THRESHOLD * 2; i++) {
-        await oracleService.fetchPrice('TESTMINT_M6_FIRE', 'SLAB_M6_FIRE');
-      }
-
-      expect(criticalSpy).toHaveBeenCalledTimes(1);
-      const [title] = criticalSpy.mock.calls[0]!;
-      expect(title).toContain('outage');
-    });
-
-    it('M6: dual-null state recovers cleanly on first successful fetch', async () => {
-      mockBothSourcesDown();
-      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
-      criticalSpy.mockClear();
-
-      for (let i = 0; i < 6; i++) {
-        await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
-      }
-      expect(criticalSpy).toHaveBeenCalledTimes(1);
-
-      mockBothSourcesUp();
-      const recovered = await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
-      expect(recovered).not.toBeNull();
-      expect(recovered?.priceE6).toBe(1_000_000n);
-
-      const followUp = await oracleService.fetchPrice('TESTMINT_M6_RESET', 'SLAB_M6_RESET');
-      expect(followUp).not.toBeNull();
-
-      expect(criticalSpy).toHaveBeenCalledTimes(1);
-    });
-
-    it('M6: does NOT fire critical alert when fresh history cache covers the gap', async () => {
-      const criticalSpy = vi.mocked(shared.sendCriticalAlert);
-      criticalSpy.mockClear();
-
-      mockBothSourcesUp();
-      const seed = await oracleService.fetchPrice('TESTMINT_M6_CACHE', 'SLAB_M6_CACHE');
-      expect(seed).not.toBeNull();
-
-      mockBothSourcesDown();
-      for (let i = 0; i < DUAL_NULL_THRESHOLD * 2; i++) {
-        await oracleService.fetchPrice('TESTMINT_M6_CACHE', 'SLAB_M6_CACHE');
-      }
-
-      expect(criticalSpy).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('price history tracking', () => {
-    it('should track price history up to max entries per market', async () => {
-      const mockResponse = {
-        pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_HISTORY' } }],
-      };
-
-      vi.mocked(fetch).mockResolvedValue({
-        ok: true,
-        json: async () => mockResponse,
-      } as any);
-
-      const mint = 'MINT_HISTORY';
-      const slab = 'SLAB_HISTORY';
-
-      // Add 101 entries (max is 100)
-      for (let i = 0; i < 101; i++) {
-        await oracleService.fetchPrice(mint, slab);
-      }
-
-      const history = oracleService.getPriceHistory(slab);
-      expect(history.length).toBe(100); // Capped at 100
-    });
-
-    it('should track up to max markets (500)', async () => {
-      // Different mints are fetched across this loop (MINT0..MINT500), so the
-      // fixture must thread the actual queried mint out of the request URL
-      // rather than hardcoding a single baseToken address.
-      vi.mocked(fetch).mockImplementation(async (url) => {
-        const u = typeof url === 'string' ? url : (url as Request).toString();
-        const mint = decodeURIComponent(u.split('/tokens/')[1] ?? 'UNKNOWN');
-        return {
-          ok: true,
-          json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 }, baseToken: { address: mint } }] }),
-        } as any;
-      });
-
-      // Add first market
-      await oracleService.fetchPrice('MINT0', 'SLAB0');
-      expect(oracleService.getPriceHistory('SLAB0').length).toBe(1);
-
-      // Add 500 more markets (total 501)
-      for (let i = 1; i <= 500; i++) {
-        await oracleService.fetchPrice(`MINT${i}`, `SLAB${i}`);
-      }
-
-      // The eviction logic runs when we ADD the 501st market
-      // At that point, SLAB0 (oldest) should be evicted
-      const history0 = oracleService.getPriceHistory('SLAB0');
-      expect(history0.length).toBe(0); // Evicted
-
-      // But the newest market should still be there
-      const history500 = oracleService.getPriceHistory('SLAB500');
-      expect(history500.length).toBe(1);
-    });
-  });
-
   describe('in-flight request deduplication', () => {
     it('should deduplicate concurrent DexScreener requests', async () => {
       const mockResponse = {
@@ -593,29 +378,4 @@ describe('OracleService', () => {
     });
   });
 
-  describe('getCurrentPrice', () => {
-    it('should return latest price from history', async () => {
-      const mockResponse = {
-        pairs: [{ priceUsd: '4.56', liquidity: { usd: 100000 }, baseToken: { address: 'MINT_CURRENT' } }],
-      };
-
-      vi.mocked(fetch).mockResolvedValue({
-        ok: true,
-        json: async () => mockResponse,
-      } as any);
-
-      const mint = 'MINT_CURRENT';
-      const slab = 'SLAB_CURRENT';
-
-      await oracleService.fetchPrice(mint, slab);
-
-      const current = oracleService.getCurrentPrice(slab);
-      expect(current?.priceE6).toBe(4_560_000n);
-    });
-
-    it('should return null for market with no history', () => {
-      const current = oracleService.getCurrentPrice('UNKNOWN_SLAB');
-      expect(current).toBeNull();
-    });
-  });
 });
