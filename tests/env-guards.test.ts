@@ -436,6 +436,23 @@ describe("validateKeeperEnvGuards", () => {
         /CRANK_KEYPAIR is not a valid keypair/,
       );
     });
+    it("M1: does not echo CRANK_KEYPAIR secret bytes into the boot error", () => {
+      // A malformed JSON secret-key array. JSON.parse throws a SyntaxError that
+      // quotes an excerpt of the input — real secret-key bytes — pre-fix. The
+      // boot error must not carry them into stderr / Railway logs / Sentry.
+      const env = { CRANK_KEYPAIR: "[201,163,88,7,x]" } as NodeJS.ProcessEnv;
+      let caught: Error | undefined;
+      try {
+        validateKeeperEnvGuards(env);
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught!.message).toMatch(/CRANK_KEYPAIR is not a valid keypair/);
+      // The raw key bytes must not appear anywhere in the message.
+      expect(caught!.message).not.toContain("201,163,88");
+      expect(caught!.message).not.toContain("[201");
+    });
 
     it("M1: accepts a well-formed 64-byte JSON array keypair", () => {
       const env = { CRANK_KEYPAIR: VALID_KEYPAIR_JSON } as NodeJS.ProcessEnv;

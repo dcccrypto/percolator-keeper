@@ -81,10 +81,15 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   if (crankKp) {
     try {
       loadKeypair(crankKp);
-    } catch (err) {
+    } catch {
+      // Do NOT append the underlying parse error. For the JSON-array form,
+      // JSON.parse quotes an excerpt of the input — i.e. raw secret-key bytes —
+      // into its SyntaxError message, which would then land in stderr / Railway
+      // logs / Sentry. A truncated or typo'd keypair is exactly this case.
       throw new Error(
-        `CRANK_KEYPAIR is not a valid keypair (expected a 64-byte JSON array or ` +
-          `base58-encoded secret key): ${err instanceof Error ? err.message : String(err)}`,
+        "CRANK_KEYPAIR is not a valid keypair (expected a 64-byte JSON array " +
+          "from `solana-keygen new`, or a base58-encoded secret key). The " +
+          "underlying parse error is omitted because it can contain secret-key bytes.",
       );
     }
   }
