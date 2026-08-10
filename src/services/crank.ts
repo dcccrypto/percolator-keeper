@@ -38,6 +38,7 @@ import {
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { monitors } from "../lib/service-monitors.js";
+import { isStreamStalled, streamStallThresholdMs } from "../lib/stream-staleness.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
@@ -1015,6 +1016,33 @@ export class CrankService {
         const cache = this._accountLoader.getCache();
         const stats = this._accountLoader.getStats();
         const currentSlot = stats.lastSlot;
+        // #426 (5.2): the cache TTL is measured in SLOTS, against the stream's
+        // own `lastSlot`. That is only a freshness signal while the stream is
+        // delivering. If the gRPC connection stays up but stops producing (a
+        // silent stall) `lastSlot` freezes, cached entries' slots freeze with
+        // it, `currentSlot - entry.slot` stops growing, and the TTL can never
+        // expire — frozen bytes are served as fresh indefinitely.
+        // `onStreamError -> invalidateAll()` does not cover this: a silent
+        // stall raises no error event.
+        //
+        // So gate the fast path on wall-clock progress as well. A stalled
+        // stream simply skips the cache refresh; each market keeps the state it
+        // already had until the next full re-discover, which reads fresh RPC.
+        // That is the same outcome as a cache miss, which this loop already
+        // handles — no new failure mode, just no false freshness.
+        const streamStalled = isStreamStalled(stats);
+        if (streamStalled) {
+          logger.warn(
+            "LaserStream slot has not advanced — skipping the cache fast path",
+            {
+              lastSlot: stats.lastSlot,
+              stalledForMs: stats.lastSlotAdvanceAt
+                ? Date.now() - stats.lastSlotAdvanceAt
+                : null,
+              thresholdMs: streamStallThresholdMs(),
+            },
+          );
+        }
         // A.1: owner-verify every cache read against the loader's program ID
         // so a corrupted stream message at a slab pubkey can't inject bytes
         // into market state via the SDK parsers.
@@ -1022,7 +1050,9 @@ export class CrankService {
         let cacheHits = 0;
         for (const [, state] of this.markets) {
           const key = state.market.slabAddress.toBase58();
-          const entry = cache.getOwnerVerified(key, currentSlot, expectedOwner);
+          const entry = streamStalled
+            ? null
+            : cache.getOwnerVerified(key, currentSlot, expectedOwner);
           if (entry) {
             // Re-parse the slab from cached bytes so the market state reflects
             // the latest on-chain data without an RPC call.
