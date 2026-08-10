@@ -32,13 +32,6 @@ export const jitoBundleFailCountTotal = new Counter({
   registers: [registry],
 });
 
-export const oraclePushCountTotal = new Counter({
-  name: "keeper_oracle_push_count_total",
-  help: "Total oracle price pushes, partitioned by mint and source",
-  labelNames: ["mint", "source"] as const,
-  registers: [registry],
-});
-
 export const accountStreamEventTotal = new Counter({
   name: "keeper_account_stream_event_total",
   help: "Total account stream events received, partitioned by type",
@@ -55,13 +48,6 @@ export const accountStreamDropTotal = new Counter({
 export const walletBalanceSol = new Gauge({
   name: "keeper_wallet_balance_sol",
   help: "Current SOL balance of the keeper wallet",
-  registers: [registry],
-});
-
-export const oracleStalenessSeconds = new Gauge({
-  name: "keeper_oracle_staleness_seconds",
-  help: "Seconds since the last oracle price push, partitioned by mint",
-  labelNames: ["mint"] as const,
   registers: [registry],
 });
 

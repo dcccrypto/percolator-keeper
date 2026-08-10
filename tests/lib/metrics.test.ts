@@ -3,11 +3,9 @@ import {
   txSentTotal,
   solSpentLamportsTotal,
   jitoBundleFailCountTotal,
-  oraclePushCountTotal,
   accountStreamEventTotal,
   accountStreamDropTotal,
   walletBalanceSol,
-  oracleStalenessSeconds,
   slotDrift,
   activeMarketsCount,
   roleGauge,
@@ -35,18 +33,6 @@ describe("metrics registry", () => {
     expect(() => jitoBundleFailCountTotal.inc()).not.toThrow();
   });
 
-  it("counter: oraclePushCountTotal increments without throwing", () => {
-    expect(() =>
-      oraclePushCountTotal.inc({ mint: "So11111111111111111111111111111111111111112", source: "dexscreener" }),
-    ).not.toThrow();
-    expect(() =>
-      oraclePushCountTotal.inc({ mint: "So11111111111111111111111111111111111111112", source: "jupiter" }),
-    ).not.toThrow();
-    expect(() =>
-      oraclePushCountTotal.inc({ mint: "So11111111111111111111111111111111111111112", source: "onchain" }),
-    ).not.toThrow();
-  });
-
   it("counter: accountStreamEventTotal increments without throwing", () => {
     expect(() => accountStreamEventTotal.inc({ type: "account" })).not.toThrow();
     expect(() => accountStreamEventTotal.inc({ type: "slot" })).not.toThrow();
@@ -60,12 +46,6 @@ describe("metrics registry", () => {
   it("gauge: walletBalanceSol sets without throwing", () => {
     expect(() => walletBalanceSol.set(1.5)).not.toThrow();
     expect(() => walletBalanceSol.set(0)).not.toThrow();
-  });
-
-  it("gauge: oracleStalenessSeconds sets without throwing", () => {
-    expect(() =>
-      oracleStalenessSeconds.set({ mint: "So11111111111111111111111111111111111111112" }, 30),
-    ).not.toThrow();
   });
 
   it("gauge: slotDrift sets without throwing", () => {
@@ -132,11 +112,14 @@ describe("metrics registry", () => {
     expect(output).toContain("keeper_tx_sent_total");
     expect(output).toContain("keeper_sol_spent_lamports_total");
     expect(output).toContain("keeper_jito_bundle_fail_count_total");
-    expect(output).toContain("keeper_oracle_push_count_total");
     expect(output).toContain("keeper_account_stream_event_total");
     expect(output).toContain("keeper_account_stream_drop_total");
     expect(output).toContain("keeper_wallet_balance_sol");
-    expect(output).toContain("keeper_oracle_staleness_seconds");
+    // keeper_oracle_push_count_total / keeper_oracle_staleness_seconds were
+    // removed with the dead off-chain staleness path (#400) — assert they are
+    // gone so a reintroduction is deliberate rather than accidental.
+    expect(output).not.toContain("keeper_oracle_push_count_total");
+    expect(output).not.toContain("keeper_oracle_staleness_seconds");
     expect(output).toContain("keeper_slot_drift");
     expect(output).toContain("keeper_active_markets_count");
     expect(output).toContain("keeper_role");

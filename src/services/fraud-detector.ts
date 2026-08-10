@@ -11,8 +11,10 @@
  * UpdateHyperpMark and represented in E6 format (i.e. USD * 1e6). The engine
  * mark field (engine.markPriceE6) was dropped in v12.17 and parses as 0.
  *
- * Off-chain consensus: OracleService.fetchPrice(mint, slabAddress), which
- * returns the DexScreener / Jupiter median as priceE6 (also E6 format).
+ * Off-chain consensus: OracleService.peekPrice(mint), which returns the
+ * DexScreener / Jupiter price as priceE6 (also E6 format). peekPrice is a
+ * read-only probe: it performs no state writes, so a detector cycle cannot
+ * perturb anything else in the keeper.
  * Both values are therefore directly comparable after Number() conversion.
  *
  * Divergence formula (per brief): |onchain - offchain| / offchain * 10_000
@@ -34,7 +36,7 @@ const logger = createLogger("keeper:fraud-detector");
 
 // Price scale used by both on-chain and off-chain price representations.
 // config.authorityPriceE6 (the on-chain HYPERP mark) is in USD * 1e6;
-// OracleService.fetchPrice returns priceE6 in the same units. No conversion
+// OracleService.peekPrice returns priceE6 in the same units. No conversion
 // required — just compare the raw bigint values after Number() for the division.
 const PRICE_E6_SCALE = 1_000_000;
 

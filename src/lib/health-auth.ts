@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 
 /**
- * How much of the /health, /pause-status and /shadow/report payload a caller is
+ * How much of the /health and /shadow/report payload a caller is
  * entitled to.
  *
  *  - "full"         — loopback bind, or a remote caller with the right secret.

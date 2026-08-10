@@ -142,11 +142,6 @@ setLeaderCheck(() => (leaderLock ? leaderLock.role() === "leader" : true));
 // discovering markets and wiring services.
 const startupTracker = new StartupTracker();
 
-// Stale oracle pause guard — markets paused due to stale oracle data
-const stalePausedMarkets = new Set<string>();
-
-const STALE_ALERT_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes → alert
-const STALE_PAUSE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes → pause cranking
 const STARTUP_GRACE_MS = 5 * 60 * 1000; // 5 minutes grace on startup — avoids false alerts on every deploy
 const _keeperStartTime = Date.now();
 
@@ -200,65 +195,6 @@ const solBalanceCheckInterval = setInterval(async () => {
 }, 60_000);
 solBalanceCheckInterval.unref();
 
-// B7: per-market cooldown so we don't fire a Discord critical every 60 s while
-// an oracle is stuck. The old aggregate alert reset only when the stale set
-// emptied, which never happened during a multi-hour DEX outage — channel got
-// nuked. Track last-alert per slab and re-fire only after STALE_ALERT_COOLDOWN_MS.
-const STALE_ALERT_COOLDOWN_MS = Number(process.env.KEEPER_STALE_ALERT_COOLDOWN_MS ?? 5 * 60_000);
-if (!Number.isFinite(STALE_ALERT_COOLDOWN_MS) || STALE_ALERT_COOLDOWN_MS < 60_000) {
-  throw new Error(`KEEPER_STALE_ALERT_COOLDOWN_MS must be >= 60000, got: ${process.env.KEEPER_STALE_ALERT_COOLDOWN_MS}`);
-}
-const lastStaleAlertByMarket = new Map<string, number>();
-
-const staleCheckInterval = setInterval(() => {
-  // Skip stale checks during startup grace period (GH#29 — false CRITICAL floods on deploy)
-  if (Date.now() - _keeperStartTime < STARTUP_GRACE_MS) return;
-
-  const alertStale = oracleService.getStaleMarkets(STALE_ALERT_THRESHOLD_MS);
-  const pauseStale = oracleService.getStaleMarkets(STALE_PAUSE_THRESHOLD_MS);
-
-  // Update paused set
-  const newPaused = new Set(pauseStale);
-  // Unpause markets that recovered
-  for (const addr of stalePausedMarkets) {
-    if (!newPaused.has(addr)) {
-      stalePausedMarkets.delete(addr);
-      logger.info("Oracle recovered, unpausing market", { slabAddress: addr });
-    }
-  }
-  // Pause newly stale markets
-  for (const addr of pauseStale) {
-    if (!stalePausedMarkets.has(addr)) {
-      stalePausedMarkets.add(addr);
-      logger.warn("Oracle stale for market, pausing mark updates", { slabAddress: addr, thresholdMs: STALE_PAUSE_THRESHOLD_MS });
-    }
-  }
-
-  // Recovered markets should drop their cooldown entry so a fresh staleness
-  // event re-alerts immediately rather than waiting for the cooldown window.
-  const alertSet = new Set(alertStale);
-  for (const market of Array.from(lastStaleAlertByMarket.keys())) {
-    if (!alertSet.has(market)) lastStaleAlertByMarket.delete(market);
-  }
-
-  // B7: per-market cooldown — gather the subset whose cooldown has elapsed.
-  const now = Date.now();
-  const toAlert: string[] = [];
-  for (const market of alertStale) {
-    const last = lastStaleAlertByMarket.get(market) ?? 0;
-    if (now - last >= STALE_ALERT_COOLDOWN_MS) {
-      lastStaleAlertByMarket.set(market, now);
-      toAlert.push(market);
-    }
-  }
-  if (toAlert.length > 0) {
-    sendCriticalAlert("Oracle stale for markets", [
-      { name: "Stale Markets", value: toAlert.join(", "), inline: false },
-      { name: "Paused (>10min)", value: stalePausedMarkets.size.toString(), inline: true },
-    ]).catch(() => {});
-  }
-}, 60_000);
-
 // GH#2025: Alert when liquidation scanner stalls (no scan completed for >3 min)
 const LIQUIDATION_STALE_THRESHOLD_MS = 3 * 60 * 1000;
 let _lastLiqStaleAlertTime = 0;
@@ -280,14 +216,6 @@ const liqStaleCheckInterval = setInterval(() => {
   }
 }, 60_000);
 
-/** Check if a market is paused due to stale oracle */
-export function isMarketStalePaused(slabAddress: string): boolean {
-  return stalePausedMarkets.has(slabAddress);
-}
-
-// Wire stale pause check into crank service
-crankService.setStalePauseCheck(isMarketStalePaused);
-
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 
@@ -307,7 +235,7 @@ crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 const startupTime = Date.now();
 const healthPort = Number(process.env.KEEPER_HEALTH_PORT ?? 8081);
 // SECURITY: bind the health server to loopback by default (mirrors the metrics
-// server's A.8 fix). /health, /pause-status, and /shadow/report expose wallet
+// server's A.8 fix). /health and /shadow/report expose wallet
 // balance, HA role, budget circuit-breaker state, stale-oracle markets, and shadow
 // decision data; the legacy 2-arg listen(port, cb) defaulted to 0.0.0.0 (publicly
 // visible on any deploy without a firewall). Operators needing remote access must
@@ -413,7 +341,6 @@ const healthServer = http.createServer((req, res) => {
   });
   const isGuardedRead =
     (req.url === "/health" ||
-      req.url === "/pause-status" ||
       req.url === "/shadow/report" ||
       req.url?.startsWith("/shadow/report?")) &&
     req.method === "GET";
@@ -521,22 +448,6 @@ res.writeHead(401, secureJsonHeaders);
     return;
   }
 
-  // GET /pause-status — returns markets paused due to stale oracle
-  if (req.url === "/pause-status" && req.method === "GET") {
-    res.writeHead(200, secureJsonHeaders);
-    // KEEPER-10 / #358: the market list itself is the sensitive part — it tells
-    // an observer exactly which markets the keeper has stopped cranking. An
-    // unauthenticated remote caller gets the count only.
-    res.end(
-      JSON.stringify(
-        healthExposure === "reduced"
-          ? { pausedMarketCount: stalePausedMarkets.size }
-          : { pausedMarkets: [...stalePausedMarkets] },
-      ),
-    );
-    return;
-  }
-
   // POST /admin/budget/resume — clear a latched budget circuit-breaker halt
   // without a full restart. Auth mirrors /register: x-shared-secret header
   // matching KEEPER_ADMIN_SECRET, constant-time compare, per-IP rate limit.
@@ -616,18 +527,8 @@ res.writeHead(401, secureJsonHeaders);
       }
     }
     
-    // Find the most recent oracle update
-    let mostRecentOracle = 0;
-    for (const [slabAddress] of markets) {
-      const price = oracleService.getCurrentPrice(slabAddress);
-      if (price && price.timestamp > mostRecentOracle) {
-        mostRecentOracle = price.timestamp;
-      }
-    }
-    
     const now = Date.now();
     const timeSinceLastCrank = mostRecentCrank > 0 ? now - mostRecentCrank : Infinity;
-    const timeSinceLastOracle = mostRecentOracle > 0 ? now - mostRecentOracle : Infinity;
 
     // Determine health status (M-2: extracted to a pure, testable helper —
     // see src/lib/health-status.ts for why marketsTracked===0 short-circuits
@@ -658,10 +559,8 @@ res.writeHead(401, secureJsonHeaders);
       status,
       role: leaderLock ? leaderLock.role() : "leader",
       lastCrankTime: mostRecentCrank,
-      lastOracleUpdate: mostRecentOracle,
       marketsTracked,
       timeSinceLastCrankMs: timeSinceLastCrank === Infinity ? null : timeSinceLastCrank,
-      timeSinceLastOracleMs: timeSinceLastOracle === Infinity ? null : timeSinceLastOracle,
       keeperWallet: {
         solBalance: keeperSolBalance,
         belowThreshold: keeperSolBalance !== null && keeperSolBalance < SOL_BALANCE_WARN_THRESHOLD,
@@ -930,13 +829,13 @@ async function start() {
       healthServer.off("error", reject);
       logger.info("Health endpoint started", { port: healthPort, host: healthBindAddr });
       // #321: warn loudly if exposed remotely without a shared secret — the
-      // /health, /pause-status, /shadow/report gate fails OPEN in that posture
+      // /health, /shadow/report gate fails OPEN in that posture
       // (so probes work), leaving operational data unauthenticated.
       const isRemoteBind =
         healthBindAddr !== "127.0.0.1" && healthBindAddr !== "localhost" && healthBindAddr !== "::1";
       if (isRemoteBind && !(process.env.KEEPER_REGISTER_SECRET ?? "")) {
         logger.warn(
-          "Health server bound to a remote address without KEEPER_REGISTER_SECRET — /health, /pause-status and /shadow/report are UNAUTHENTICATED. Set KEEPER_REGISTER_SECRET to require the x-shared-secret header.",
+          "Health server bound to a remote address without KEEPER_REGISTER_SECRET — /health and /shadow/report are UNAUTHENTICATED. Set KEEPER_REGISTER_SECRET to require the x-shared-secret header.",
           { host: healthBindAddr },
         );
       }
@@ -1033,7 +932,6 @@ async function shutdown(signal: string): Promise<void> {
     await sharedDecisionLog.close();
 
     // Stop stale oracle + liquidation + SOL balance checks
-    clearInterval(staleCheckInterval);
     clearInterval(liqStaleCheckInterval);
     clearInterval(solBalanceCheckInterval);
     monitorService.stop();
