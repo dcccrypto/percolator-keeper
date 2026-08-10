@@ -126,6 +126,13 @@ function firstProgramInstruction(instructions: TransactionInstruction[]): Transa
 interface EstimateCostResult {
   estimatedCost: number;
   simulatedCu: number;
+  /**
+   * The priority fee (microLamports per CU) the budget gated on. Surfaced so the
+   * caller can broadcast this exact value instead of letting the shared sender
+   * re-derive it from getRecentPrioritizationFees — otherwise the gated cost and
+   * the on-chain bid are independent numbers (dcccrypto/percolator-keeper#396).
+   */
+  microLamports: number;
   /** H-3: true iff simulation proved this exact tx would fail on-chain. */
   provenToFail: boolean;
   simError?: unknown;
@@ -160,6 +167,7 @@ async function estimateCost(
   return {
     estimatedCost: estimateLamportCost(microLamports, cuResult.cu, jitoTip, extraLamports),
     simulatedCu: cuResult.cu,
+    microLamports,
     provenToFail: cuResult.provenToFail,
     simError: cuResult.simError,
   };
@@ -241,7 +249,7 @@ export async function keeperSend(
     ...instructions,
   ];
 
-  const { estimatedCost, simulatedCu, provenToFail, simError } = await estimateCost(
+  const { estimatedCost, simulatedCu, microLamports, provenToFail, simError } = await estimateCost(
     connection,
     simulationInstructions,
     signers,
@@ -343,6 +351,17 @@ export async function keeperSend(
 
     const opts: KeeperSendOptions = {
       ...keeperOpts,
+      // Couple the broadcast to the budget: hand the shared sender the exact
+      // priority fee and CU limit the budget gated on, so it broadcasts those
+      // instead of re-deriving the fee from getRecentPrioritizationFees (an
+      // RPC-controlled, ceiling-less source). Without this the gated cost and the
+      // on-chain bid are independent numbers, and a hostile or spiking RPC can
+      // drive spend past the budget cap while the gate approved a small estimate;
+      // with it, an inflated fee raises estimatedCost and trips the existing
+      // fail-closed budget halt instead. A caller-supplied override still wins.
+      // See dcccrypto/percolator-keeper#396.
+      priorityFeeMicroLamports: keeperOpts?.priorityFeeMicroLamports ?? microLamports,
+      computeUnitLimit: keeperOpts?.computeUnitLimit ?? simulatedCu,
       // Saves ~20-50ms on mainnet when Helius Sender runs its own preflight downstream.
       ...(isMainnetSender() ? { skipPreflight: true } : {}),
     };
