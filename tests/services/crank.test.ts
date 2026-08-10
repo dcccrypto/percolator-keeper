@@ -298,7 +298,7 @@ describe('CrankService', () => {
 
         const mockAccountLoader = {
           getCache: vi.fn(() => mockCache),
-          getStats: vi.fn(() => ({ lastSlot: 123 })),
+          getStats: vi.fn(() => ({ lastSlot: 123, lastSlotAdvanceAt: Date.now() })),
           getProgramId: vi.fn(() => new PublicKey('11111111111111111111111111111111')),
         };
 
@@ -1728,6 +1728,11 @@ describe('CrankService', () => {
         getStats: () => ({
           connected: true,
           lastSlot: 110,
+          // #426: the fast path is gated on the stream having advanced
+          // recently, so a live stream must say so. Previously this was
+          // implicit — a frozen stream was indistinguishable from a healthy
+          // one here, which is the bug that gating closes.
+          lastSlotAdvanceAt: Date.now(),
           eventsReceived: 0,
           eventsDropped: 0,
           reconnectCount: 0,
@@ -1769,6 +1774,58 @@ describe('CrankService', () => {
       service.stop();
     });
 
+    it('#426: does NOT read the cache when the stream slot has stalled', async () => {
+      // A silent stall freezes `lastSlot`, which freezes the slot-age TTL with
+      // it — the cache would keep serving frozen bytes as fresh forever, and
+      // `onStreamError -> invalidateAll()` never fires because no error occurs.
+      // The fast path must therefore not consult the cache at all here.
+      const { AccountCache } = await import('../../src/lib/account-cache.js');
+      const realCache = new AccountCache();
+      realCache.set(GOOD_SLAB, new Uint8Array([1]), EXPECTED_PROGRAM_ID, 100);
+
+      const getOwnerVerifiedSpy = vi.spyOn(realCache, 'getOwnerVerified');
+
+      const fakeLoader = {
+        getCache: () => realCache,
+        getProgramId: () => EXPECTED_PROGRAM_ID,
+        getStats: () => ({
+          connected: true,
+          // Slot is well within the 32-slot TTL of the cached entry, so a
+          // slot-only freshness check would happily serve it. Only the
+          // wall-clock stamp reveals that the stream stopped moving.
+          lastSlot: 110,
+          lastSlotAdvanceAt: Date.now() - 120_000,
+          eventsReceived: 0,
+          eventsDropped: 0,
+          reconnectCount: 0,
+        }),
+      } as any;
+
+      const service = new CrankService(mockOracleService, undefined, fakeLoader);
+
+      const mkMarket = (slab: string) => ({
+        slabAddress: { toBase58: () => slab, equals: () => false },
+        programId: { toBase58: () => EXPECTED_PROGRAM_ID },
+        config: {
+          collateralMint: { toBase58: () => 'Mint' + slab.slice(0, 4) },
+          oracleAuthority: { toBase58: () => 'Auth' + slab.slice(0, 4), equals: () => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin' + slab.slice(0, 4) } },
+      });
+      const internal: any = service;
+      internal.markets.set(GOOD_SLAB, { market: mkMarket(GOOD_SLAB), missedDiscoveryCount: 0 });
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      expect(getOwnerVerifiedSpy).not.toHaveBeenCalled();
+      expect(realCache.stats().hits).toBe(0);
+
+      service.stop();
+    });
+
     it('re-parses cached v17 account data with the v17 parser, not legacy slab parsers', async () => {
       const { AccountCache } = await import('../../src/lib/account-cache.js');
       const realCache = new AccountCache();
@@ -1781,6 +1838,11 @@ describe('CrankService', () => {
         getStats: () => ({
           connected: true,
           lastSlot: 110,
+          // #426: the fast path is gated on the stream having advanced
+          // recently, so a live stream must say so. Previously this was
+          // implicit — a frozen stream was indistinguishable from a healthy
+          // one here, which is the bug that gating closes.
+          lastSlotAdvanceAt: Date.now(),
           eventsReceived: 0,
           eventsDropped: 0,
           reconnectCount: 0,
@@ -1871,6 +1933,11 @@ describe('CrankService', () => {
         getStats: () => ({
           connected: true,
           lastSlot: 110,
+          // #426: the fast path is gated on the stream having advanced
+          // recently, so a live stream must say so. Previously this was
+          // implicit — a frozen stream was indistinguishable from a healthy
+          // one here, which is the bug that gating closes.
+          lastSlotAdvanceAt: Date.now(),
           eventsReceived: 0,
           eventsDropped: 0,
           reconnectCount: 0,

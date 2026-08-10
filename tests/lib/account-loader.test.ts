@@ -644,3 +644,55 @@ describe("AccountLoader — H-5: connect()/stop() race", () => {
     expect(l.getStats().reconnectCount).toBe(0);
   });
 });
+
+/**
+ * #426 (5.2): the loader must expose when its slot last moved FORWARD, so a
+ * consumer can tell a live stream from a silently stalled one — and it must do
+ * so without clamping `lastSlot`, which has to stay able to move backward for
+ * the cache's reorg invalidation (A.2) to work.
+ */
+describe("#426: lastSlotAdvanceAt", () => {
+  it("stamps on a forward slot, and leaves lastSlot free to move backward", async () => {
+    // Fake timers are load-bearing here, not decoration. Without them all three
+    // pushes land in the same millisecond, so the stamps compare equal whether
+    // or not the forward-only guard exists — the assertions below would pass
+    // against a mutation that stamps on every slot. Verified by running that
+    // mutation: it only fails once time actually advances between pushes.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_800_000_000_000));
+
+    const a = new FakeAdapter();
+    const l = new AccountLoader(BASE_OPTS, a);
+
+    expect(l.getStats().lastSlotAdvanceAt).toBe(0);
+
+    await l.start();
+    a.pushSlot(100);
+    const first = l.getStats();
+    expect(first.lastSlot).toBe(100);
+    expect(first.lastSlotAdvanceAt).toBeGreaterThan(0);
+
+    // A repeated slot is not progress — the stamp must not move, or a stream
+    // stuck re-announcing one slot would look healthy forever.
+    vi.advanceTimersByTime(5_000);
+    a.pushSlot(100);
+    expect(l.getStats().lastSlotAdvanceAt).toBe(first.lastSlotAdvanceAt);
+
+    // A BACKWARD slot must still land in lastSlot, because the cache's reorg
+    // invalidation (A.2) keys off `currentSlot < entry.slot`. Clamping it
+    // forward here would trade this staleness bug for a worse one.
+    vi.advanceTimersByTime(5_000);
+    a.pushSlot(90);
+    const after = l.getStats();
+    expect(after.lastSlot).toBe(90);
+    expect(after.lastSlotAdvanceAt).toBe(first.lastSlotAdvanceAt);
+
+    // And a genuine forward move does stamp again.
+    vi.advanceTimersByTime(5_000);
+    a.pushSlot(101);
+    expect(l.getStats().lastSlotAdvanceAt).toBeGreaterThan(first.lastSlotAdvanceAt);
+
+    await l.stop();
+    vi.useRealTimers();
+  });
+});

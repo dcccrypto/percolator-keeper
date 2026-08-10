@@ -23,6 +23,21 @@ export type UnsubscribeFn = () => void;
 export interface LoaderStats {
   connected: boolean;
   lastSlot: number;
+  /**
+   * `Date.now()` when `lastSlot` last moved FORWARD, or 0 if it never has.
+   *
+   * #426 (5.2): consumers use `lastSlot` as the yardstick for cache freshness,
+   * which is only meaningful while the stream is actually delivering. A silent
+   * stall — gRPC connection up, no messages — freezes `lastSlot`, and because
+   * cached entries' slots freeze with it, a slot-age TTL can never expire. The
+   * cache would serve frozen bytes as fresh indefinitely. `onStreamError` does
+   * not help: it fires on an error event, and a silent stall raises none.
+   *
+   * Exposing the wall-clock stamp lets a consumer notice that slot-based
+   * freshness has stopped meaning anything, without this class having to guess
+   * what "too stale" is for any particular caller.
+   */
+  lastSlotAdvanceAt: number;
   eventsReceived: number;
   eventsDropped: number;
   reconnectCount: number;
@@ -193,6 +208,8 @@ export class AccountLoader {
   private running = false;
   private connected = false;
   private lastSlot = 0;
+  /** See LoaderStats.lastSlotAdvanceAt (#426). */
+  private lastSlotAdvanceAt = 0;
   private eventsReceived = 0;
   private eventsDropped = 0;
   private reconnectCount = 0;
@@ -264,6 +281,7 @@ export class AccountLoader {
     return {
       connected: this.connected,
       lastSlot: this.lastSlot,
+      lastSlotAdvanceAt: this.lastSlotAdvanceAt,
       eventsReceived: this.eventsReceived,
       eventsDropped: this.eventsDropped,
       reconnectCount: this.reconnectCount,
@@ -291,6 +309,15 @@ export class AccountLoader {
         this.opts,
         (update) => this.enqueue(update),
         (slot) => {
+          // Stamp only on FORWARD movement: a stream stuck re-announcing the
+          // same slot is not making progress and must not look healthy (#426).
+          //
+          // `lastSlot` itself is still assigned unconditionally. It must stay
+          // able to move BACKWARD — the cache's reorg invalidation (A.2,
+          // account-cache.ts: `currentSlot < entry.slot` is a miss) depends on
+          // exactly that. Clamping it forward here would silently disable that
+          // check, trading one staleness bug for a worse one.
+          if (slot > this.lastSlot) this.lastSlotAdvanceAt = Date.now();
           this.lastSlot = slot;
           this.slotTracker.onStreamSlot(slot);
         },
