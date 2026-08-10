@@ -65,6 +65,33 @@ export interface StreamAdapter {
   stop(): void;
 }
 
+type AccountsSubscription = Record<string, { account: string[]; owner: string[]; filters: [] }>;
+
+/**
+ * Build the Yellowstone `accounts` subscription filter.
+ *
+ * Yellowstone AND-combines the non-empty fields WITHIN one filter entry and
+ * OR-combines separate named entries. Program-owned accounts (matched by `owner`)
+ * and the caller's extra accounts (e.g. dex-pool accounts owned by OTHER programs,
+ * matched by `account`) must therefore live in SEPARATE entries. Putting both
+ * `account:[extras]` and `owner:[programId]` in one entry matches NOTHING — an
+ * extra account is not program-owned, and a program-owned slab is not in the
+ * extras list — which silently kills the entire account stream the moment
+ * additionalAccounts is set.
+ */
+export function buildAccountsSubscription(
+  programId: string,
+  additionalAccounts: string[],
+): AccountsSubscription {
+  const accounts: AccountsSubscription = {
+    "keeper-program": { account: [], owner: [programId], filters: [] },
+  };
+  if (additionalAccounts.length > 0) {
+    accounts["additional-accounts"] = { account: additionalAccounts, owner: [], filters: [] };
+  }
+  return accounts;
+}
+
 /**
  * Production adapter: wraps the helius-laserstream subscribe() function.
  * Lazy-imports the native module so this file can be loaded in test environments
@@ -85,13 +112,7 @@ export class LaserStreamAdapter implements StreamAdapter {
     const programId = opts.programId ?? MAINNET_PROGRAM_ID;
 
     const request = {
-      accounts: {
-        "keeper-program": {
-          account: opts.additionalAccounts ?? [],
-          owner: [programId],
-          filters: [],
-        },
-      },
+      accounts: buildAccountsSubscription(programId, opts.additionalAccounts ?? []),
       slots: {
         "keeper-slots": { filterByCommitment: true },
       },
