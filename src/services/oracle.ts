@@ -112,17 +112,43 @@ export class OracleService {
   // staleness rather than cranking on a frozen price forever.
   private lastExternalPriceMs = new Map<string, number>();
   // H1: Track consecutive deviation rejections per slab to avoid permanent anchor lock.
-  // After DEVIATION_ACCEPT_AFTER consecutive rejections, accept the price as legitimate.
+  // After DEVIATION_ACCEPT_AFTER consecutive rejections AND at least
+  // DEVIATION_ACCEPT_AFTER_MS have elapsed since the FIRST rejection in the current
+  // streak, accept the price as legitimate.
+  // KEEPER-12: the count-only guard allowed a ~25-second coordinated dual-source
+  // manipulation (attacker moves a thin pool that both DexScreener and Jupiter index;
+  // both feeds agree so cross-validation passes; H1 fires after 5 * 5s cycles).
+  // Adding a wall-clock minimum ensures rapid manipulation cannot win the race.
   private deviationRejections = new Map<string, number>();
+  private deviationFirstRejectedAt = new Map<string, number>();
   private static readonly DEVIATION_ACCEPT_AFTER = 5;
+  /**
+   * Minimum elapsed time since the first rejection of the current streak before
+   * H1 fires. Instance state, read at construction rather than at module load,
+   * so it can be injected in tests — matching the `now` clock beside it. A
+   * `static readonly` initialised from process.env is fixed the moment the
+   * module is first imported, which no test can influence.
+   *
+   * 60s, not the 5 minutes first proposed. The gate trades liveness for
+   * manipulation resistance and these are memecoin perps: a legitimate >30% move
+   * inside five minutes is ordinary, and while the price is rejected the market
+   * ages into staleness, gets paused, and stops cranking — suppressing
+   * liquidations during exactly the volatility that produces bad debt. 60s still
+   * forces an attacker to hold a dual-source manipulation across 5+ fetches
+   * rather than the ~25s the count-only gate allowed.
+   */
+  private readonly _deviationAcceptAfterMs: number;
 
   /** Injectable clock — defaults to Date.now() in production; overridden in
    *  tests so price freshness / staleness is deterministic without faking the
    *  global Date around the async fetch path. */
   private readonly now: () => number;
 
-  constructor(opts?: { now?: () => number }) {
+  constructor(opts?: { now?: () => number; deviationAcceptAfterMs?: number }) {
     this.now = opts?.now ?? (() => Date.now());
+    this._deviationAcceptAfterMs =
+      opts?.deviationAcceptAfterMs ??
+      Number(process.env.ORACLE_DEVIATION_ACCEPT_AFTER_MS ?? 60_000);
     // M5: DexScreener and Jupiter REST APIs return prices with NO publisher
     // signature and NO slot field. Cross-source validation (10% deviation) +
     // min-liquidity filter ($1000) + historical deviation cap (30%) mitigate
@@ -494,7 +520,16 @@ export class OracleService {
         if (deviationBps > HISTORICAL_DEVIATION_MAX_BPS) {
           const consecutiveCount = (this.deviationRejections.get(slabAddress) ?? 0) + 1;
           this.deviationRejections.set(slabAddress, consecutiveCount);
-          if (consecutiveCount < OracleService.DEVIATION_ACCEPT_AFTER) {
+          // Track the timestamp of the first consecutive rejection so we can enforce
+          // a wall-clock minimum in addition to the count gate (KEEPER-12).
+          if (consecutiveCount === 1) {
+            this.deviationFirstRejectedAt.set(slabAddress, this.now());
+          }
+          const firstRejectedAt = this.deviationFirstRejectedAt.get(slabAddress) ?? this.now();
+          const elapsedMs = this.now() - firstRejectedAt;
+          const countGate = consecutiveCount >= OracleService.DEVIATION_ACCEPT_AFTER;
+          const timeGate = elapsedMs >= this._deviationAcceptAfterMs;
+          if (!countGate || !timeGate) {
             logger.warn("Price deviation exceeds threshold", {
               mint,
               deviationBps,
@@ -503,14 +538,17 @@ export class OracleService {
               newPrice: priceE6.toString(),
               source,
               consecutiveRejections: consecutiveCount,
-              acceptAfter: OracleService.DEVIATION_ACCEPT_AFTER,
+              acceptAfterCount: OracleService.DEVIATION_ACCEPT_AFTER,
+              acceptAfterMs: this._deviationAcceptAfterMs,
+              elapsedMs: Math.round(elapsedMs),
             });
             return null;
           }
-          logger.warn("Accepting deviated price after consecutive rejections (H1)", {
+          logger.warn("Accepting deviated price after consecutive rejections + time gate (H1)", {
             mint,
             deviationBps,
             consecutiveRejections: consecutiveCount,
+            elapsedMs: Math.round(elapsedMs),
             lastPrice: lastPrice.toString(),
             newPrice: priceE6.toString(),
             source,
@@ -518,8 +556,9 @@ export class OracleService {
         }
       }
     }
-    // H1: Price accepted — reset consecutive rejection counter
+    // H1: Price accepted — reset consecutive rejection counter and first-rejection timestamp
     this.deviationRejections.delete(slabAddress);
+    this.deviationFirstRejectedAt.delete(slabAddress);
 
     const entry: PriceEntry = { priceE6, source, timestamp: this.now() };
     this.recordPrice(slabAddress, entry);

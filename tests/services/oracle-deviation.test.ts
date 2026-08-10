@@ -224,11 +224,17 @@ describe('Cross-source deviation — actual boundary conditions', () => {
 // ─── 2. Historical deviation boundary tests ────────────────────────────────────
 
 describe('Historical deviation — boundary conditions', () => {
+  // KEEPER-12 added a wall-clock minimum alongside the consecutive-rejection
+  // count, so the two H1 escape-hatch tests below have to be able to advance
+  // time. Everything else in this block is time-independent.
+  let clockMs = 1_700_000_000_000;
+  const advanceClock = (ms: number) => { clockMs += ms; };
   let svc: OracleService;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    svc = new OracleService();
+    clockMs = 1_700_000_000_000;
+    svc = new OracleService({ now: () => clockMs });
   });
 
   async function seedPrice(slab: string, usd: number): Promise<bigint> {
@@ -345,6 +351,12 @@ describe('Historical deviation — boundary conditions', () => {
       expect(r).toBeNull();
     }
 
+    // KEEPER-12: acceptance now needs the count AND a sustained deviation, so
+    // the move has to persist past the wall-clock gate as well. The property
+    // this test guards — H1 can still escape, the anchor is not permanently
+    // bricked — is unchanged; only the cost of escaping went up.
+    advanceClock(61_000);
+
     // 5th consecutive rejection — should be accepted
     const mintAccept = freshMint();
     mockBothSources(2.00, 2.00, mintAccept);
@@ -376,6 +388,11 @@ describe('Historical deviation — boundary conditions', () => {
       mockBothSources(2.00, 2.00, mint);
       expect(await svc.fetchPrice(mint, slab)).toBeNull();
     }
+
+    // KEEPER-12: the wall-clock gate also restarts with the streak, so the new
+    // streak has to age past it on its own — it inherits no credit from the
+    // rejections that preceded the accepted price.
+    advanceClock(61_000);
 
     // 5th consecutive from fresh counter — NOW accepted
     const mintFinal = freshMint();
@@ -545,4 +562,97 @@ describe('HYPERP vs Pyth scenario table', () => {
       }
     });
   }
+});
+
+/**
+ * KEEPER-12: the H1 escape hatch (accept a deviated price after N consecutive
+ * rejections) was count-only, so a manipulation that moved a thin pool both
+ * DexScreener and Jupiter index could clear it in ~25 seconds. A wall-clock
+ * minimum makes the attacker hold the manipulation instead of just outlasting a
+ * counter.
+ *
+ * The gate is deliberately 60s and not the 5 minutes originally proposed. These
+ * are memecoin perps: a legitimate >30% move inside five minutes is routine, and
+ * while the price is being rejected the market ages into staleness, gets paused,
+ * and stops cranking -- so an over-long gate suppresses liquidations during
+ * exactly the volatility that creates bad debt.
+ */
+describe('KEEPER-12: wall-clock gate on H1 deviation acceptance', () => {
+  function makeSvc(deviationAcceptAfterMs?: number) {
+    let t = 1_700_000_000_000;
+    const svc = new OracleService({ now: () => t, deviationAcceptAfterMs });
+    return { svc, advance: (ms: number) => { t += ms; } };
+  }
+
+  async function seed(svc: OracleService, slab: string, usd: number) {
+    const mint = freshMint();
+    mockBothSources(usd, usd, mint);
+    const r = await svc.fetchPrice(mint, slab);
+    expect(r).not.toBeNull();
+  }
+
+  async function offer(svc: OracleService, slab: string, usd: number) {
+    const mint = freshMint();
+    mockBothSources(usd, usd, mint);
+    return svc.fetchPrice(mint, slab);
+  }
+
+  it('keeps rejecting a deviated price while the burst is faster than the gate', async () => {
+    const { svc } = makeSvc(60_000);
+    const slab = freshSlab();
+    await seed(svc, slab, 1.0);
+
+    // Ten consecutive rejections, zero elapsed time: the count gate is long
+    // satisfied, so only the clock is holding the line.
+    for (let i = 0; i < 10; i++) {
+      expect(await offer(svc, slab, 2.0)).toBeNull();
+    }
+  });
+
+  it('accepts once the deviation has persisted past the gate', async () => {
+    const { svc, advance } = makeSvc(60_000);
+    const slab = freshSlab();
+    await seed(svc, slab, 1.0);
+
+    for (let i = 0; i < 4; i++) {
+      expect(await offer(svc, slab, 2.0)).toBeNull();
+    }
+    advance(61_000);
+
+    const accepted = await offer(svc, slab, 2.0);
+    expect(accepted).not.toBeNull();
+    expect(accepted!.priceE6).toBe(toE6(2.0));
+  });
+
+  it('defaults the gate to 60s rather than 5 minutes', async () => {
+    const { svc, advance } = makeSvc(); // no override — exercise the default
+    const slab = freshSlab();
+    await seed(svc, slab, 1.0);
+
+    for (let i = 0; i < 4; i++) {
+      expect(await offer(svc, slab, 2.0)).toBeNull();
+    }
+    advance(61_000);
+
+    expect(await offer(svc, slab, 2.0)).not.toBeNull();
+  });
+
+  it('restarts the clock when an in-band price resets the streak', async () => {
+    // The gate measures from the FIRST rejection of the current streak, so an
+    // accepted price in between must clear the timestamp too -- otherwise a
+    // later streak inherits credit for time it did not spend deviating.
+    const { svc, advance } = makeSvc(60_000);
+    const slab = freshSlab();
+    await seed(svc, slab, 1.0);
+
+    expect(await offer(svc, slab, 2.0)).toBeNull(); // streak starts here
+    advance(59_000);
+    await seed(svc, slab, 1.05);                    // in band -> streak reset
+
+    for (let i = 0; i < 4; i++) {
+      expect(await offer(svc, slab, 2.1)).toBeNull();
+    }
+    advance(30_000); // 89s since the ORIGINAL first rejection, 30s since reset
+    expect(await offer(svc, slab, 2.1)).toBeNull();
+  });
 });

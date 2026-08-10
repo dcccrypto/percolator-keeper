@@ -1,3 +1,4 @@
+import { LRUCache } from "lru-cache";
 import { PublicKey, TransactionInstruction, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   fetchSlab,
@@ -16,7 +17,8 @@ import {
   parsePortfolioV17,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, sendCriticalAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
+import { config, getConnection, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, sendCriticalAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
+import { getKeeperKeypair } from "../lib/keypair-singleton.js";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { isCustomProgramError } from "../lib/program-error.js";
@@ -617,8 +619,11 @@ export class LiquidationService {
   // (which collapses bursts within a few seconds, not a level held for hours).
   private readonly _corruptedRiskParamsAlertedAt = new Map<string, number>();
   private static readonly RISK_PARAMS_ALERT_COOLDOWN_MS = 15 * 60_000; // 15 min
-  // Cache keypair at construction — avoids re-parsing from env on every liquidate() call
-  private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+  // Use the process-wide keypair singleton — avoids a second secretKey allocation.
+  // Eager, not a lazy getter — see the matching note in crank.ts: deferring
+  // resolution would turn a boot-time misconfiguration into a first-liquidation
+  // failure, which is exactly the degraded state index.ts warns about.
+  private readonly _keypair = getKeeperKeypair();
   /** LaserStream account loader — injected for event-driven portfolio scanning. */
   private readonly _accountLoader?: AccountLoader;
   /** Per-account debounce timers: slab pubkey → setTimeout handle. */
@@ -649,7 +654,28 @@ export class LiquidationService {
   // scan budget. Residual positions above the cap are picked up next cycle.
   private _cycleSeenPositions = new Set<string>();
   private _cycleOwnerCounts = new Map<string, number>();
-  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE = 3;
+  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE =
+    Number(process.env.KEEPER_MAX_LIQ_PER_OWNER_PER_CYCLE ?? 3);
+  /**
+   * KEEPER-11: the event path gets its OWN per-owner budget rather than sharing
+   * the polling scan's.
+   *
+   * The bug being fixed is that a LaserStream burst covering several positions of
+   * one owner consumed the shared cap before the polling scan reached those
+   * positions, so genuinely underwater accounts were skipped. Exempting the event
+   * path entirely would fix that but leave it unbounded — and it is the one path
+   * an attacker can provoke on demand by touching their own account. The cap is
+   * defence-in-depth against the KEEPER's own mispricing, not against the
+   * attacker, so removing it multiplies the blast radius of a keeper-side price
+   * bug on precisely the cheapest path to trigger.
+   *
+   * Two counters, two limits: a burst can no longer starve the scan, and neither
+   * path is unbounded. Both are env-tunable so the limits can be raised during a
+   * genuine cascade without a redeploy.
+   */
+  private _eventCycleOwnerCounts = new Map<string, number>();
+  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT =
+    Number(process.env.KEEPER_MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT ?? 10);
   // H-1: positions with a liquidate() call currently in flight (added before
   // awaiting liquidate(), removed in a finally once it settles). Intentionally
   // separate from _cycleSeenPositions above: that Set is cleared at the start
@@ -662,6 +688,38 @@ export class LiquidationService {
   // gatedLiquidate is the sole entry point for both the polling path and the
   // LaserStream event path, so guarding here covers both unconditionally.
   private readonly _inFlightPositions = new Set<string>();
+  // BUG-103: per-position failure backoff. _cycleSeenPositions/_inFlightPositions
+  // only prevent *concurrent* double-submission within or across one cycle --
+  // neither remembers that a liquidate() attempt for a given position failed,
+  // so a position whose submitted liquidation keeps reverting gets re-attempted
+  // at full tx-fee cost on every polling cycle.
+  //
+  // Armed ONLY when a transaction was actually broadcast (see _submitAttempts)
+  // and the budget breaker is not halted. Both exclusions matter:
+  //   - Every pre-submit `return null` in liquidate() (oracle-drift guard, the
+  //     #373 fail-closed re-verification, "no longer undercollateralized") sits
+  //     above recordAttempt() and costs no fee. Backing off on those would blind
+  //     the keeper to a genuinely underwater position because an RPC call failed.
+  //   - A halted budget makes keeperSend return null for EVERY position
+  //     (keeper-send.ts: `if (!budget.canSpend(...)) return null`), so arming
+  //     there would put the entire book into escalating cooldown at once and
+  //     keep the keeper idle well past the operator's resume().
+  //
+  // LRU-bounded: entries are only deleted on a landed liquidation, so a position
+  // closed by its owner or liquidated by someone else would otherwise leave its
+  // entry behind for the life of the process.
+  private readonly _positionBackoff = new LRUCache<string, { failures: number; retryAfter: number }>({
+    max: 2_000,
+  });
+  private static readonly POSITION_BACKOFF_BASE_MS = 5_000;
+  // 60s, not the 5 minutes originally proposed: a position that is genuinely
+  // liquidatable must not be ignored long enough for a cascade to accrue bad
+  // debt the protocol then absorbs.
+  private static readonly POSITION_BACKOFF_MAX_MS = 60_000;
+  // Incremented in liquidate() at the recordAttempt() line, i.e. once the tx is
+  // about to go to keeperSend. gatedLiquidate compares this across the call to
+  // tell "broadcast and failed" from "aborted before broadcasting".
+  private _submitAttempts = 0;
   // B5: collapse per-liquidation Discord alerts into a single summary alert per
   // market within a 5 s window — prevents cascade-driven channel flooding.
   private readonly _liquidationAlertAggregator = new AlertAggregator(
@@ -960,6 +1018,13 @@ export class LiquidationService {
       scanPriceE6: bigint;
       closeQ?: bigint;
     },
+    // KEEPER-11: LaserStream-triggered calls do NOT count against _cycleOwnerCounts.
+    // The per-owner cap was designed to bound the polling scan from over-liquidating a
+    // single owner within one cycle. A burst of LaserStream events for distinct positions
+    // of the same owner would exhaust the cap before the polling scan could reach those
+    // positions, causing valid liquidation candidates to be skipped. Event-driven calls
+    // are already deduplicated by _cycleSeenPositions and _inFlightPositions.
+    source: "polling" | "laserstream" = "polling",
   ): Promise<string | null> {
     const positionKey = candidate.v17PortfolioPubkey
       ? `${candidate.slabAddress}:v17:${candidate.v17PortfolioPubkey.toBase58()}`
@@ -975,6 +1040,18 @@ export class LiquidationService {
       });
       return null;
     }
+    // BUG-103: a position that keeps failing gets an escalating cooldown
+    // instead of an unconditional retry on every cycle/event.
+    const backoff = this._positionBackoff.get(positionKey);
+    if (backoff && Date.now() < backoff.retryAfter) {
+      logger.debug("Skipping position in per-position failure backoff", {
+        positionKey,
+        owner: candidate.owner.slice(0, 8),
+        failures: backoff.failures,
+        retryInMs: backoff.retryAfter - Date.now(),
+      });
+      return null;
+    }
     if (this._cycleSeenPositions.has(positionKey)) {
       logger.debug("Skipping position already targeted this cycle", {
         positionKey,
@@ -982,25 +1059,62 @@ export class LiquidationService {
       });
       return null;
     }
-    const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
-    if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
+    // KEEPER-11: independent budgets per source. An event burst draws on
+    // _eventCycleOwnerCounts, so it cannot exhaust the polling scan's allowance
+    // for the same owner — and it is still bounded.
+    const counts =
+      source === "laserstream" ? this._eventCycleOwnerCounts : this._cycleOwnerCounts;
+    const cap =
+      source === "laserstream"
+        ? LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE_EVENT
+        : LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE;
+    const ownerCount = counts.get(candidate.owner) ?? 0;
+    if (ownerCount >= cap) {
       logger.debug("Owner hit per-cycle liquidation cap", {
         owner: candidate.owner.slice(0, 8),
-        cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
+        cap,
+        source,
       });
       return null;
     }
+    counts.set(candidate.owner, ownerCount + 1);
     this._cycleSeenPositions.add(positionKey);
-    this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
     this._inFlightPositions.add(positionKey);
     try {
-      return (await this.liquidate(
-        market,
-        candidate.accountIdx,
-        candidate.v17PortfolioPubkey,
-        candidate.scanPriceE6,
-        candidate.closeQ ?? 0n,
-      )) ?? null;
+      const attemptsBefore = this._submitAttempts;
+      const sig =
+        (await this.liquidate(
+          market,
+          candidate.accountIdx,
+          candidate.v17PortfolioPubkey,
+          candidate.scanPriceE6,
+          candidate.closeQ ?? 0n,
+        )) ?? null;
+      // Did a transaction actually reach the wire? Everything that returns null
+      // above recordAttempt() cost an RPC call, not a fee, and must not throttle
+      // a position that may still be underwater.
+      const broadcast = this._submitAttempts > attemptsBefore;
+      if (sig) {
+        // BUG-103: a landed liquidation clears any prior failure history --
+        // the position is gone, and a future reuse of this key (a new
+        // position at the same slot) deserves a clean slate.
+        this._positionBackoff.delete(positionKey);
+      } else if (broadcast && !sharedBudget.isHalted()) {
+        const prev = this._positionBackoff.get(positionKey);
+        const failures = (prev?.failures ?? 0) + 1;
+        // The first failure is free (immediate retry permitted) -- a single
+        // recheck-abort (oracle moved, owner topped up once) is routine and
+        // must not delay a position that's still genuinely liquidatable.
+        // Backoff only escalates once a position has failed repeatedly.
+        const delay = failures <= 1
+          ? 0
+          : Math.min(
+              LiquidationService.POSITION_BACKOFF_BASE_MS * Math.pow(2, failures - 2),
+              LiquidationService.POSITION_BACKOFF_MAX_MS,
+            );
+        this._positionBackoff.set(positionKey, { failures, retryAfter: Date.now() + delay });
+      }
+      return sig;
     } finally {
       // Always release, regardless of success, a returned null (race-
       // condition abort inside liquidate()), or an unexpected thrown error.
@@ -1385,6 +1499,10 @@ export class LiquidationService {
       //   - Multi-RPC parallel broadcast (+20-40% landing rate)
       //   - Simulation-based tight CU limit (better queue position)
       const __t0 = Date.now();
+      // BUG-103: everything above this line is a pre-submit abort. Past it we are
+      // committed to putting a transaction on the wire, so this is the point that
+      // distinguishes "cost us a fee" from "cost us an RPC call".
+      this._submitAttempts++;
       recordAttempt();
       let sig: string;
       try {
@@ -1477,6 +1595,9 @@ export class LiquidationService {
     // away part of the exposure; partial-fill retry is intentional).
     this._cycleSeenPositions.clear();
     this._cycleOwnerCounts.clear();
+    // KEEPER-11: the event budget resets on the same cycle boundary, so an
+    // exhausted event allowance recovers rather than latching for the process.
+    this._eventCycleOwnerCounts.clear();
 
     // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
     // Markets re-add themselves on next parse failure, so this is safe.
@@ -1596,8 +1717,10 @@ export class LiquidationService {
     this.scanMarket(market).then(async (candidates) => {
       for (const c of candidates) {
         // #218: route through the shared gate so the event path honors the same
-        // per-cycle dedup + per-owner cap as the polling path (no double-liquidation).
-        const sig = await this.gatedLiquidate(market, c);
+        // per-cycle dedup + in-flight guard as the polling path (no double-liquidation).
+        // KEEPER-11: tagged "laserstream" so an event burst draws on its own
+        // per-owner budget instead of exhausting the polling scan's.
+        const sig = await this.gatedLiquidate(market, c, "laserstream");
         if (sig) {
           logger.info("Event-driven liquidation complete", {
             slabAddress: slabKey,

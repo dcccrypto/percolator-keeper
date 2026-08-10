@@ -9,3 +9,10 @@ overrides:
   # an unauthenticated request path. Pulled in at 2.6.0 and 2.6.1 by different
   # Sentry sub-dependencies, hence an override rather than a direct bump.
   "@opentelemetry/core": ">=2.8.0"
+  # GHSA-3h5v-q93c-6h6q (CVE-2024-37890) / GHSA-5v72-xg48-5rpm (#372-adjacent):
+  # ws < 8.17.1 allocates one object per HTTP header, so a request carrying many
+  # headers exhausts memory. The keeper reaches ws two ways: @supabase/realtime-js
+  # and helius-laserstream both pull ws@8.20.0, and @solana/web3.js pulls ws@7.5.10
+  # transitively through jayson/isomorphic-ws. An override is required rather than
+  # a direct bump because the keeper has no direct ws dependency of its own.
+  ws: ^8.21.0
