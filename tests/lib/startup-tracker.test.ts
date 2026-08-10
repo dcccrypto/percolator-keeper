@@ -50,4 +50,16 @@ describe("StartupTracker", () => {
     t.markReady();
     expect(t.state).toBe("ready");
   });
+
+  it("masks an embedded api-key in the failure reason (served on /health)", () => {
+    const t = new StartupTracker();
+    // A boot RPC failure surfaces as a node-fetch error quoting the full URL.
+    t.markFailed(
+      "Primary RPC connectivity check failed: request to " +
+        "https://mainnet.helius-rpc.com/?api-key=SECRET123 failed, reason: ECONNREFUSED",
+    );
+    // failureReason is returned in the /health 503 body — it must not leak the key.
+    expect(t.failureReason).not.toContain("SECRET123");
+    expect(t.failureReason).toContain("api-key=***");
+  });
 });

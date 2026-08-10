@@ -1,3 +1,5 @@
+import { maskApiKeys } from "@percolatorct/shared";
+
 /**
  * Tracks whether the asynchronous keeper boot (RPC connectivity probe,
  * market discovery, service start) has completed.
@@ -19,7 +21,11 @@ export class StartupTracker {
 
   markFailed(reason: string): void {
     this._state = "failed";
-    this._failureReason = reason;
+    // failureReason is served on /health (503 body), so mask any embedded
+    // api-key before storing it. A boot RPC failure surfaces as a node-fetch
+    // error quoting the full URL ("request to https://…?api-key=XXX failed"),
+    // which would otherwise leak the RPC key to any prober and to Sentry.
+    this._failureReason = maskApiKeys(reason);
   }
 
   get state(): StartupState {

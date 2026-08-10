@@ -1,7 +1,7 @@
 import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, getConnection } from "@percolatorct/shared";
+import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, getConnection, maskApiKeys } from "@percolatorct/shared";
 import { monitors } from "./lib/service-monitors.js";
 import { getKeeperKeypair } from "./lib/keypair-singleton.js";
 import { OracleService } from "./services/oracle.js";
@@ -797,7 +797,10 @@ async function start() {
       });
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    // Mask any embedded api-key: a node-fetch failure quotes the full RPC URL
+    // ("request to https://…?api-key=XXX failed"), and this msg flows to the log,
+    // the thrown error (→ Sentry via captureAndExit), and /health's failureReason.
+    const msg = maskApiKeys(err instanceof Error ? err.message : String(err));
     logger.error("Primary RPC unreachable at startup — check SOLANA_RPC_URL", { error: msg });
     throw new Error(`Primary RPC connectivity check failed: ${msg}`);
   }
