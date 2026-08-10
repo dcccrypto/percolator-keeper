@@ -274,10 +274,19 @@ async function scanV17Portfolios(
   cursors: Map<string, number>,
 ): Promise<Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint; deficit: bigint }>> {
   const marketKey = market.slabAddress.toBase58();
+  // #334-followup: fetch only the matching portfolio PUBKEYS here (dataSlice
+  // length 0). The full portfolio account is ~9.3 KB, so fetching every match's
+  // data up front lets an attacker who floods a market with portfolios push the
+  // getProgramAccounts response into the tens of MB — past RPC response limits —
+  // so the query fails, the catch returns [], and (previously logged at debug)
+  // liquidation scanning for that market goes dark SILENTLY. Fetching keys only
+  // bounds the response; full data for the capped window is fetched below via
+  // getMultipleAccountsInfo.
   let rawPortfolios: ReadonlyArray<{ pubkey: PublicKey; account: { data: Buffer | Uint8Array } }>;
   try {
     rawPortfolios = await withTimeout(
       connection.getProgramAccounts(programId, {
+        dataSlice: { offset: 0, length: 0 },
         filters: [
           { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
           {
@@ -292,7 +301,9 @@ async function scanV17Portfolios(
       `scanV17Portfolios:getProgramAccounts(${marketKey.slice(0, 8)})`,
     );
   } catch (err) {
-    logger.debug("scanV17Portfolios: getProgramAccounts failed", {
+    // Visible, not debug: a persistent failure here silently disables
+    // liquidation for this market, which is exactly the case ops must see.
+    logger.warn("scanV17Portfolios: portfolio key scan failed — liquidation scanning DEGRADED for this market this cycle", {
       market: marketKey.slice(0, 8),
       error: err instanceof Error ? err.message : String(err),
     });
@@ -342,6 +353,37 @@ async function scanV17Portfolios(
     // Market shrank back under the cap — reset the cursor so we don't carry a
     // stale offset that would skip the front of a now-small set.
     cursors.delete(marketKey);
+  }
+
+  // Hydrate the capped window: the getProgramAccounts above fetched pubkeys only
+  // (to bound the response under a flood), so fetch full account data for just
+  // the ≤MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE window via getMultipleAccountsInfo,
+  // chunked at the 100-pubkey RPC limit. This is bounded work regardless of how
+  // many portfolios the market has.
+  try {
+    const GMA_CHUNK = 100;
+    const winKeys = window.map((w) => w.pubkey);
+    const hydrated: RawPortfolio[] = [];
+    for (let i = 0; i < winKeys.length; i += GMA_CHUNK) {
+      const chunk = winKeys.slice(i, i + GMA_CHUNK);
+      const infos = await withTimeout(
+        connection.getMultipleAccountsInfo(chunk),
+        RPC_TIMEOUT_MS,
+        `scanV17Portfolios:getMultipleAccountsInfo(${marketKey.slice(0, 8)})`,
+      );
+      for (let j = 0; j < chunk.length; j++) {
+        const info = infos[j];
+        // Skip accounts that vanished between the key scan and this fetch.
+        if (info?.data) hydrated.push({ pubkey: chunk[j]!, account: { data: info.data } });
+      }
+    }
+    window = hydrated;
+  } catch (err) {
+    logger.warn("scanV17Portfolios: portfolio hydration failed — liquidation scanning DEGRADED for this market this cycle", {
+      market: marketKey.slice(0, 8),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
   }
 
   // #334: collect all qualifying candidates with their deficit so we can

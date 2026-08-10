@@ -589,6 +589,7 @@ describe('LiquidationService', () => {
         vi.mocked(shared.getConnection).mockReturnValue({
           getAccountInfo: vi.fn(async () => null),
           getProgramAccounts: vi.fn(async () => [makeRawPortfolio('Mismatched')]),
+          getMultipleAccountsInfo: vi.fn(async (keys: any[]) => keys.map(() => ({ data: new Uint8Array(16) }))),
         } as any);
         vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
           oracleMode: 2, // EWMA_MARK
@@ -621,6 +622,7 @@ describe('LiquidationService', () => {
         vi.mocked(shared.getConnection).mockReturnValue({
           getAccountInfo: vi.fn(async () => null),
           getProgramAccounts: vi.fn(async () => [makeRawPortfolio('Matching')]),
+          getMultipleAccountsInfo: vi.fn(async (keys: any[]) => keys.map(() => ({ data: new Uint8Array(16) }))),
         } as any);
         vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
           oracleMode: 2, // EWMA_MARK
@@ -655,6 +657,7 @@ describe('LiquidationService', () => {
             makeRawPortfolio('Mismatched'),
             makeRawPortfolio('Matching'),
           ]),
+          getMultipleAccountsInfo: vi.fn(async (keys: any[]) => keys.map(() => ({ data: new Uint8Array(16) }))),
         } as any);
         vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
           oracleMode: 2, // EWMA_MARK
@@ -685,6 +688,50 @@ describe('LiquidationService', () => {
 
         expect(candidates).toHaveLength(1);
         expect(candidates[0].owner).toBe('OwnerMatching11111111111111111111111');
+      });
+
+      // PoC: a portfolio flood must not make the scan fetch full account data for
+      // every match. getProgramAccounts fetches PUBKEYS ONLY (dataSlice length 0),
+      // and full data is fetched for at most the per-cycle cap via chunked
+      // getMultipleAccountsInfo. Pre-fix (full-data getProgramAccounts, no cap on
+      // the fetch) there is no dataSlice and no getMultipleAccountsInfo call.
+      it('bounds the full-data fetch under a portfolio flood', async () => {
+        const MAX_PER_CYCLE = 512; // MAX_PORTFOLIOS_PER_MARKET_PER_CYCLE
+        const FLOOD = 1000;
+        vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        const floodKeys = Array.from({ length: FLOOD }, (_, i) => makeRawPortfolio(`Flood${i}`));
+        const gpaSpy = vi.fn(async () => floodKeys);
+        const gmaSpy = vi.fn(async (keys: any[]) => keys.map(() => ({ data: new Uint8Array(16) })));
+        vi.mocked(shared.getConnection).mockReturnValue({
+          getAccountInfo: vi.fn(async () => null),
+          getProgramAccounts: gpaSpy,
+          getMultipleAccountsInfo: gmaSpy,
+        } as any);
+        vi.mocked(core.parseWrapperConfigV17).mockReturnValueOnce({
+          oracleMode: 2,
+          maxStalenessSecs: 60n,
+          oracleTargetPriceE6: 0n,
+          oracleTargetPublishTime: BigInt(Math.floor(Date.now() / 1000)) - 10n,
+          markEwmaE6: 1_000_000n,
+        } as any);
+        // Every parsed portfolio is healthy — we only assert on the fetch shape.
+        vi.mocked(core.parsePortfolioV17).mockReturnValue({
+          marketGroupId: mockMarket.slabAddress,
+          owner: mockNonZeroKey('Owner11111111111111111111111111111111'),
+          capital: 10_000_000_000n,
+          pnl: 0n,
+          feeCredits: 0n,
+          legs: [{ active: true, basisPosQ: 1n, assetIndex: 0 }],
+        } as any);
+
+        await liquidationService.scanMarket(mockMarket as any);
+
+        // Response bounded to pubkeys.
+        expect(gpaSpy.mock.calls[0]?.[1]?.dataSlice).toEqual({ offset: 0, length: 0 });
+        // Full data fetched for at most the per-cycle cap — NOT all 1000.
+        const totalHydrated = gmaSpy.mock.calls.reduce((s, c) => s + (c[0] as any[]).length, 0);
+        expect(totalHydrated).toBe(MAX_PER_CYCLE);
       });
     });
   });
