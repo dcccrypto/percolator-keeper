@@ -951,6 +951,10 @@ async function start() {
     const conn = (await import("@percolatorct/shared")).getConnection();
     const harness = initSharedShadowHarness({
       connection: conn,
+      // Without this the harness falls back to the MAINNET program id (see its
+      // constructor), so a devnet shadow deploy would count signatures on the
+      // mainnet program and emit spurious runaway/silent alerts.
+      programId: config.programId,
       readDecisions: (fromMs, toMs) => sharedDecisionLog.readWindow(fromMs, toMs),
     });
     harness.start();

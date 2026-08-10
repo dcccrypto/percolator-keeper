@@ -383,6 +383,28 @@ describe("ShadowHarness — comparison logic", () => {
       else process.env.PROGRAM_ID = origEnv;
     }
   });
+
+  it("uses a caller-provided programId instead of the MAINNET fallback (index.ts must pass config.programId)", async () => {
+    const origEnv = process.env.PROGRAM_ID;
+    delete process.env.PROGRAM_ID; // mainnet fallback is the only alternative
+    try {
+      const DEVNET_PROGRAM = "So11111111111111111111111111111111111111112";
+      const conn = makeConnection(0);
+      const harness = new ShadowHarness({
+        connection: conn,
+        readDecisions: vi.fn(async () => []),
+        compareWindowMs: 300_000,
+        programId: DEVNET_PROGRAM,
+      });
+      await harness.runCycle();
+      const calledWith = vi.mocked(conn.getSignaturesForAddress).mock.calls[0][0] as PublicKey;
+      expect(calledWith.toBase58()).toBe(DEVNET_PROGRAM);
+      expect(calledWith.toBase58()).not.toBe(MAINNET_PROGRAM_ID);
+    } finally {
+      if (origEnv === undefined) delete process.env.PROGRAM_ID;
+      else process.env.PROGRAM_ID = origEnv;
+    }
+  });
 });
 
 describe("ShadowHarness — buildReport (used by /shadow/report)", () => {
