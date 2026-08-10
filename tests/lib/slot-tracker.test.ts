@@ -112,6 +112,35 @@ describe("SlotTracker", () => {
 
       expect(alertFn).toHaveBeenCalledWith(6);
     });
+
+    it("does not alert on boot before the stream has delivered a slot (streamSlot=0)", async () => {
+      vi.useFakeTimers();
+      const alertFn = vi.fn();
+      const t = new SlotTracker(alertFn);
+      // No onStreamSlot() — streamSlot stays 0, so drift = rpcSlot (huge), but the
+      // stream simply hasn't started yet; this must not fire an alert.
+      t.start(async () => 100_000);
+
+      await vi.advanceTimersByTimeAsync(30_100); // three polls
+      t.stop();
+      vi.useRealTimers();
+
+      expect(alertFn).not.toHaveBeenCalled();
+    });
+
+    it("rate-limits repeated drift alerts to the cooldown window", async () => {
+      vi.useFakeTimers();
+      const alertFn = vi.fn();
+      const t = new SlotTracker(alertFn);
+      t.onStreamSlot(10);
+      t.start(async () => 100); // sustained drift = 90 > 50 every poll
+
+      await vi.advanceTimersByTimeAsync(60_100); // six polls within the 5-min cooldown
+      t.stop();
+      vi.useRealTimers();
+
+      expect(alertFn).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("start / stop", () => {
