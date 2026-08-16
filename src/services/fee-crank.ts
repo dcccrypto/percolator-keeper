@@ -56,6 +56,7 @@ import {
   deriveLpBackingLedger,
   deriveLpVaultRegistry,
   deriveStakePool,
+  getStakeProgramId,
   deriveCanonicalVault,
   deriveVaultAuthority,
   encodeExpireBackingBucket,
@@ -66,6 +67,7 @@ import {
   parseWrapperConfigV17,
 } from "@percolatorct/sdk";
 import { createLogger } from "@percolatorct/shared";
+import { isMainnet } from "../config/network.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import {
@@ -495,7 +497,15 @@ export const insuranceReserveToStakeLeg: CrankLeg = {
     // out of that pool's own bytes. We re-derive it here only to know whether
     // the market has a bound pool at all — an unbound market can never satisfy
     // this instruction and sending would be a guaranteed revert.
-    const [stakePoolPda] = deriveStakePool(address);
+    // Pass the stake program EXPLICITLY. deriveStakePool falls back to
+    // getStakeProgramId() when no programId is given, and that resolver refuses to
+    // guess an ambiguous network rather than defaulting — the keeper runs with
+    // NETWORK unset in local/devnet operation, so the bare form throws. The throw
+    // is swallowed by the leg's try/catch below, which would silently degrade tag 87
+    // (WithdrawInsuranceReserveToStake) to status:"error" every cycle and stall an
+    // insurance-reserve -> stake money movement behind a log line.
+    const stakeProgramId = getStakeProgramId(isMainnet() ? "mainnet" : "devnet");
+    const [stakePoolPda] = deriveStakePool(address, stakeProgramId);
     const poolInfo = await ctx.connection.getAccountInfo(stakePoolPda);
     if (poolInfo === null) {
       logger.debug("no stake pool bound to market, skipping tag 87", {
