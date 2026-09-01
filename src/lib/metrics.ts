@@ -172,6 +172,40 @@ export const priorityFeeEstimateTotal = new Counter({
   registers: [registry],
 });
 
+// The RAW estimate the fee RPC reported, before clamping. Paired with
+// keeper_priority_fee_microlamports (which carries the value actually
+// BROADCAST) so an operator can see the true market price even while the
+// ceiling is binding — otherwise the broadcast gauge flatlines at the ceiling
+// and cannot answer "is my ceiling too low?".
+export const priorityFeeRawMicrolamports = new Gauge({
+  name: "keeper_priority_fee_raw_microlamports",
+  help: "Priority fee estimate as reported by the RPC, before the sanity ceiling",
+  labelNames: ["tier"] as const,
+  registers: [registry],
+});
+
+// Counts estimates clamped to PRIORITY_FEE_ESTIMATE_MAX. A non-zero rate means
+// the fee RPC is reporting bids the keeper refuses to broadcast — alert on it:
+// pre-clamp such a value would have latched the keeper-wide spend breaker (#350).
+export const priorityFeeClampedTotal = new Counter({
+  name: "keeper_priority_fee_clamped_total",
+  help: "Total priority fee estimates clamped to the sanity ceiling, by tier",
+  labelNames: ["tier"] as const,
+  registers: [registry],
+});
+
+// Denominator for the clamp rate. keeper_priority_fee_estimate_total counts
+// every estimate() CALL including cache hits, while a clamp can only happen on
+// a cache MISS — so clamped/estimate_total understates the clamp fraction by
+// the cache-hit multiplier (itself an env knob). Alert on
+// rate(clamped_total) / rate(fetch_total) instead.
+export const priorityFeeFetchTotal = new Counter({
+  name: "keeper_priority_fee_fetch_total",
+  help: "Priority fee estimate RPC fetches (cache misses), by tier",
+  labelNames: ["tier"] as const,
+  registers: [registry],
+});
+
 // Per-DEX-type UpdateHyperpMark instruction outcome counter.
 // Wired in crank.ts crankMarket() HYPERP branch.
 export const updateHyperpMarkTotal = new Counter({

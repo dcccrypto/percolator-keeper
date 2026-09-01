@@ -8,7 +8,10 @@
  */
 import { describe, it, expect } from "vitest";
 import { validateKeeperEnvGuards } from "../../src/env-guards.js";
+import { estimateLamportCost } from "../../src/lib/keeper-send.js";
+import { KeeperBudget } from "../../src/lib/budget.js";
 import {
+  PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX,
   PRIORITY_FEE_FALLBACK_MAX,
   PRIORITY_FEE_FALLBACK_MIN,
 } from "../../src/lib/priority-fee.js";
@@ -73,6 +76,72 @@ describe("#426 §5.1 — priority-fee fallback envs are validated at boot", () =
   it("treats an empty string as unset", () => {
     expect(() =>
       validateKeeperEnvGuards({ ...BASE, KEEPER_PRIORITY_FEE_FALLBACK_CRANK: "" }),
+    ).not.toThrow();
+  });
+
+  it("validates the #350 estimate ceiling at the LITERAL boundary too", () => {
+    const V = "KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS";
+    // Floor is the fallback FLOOR (1_000), not the fallback ceiling — an
+    // operator must be able to tighten a safety bound, only raising is capped.
+    expect(() => validateKeeperEnvGuards({ ...BASE, [V]: "999" })).toThrow(
+      new RegExp(V),
+    );
+    expect(() => validateKeeperEnvGuards({ ...BASE, [V]: "1000000" })).not.toThrow();
+    expect(() => validateKeeperEnvGuards({ ...BASE, [V]: "10000000" })).not.toThrow();
+    expect(() => validateKeeperEnvGuards({ ...BASE, [V]: "20000000" })).not.toThrow();
+    // Above the hard max it walks back toward the single-send keeper-wide halt.
+    expect(() => validateKeeperEnvGuards({ ...BASE, [V]: "20000001" })).toThrow(
+      new RegExp(V),
+    );
+    for (const bad of ["abc", "2000000.5", "-1", "Infinity"]) {
+      expect(() => validateKeeperEnvGuards({ ...BASE, [V]: bad })).toThrow(new RegExp(V));
+    }
+    expect(() => validateKeeperEnvGuards({ ...BASE, [V]: "" })).not.toThrow();
+  });
+
+  it("the ceiling's hard max cannot itself latch the breaker on one send", () => {
+    // Uses the REAL cost formula and the REAL budget default, not a local
+    // re-implementation — otherwise lowering maxSolPerCycle or raising the CU
+    // fallback (exactly the changes this guards) would leave it passing.
+    const MAX_CU = 1_540_000; // 1.4M cap x 1.1 sim margin
+    const JITO = 200_000;
+    const worstCase = estimateLamportCost(
+      PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX,
+      MAX_CU,
+      JITO,
+      0,
+    );
+    const budget = new KeeperBudget({}, { env: {} });
+    expect(budget.canSpend(worstCase, "liquidation")).toBe(true);
+    expect(budget.isHalted()).toBe(false);
+  });
+
+  it("REFUSES a ceiling below the largest configured fallback", () => {
+    // The degraded path would otherwise bid MORE than the healthy path's cap.
+    expect(() =>
+      validateKeeperEnvGuards({
+        ...BASE,
+        KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS: "2000",
+      }),
+    ).toThrow(/below the largest configured per-tier fallback/);
+
+    // ...but the same tight ceiling is fine once the fallbacks are lowered to match.
+    expect(() =>
+      validateKeeperEnvGuards({
+        ...BASE,
+        KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS: "2000",
+        KEEPER_PRIORITY_FEE_FALLBACK_LIQUIDATION: "2000",
+        KEEPER_PRIORITY_FEE_FALLBACK_ADL: "2000",
+      }),
+    ).not.toThrow();
+  });
+
+  it("an operator may TIGHTEN the ceiling — the safety-increasing direction", () => {
+    expect(() =>
+      validateKeeperEnvGuards({
+        ...BASE,
+        KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS: "200000",
+      }),
     ).not.toThrow();
   });
 
