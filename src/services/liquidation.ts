@@ -521,9 +521,47 @@ async function scanV17Portfolios(
 // Default 150 bps (1.5%) — wider than typical intra-minute moves on SOL/BTC/ETH
 // but tight enough to cap keeper-wallet exposure on a 60s scan interval.
 // Set to 0 to disable.
-const MAX_LIQUIDATION_DRIFT_BPS = BigInt(
-  parseInt(process.env.LIQUIDATION_MAX_ORACLE_DRIFT_BPS ?? "150", 10),
-);
+/**
+ * Resolve the oracle-drift guard threshold.
+ *
+ * Previously `BigInt(parseInt(env ?? "150", 10))`, which prefix-parses and so
+ * mis-reads the forms an operator actually types:
+ *
+ *   "0x10" -> parseInt stops at `x` -> 0 -> `MAX_LIQUIDATION_DRIFT_BPS > 0n`
+ *             is false and THE DRIFT GUARD IS SILENTLY DISABLED. The on-chain
+ *             Liquidate instruction carries no price bound, so this guard is
+ *             the only mitigation — a typo removes it with no signal.
+ *   "1e3"  -> 1, a 1000x tightening that aborts nearly every liquidation.
+ *   "abc"  -> NaN -> BigInt(NaN) throws at MODULE TOP LEVEL, before
+ *             validateKeeperEnvGuards() can run, so the operator gets a bare
+ *             "Cannot convert NaN to a BigInt" that never names the variable.
+ *
+ * Digits only, resolved lazily so a bad value is an attributed boot error
+ * rather than an unattributed import crash. 0 still disables deliberately.
+ */
+export function resolveMaxLiquidationDriftBps(
+  env: NodeJS.ProcessEnv = process.env,
+): bigint {
+  const raw = env.LIQUIDATION_MAX_ORACLE_DRIFT_BPS?.trim();
+  if (raw === undefined || raw === "") return 150n;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `LIQUIDATION_MAX_ORACLE_DRIFT_BPS='${raw.slice(0, 20)}' is not a non-negative ` +
+        `integer. Digits only: hex, exponent notation and underscores are rejected ` +
+        `because they previously parsed to 0, silently disabling the oracle drift ` +
+        `guard — the only bound on the price a liquidation is submitted at.`,
+    );
+  }
+  const value = BigInt(raw);
+  if (value > 10_000n) {
+    throw new Error(
+      `LIQUIDATION_MAX_ORACLE_DRIFT_BPS=${value} exceeds 10000 bps (100%). A ` +
+        `threshold at or above 100% can never trip, which disables the guard as ` +
+        `surely as 0 does. Use 0 to disable it deliberately.`,
+    );
+  }
+  return value;
+}
 
 /**
  * Is this candidate below the configured dust floor?
@@ -1540,19 +1578,20 @@ export class LiquidationService {
             });
             return null;
           }
-          if (MAX_LIQUIDATION_DRIFT_BPS > 0n && scanPriceE6 > 0n) {
+          const maxDriftBps = resolveMaxLiquidationDriftBps();
+          if (maxDriftBps > 0n && scanPriceE6 > 0n) {
             const delta = freshPrice > scanPriceE6
               ? freshPrice - scanPriceE6
               : scanPriceE6 - freshPrice;
             const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
-            if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+            if (driftBps > maxDriftBps) {
               logger.warn("Aborting v17 liquidation: oracle drift exceeds limit", {
                 portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
                 slabAddress: slabAddress.toBase58(),
                 scanPriceE6: scanPriceE6.toString(),
                 freshPriceE6: freshPrice.toString(),
                 driftBps: driftBps.toString(),
-                limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+                limitBps: maxDriftBps.toString(),
               });
               return null;
             }
@@ -1662,19 +1701,20 @@ export class LiquidationService {
         // price bound. If the oracle has moved more than MAX_LIQUIDATION_DRIFT_BPS
         // since candidacy, the on-chain execution price may differ enough to
         // flip the liquidation's P&L. Abort rather than absorb that drift.
-        if (MAX_LIQUIDATION_DRIFT_BPS > 0n && scanPriceE6 > 0n && freshPrice > 0n) {
+        const legacyMaxDriftBps = resolveMaxLiquidationDriftBps();
+        if (legacyMaxDriftBps > 0n && scanPriceE6 > 0n && freshPrice > 0n) {
           const delta = freshPrice > scanPriceE6
             ? freshPrice - scanPriceE6
             : scanPriceE6 - freshPrice;
           const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
-          if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+          if (driftBps > legacyMaxDriftBps) {
             logger.warn("Aborting liquidation: oracle drift exceeds limit", {
               accountIndex: accountIdx,
               slabAddress: slabAddress.toBase58(),
               scanPriceE6: scanPriceE6.toString(),
               freshPriceE6: freshPrice.toString(),
               driftBps: driftBps.toString(),
-              limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+              limitBps: legacyMaxDriftBps.toString(),
             });
             return null;
           }
