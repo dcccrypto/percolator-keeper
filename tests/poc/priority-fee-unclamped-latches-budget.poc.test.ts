@@ -128,12 +128,13 @@ describe("#350 — unclamped priority-fee estimate latches the budget breaker", 
   it("SCOPE: the ceiling bounds the FEE term only — rent still latches", async () => {
     // Honest limit of this fix. estimateLamportCost is
     // base + fee + jitoTip + extraLamports, and extraLamports carries the v17
-    // portfolio rent (~60.0M lamports, measured on-chain for 9347 bytes),
-    // which exceeds the 50M cycle cap on its own. Tracked separately; asserted
-    // here so nobody reads the ceiling as "no send can latch the breaker".
+    // portfolio rent for 9347 bytes — 65_946_000 lamports on mainnet,
+    // 60_005_175 on devnet, both measured via getMinimumBalanceForRentExemption
+    // — which exceeds the 50M cycle cap on either cluster. Tracked separately;
+    // asserted here so nobody reads the ceiling as "no send can latch it".
     const est = estimatorReturning(1_000);
     const fee = await est.estimate(["acc1"], "crank");
-    const V17_PORTFOLIO_RENT = 60_005_175;
+    const V17_PORTFOLIO_RENT = 65_946_000; // mainnet
 
     const cost = estimateLamportCost(fee, 1_400_000, 0, V17_PORTFOLIO_RENT);
     expect(cost).toBeGreaterThan(CYCLE_CAP);

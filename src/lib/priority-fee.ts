@@ -80,9 +80,10 @@ export const PRIORITY_FEE_FALLBACK_MAX = 1_000_000;
  * SCOPE — this bounds the FEE TERM ONLY, not the whole cost. `estimateLamportCost`
  * is `base + ceil(uL*cu/1e6) + jitoTip + extraLamports`, and the last two are
  * unbounded by this ceiling. In particular `extraLamports` carries the v17
- * portfolio rent (`crank.ts` `provisionKeeperPortfolio`), which is ~60.0M
- * lamports on its own — ABOVE the 50M cycle cap — so that path latches the
- * breaker regardless of the fee. Do not read this ceiling as "no send can
+ * portfolio rent (`crank.ts` `provisionKeeperPortfolio`), which is 65_946_000
+ * lamports on mainnet (60_005_175 on devnet, whose rent params differ) — ABOVE
+ * the 50M cycle cap on either cluster — so that path latches the breaker
+ * regardless of the fee. Do not read this ceiling as "no send can
  * latch the breaker"; it is "no FEE ESTIMATE can latch it by itself".
  *
  * VALUE — 10_000_000 uL, not a tighter number, because the ceiling is
@@ -105,12 +106,21 @@ export const PRIORITY_FEE_FALLBACK_MAX = 1_000_000;
  * rather than a silent min(). A sustained clamp rate means the fee RPC is
  * reporting bids the keeper is refusing to pay, which an operator needs to see.
  *
- * This bounds a SINGLE send, not a cycle. At the clamped 2_000_000 uL and the
- * worst-case 1.54M CU, ~16 sends in one 30s window still reach the cycle cap —
- * and `maxTxPerCycle` (60) does not bite first at that cost. That is intended:
- * sustained spend at the ceiling IS the genuine overspend signal the breaker
- * exists to latch on. What this ceiling removes is the case where ONE proposal
- * latches it with nothing spent.
+ * This bounds a SINGLE send, not a cycle. At the clamped 10_000_000 uL and the
+ * worst-case 1.54M CU a send costs 15_605_000 lamports, so ~3 sends in one 30s
+ * window still reach the cycle cap, and `maxTxPerCycle` (60) does not bite
+ * first. That is intended: sustained spend at the ceiling IS the genuine
+ * overspend signal the breaker exists to latch on. What this ceiling removes is
+ * the case where ONE proposal latches it with nothing spent.
+ *
+ * Be aware of the trade this ceiling's height makes. Raising it from a tighter
+ * value buys headroom on the single send and spends it on the HOUR cap, which
+ * also latches: at 10_000_000 uL and a typical 300k CU, `maxSolPerHour`
+ * (500_000_000) is reached after ~156 sends rather than ~621 at 2_000_000 —
+ * roughly a 4x shorter fuse. That is the right side to err on, because a
+ * clamped-too-low bid silently loses a liquidation while an hour-cap halt is
+ * visible and resumable, but it is the strongest argument for fixing
+ * halt-vs-refuse in budget.ts rather than bounding inputs one at a time.
  */
 export const PRIORITY_FEE_ESTIMATE_MAX = 10_000_000;
 
