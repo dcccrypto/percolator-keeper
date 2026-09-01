@@ -25,6 +25,7 @@ import {
   MG_CURRENT_SLOT_OFF,
   MG_INSURANCE_DOMAIN_BUDGET_REMAINING_TOTAL_OFF,
   MG_INSURANCE_OFF,
+  MG_VAULT_OFF,
   MG_MATERIALIZED_PORTFOLIO_COUNT_OFF,
   MG_MODE_OFF,
   MG_SOURCE_INSURANCE_CREDIT_RESERVED_ATOMS_OFF,
@@ -88,6 +89,12 @@ export interface V17MarketGroupState {
   mode: number;
   /** The engine's own advancing slot counter (`header.current_slot`). */
   currentSlot: bigint;
+  /**
+   * `header.vault` — collateral the PROGRAM accounts for. #347's conservation
+   * invariant compares this against the vault token account's real SPL balance;
+   * it must never exceed it.
+   */
+  vault: bigint;
   insurance: bigint;
   cTot: bigint;
   materializedPortfolioCount: bigint;
@@ -108,6 +115,10 @@ export function readMarketGroupState(data: Uint8Array): V17MarketGroupState {
   return {
     mode: readU8(data, marketGroupFieldOff(MG_MODE_OFF)),
     currentSlot: readU64LE(data, marketGroupFieldOff(MG_CURRENT_SLOT_OFF)),
+    // #347: what the PROGRAM accounts for as collateral in the vault. The
+    // conservation invariant compares this against the vault token account's
+    // real SPL balance.
+    vault: readU128LE(data, marketGroupFieldOff(MG_VAULT_OFF)),
     insurance: readU128LE(data, marketGroupFieldOff(MG_INSURANCE_OFF)),
     cTot: readU128LE(data, marketGroupFieldOff(MG_C_TOT_OFF)),
     materializedPortfolioCount: readU64LE(
