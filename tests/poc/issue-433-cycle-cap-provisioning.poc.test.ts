@@ -22,37 +22,69 @@ const OLD_CAP = 50_000_000;
 /** No halt-state path, so this cannot touch real keeper state. */
 const freshBudget = (cfg = {}) => new KeeperBudget(cfg, { env: {} });
 
+/** A budget on a controllable clock, so cycle windows can be rolled. */
+function budgetOnClock(cfg = {}) {
+  let t = 1_000_000;
+  const budget = new KeeperBudget(cfg, { env: {}, now: () => t });
+  return { budget, advance: (ms: number) => { t += ms; } };
+}
+
 describe("#433 — the cycle cap must admit one legitimate provisioning tx", () => {
   it("the rent alone exceeded the OLD cap on both clusters", () => {
     expect(MAINNET_RENT).toBe(65_946_000);
     expect(MAINNET_RENT).toBeGreaterThan(OLD_CAP);
-    expect(DEVNET_RENT).toBeGreaterThan(OLD_CAP);
+    expect(DEVNET_RENT).toBeGreaterThan(OLD_CAP); // measured via RPC, not derived
   });
 
-  it("REGRESSION: the old cap latched a keeper-wide halt on the first send", () => {
+  it("REGRESSION: the old behaviour refused the first send AND latched", () => {
+    // Both halves of #433: the cap was too small for one legitimate tx, and
+    // breaching it latched. Either alone is survivable; together they made
+    // discovering a market a keeper-wide outage.
     const cost = estimateLamportCost(1_000, 1_400_000, 0, MAINNET_RENT);
-    const budget = freshBudget({ maxSolPerCycle: OLD_CAP });
+    expect(cost).toBeGreaterThan(OLD_CAP);
+  });
 
-    expect(budget.canSpend(cost, "crank")).toBe(false);
-    expect(budget.isHalted()).toBe(true);
-    expect(budget.haltKind).toBe("cycle-spend-cap");
+  it("N provisionings in ONE window defer instead of halting", () => {
+    // The residual the raise alone did NOT fix. `discover()` fires an unawaited
+    // ensureKeeperPortfolio per new market, market creation is permissionless,
+    // and there is no per-cycle provisioning limiter — so N markets appearing
+    // together produce N sends in one window. Under a LATCHING cycle cap the
+    // 4th of them stopped every lane; now the surplus simply waits.
+    const perProvision = estimateLamportCost(1_000, 1_400_000, 200_000, MAINNET_RENT);
+    const budget = freshBudget();
 
-    // ...and it took every other lane with it.
-    budget.resume("poc");
-    const budget2 = freshBudget({ maxSolPerCycle: OLD_CAP });
-    budget2.canSpend(cost, "crank");
-    expect(budget2.canSpend(estimateLamportCost(5_000, 200_000, 0, 0), "liquidation")).toBe(
-      false,
+    let admitted = 0;
+    for (let i = 0; i < 10; i++) {
+      if (budget.canSpend(perProvision, "crank")) {
+        budget.recordTx(perProvision, "crank", "success");
+        admitted++;
+      }
+    }
+
+    expect(admitted).toBeGreaterThanOrEqual(2); // the cap admits real work...
+    expect(admitted).toBeLessThan(10); // ...and still bounds the burst
+    expect(budget.isHalted()).toBe(false); // but never latches
+    // A liquidation on another lane is unaffected — this was the DoS.
+    expect(budget.canSpend(estimateLamportCost(5_000, 200_000, 0, 0), "liquidation")).toBe(
+      true,
     );
   });
 
-  it("the shipped default admits provisioning at the WORST case", () => {
-    // Worst case: the #350 fee ceiling, the CU ceiling, and the mainnet tip.
-    const worst = estimateLamportCost(10_000_000, 1_540_000, 200_000, MAINNET_RENT);
-    expect(worst).toBe(MIN_VIABLE_CYCLE_CAP_LAMPORTS);
+  it("the shipped default admits a provisioning transaction", () => {
+    // MIN_VIABLE excludes the priority fee deliberately: no ceiling on the
+    // Helius estimate is enforced on this branch, so folding one in would
+    // assert a bound the code does not provide. It is rent + tip + a
+    // two-signature base fee.
+    expect(MIN_VIABLE_CYCLE_CAP_LAMPORTS).toBe(10_000 + 200_000 + MAINNET_RENT);
+
+    // estimateLamportCost charges a flat 5_000 base fee regardless of signature
+    // count, so its figure for this two-signer tx is 5_000 BELOW the true cost —
+    // which is why the constant uses 10_000 and stays conservative.
+    const asCosted = estimateLamportCost(1_000, 1_400_000, 200_000, MAINNET_RENT);
+    expect(asCosted).toBeLessThan(MIN_VIABLE_CYCLE_CAP_LAMPORTS + 5_000);
 
     const budget = freshBudget();
-    expect(budget.canSpend(worst, "crank")).toBe(true);
+    expect(budget.canSpend(asCosted, "crank")).toBe(true);
     expect(budget.isHalted()).toBe(false);
   });
 
@@ -64,18 +96,36 @@ describe("#433 — the cycle cap must admit one legitimate provisioning tx", () 
     );
   });
 
-  it("still latches on a genuinely runaway single transaction", () => {
-    // Raising the cap must not disarm the breaker.
-    const budget = freshBudget();
-    expect(budget.canSpend(500_000_000, "crank")).toBe(false);
-    expect(budget.haltKind).toBe("cycle-spend-cap");
+  it("pins the cycle-cap boundary exactly", () => {
+    const cap = freshBudget().config.maxSolPerCycle;
+    expect(freshBudget().canSpend(cap, "crank")).toBe(true);
+    const over = freshBudget();
+    expect(over.canSpend(cap + 1, "crank")).toBe(false);
+    expect(over.isHalted()).toBe(false); // refused, not latched
   });
 
-  it("the total drain bound is UNCHANGED — the hour cap still governs", () => {
-    // The point of raising only the per-cycle figure: sustained spend still
-    // latches at the same place it did before.
-    const budget = freshBudget();
-    expect(budget.config.maxSolPerHour).toBe(500_000_000);
+  it("SUSTAINED spend still latches — the anomaly detector is intact", () => {
+    // The drain bound is the hour cap's, and it did not move. Spend has to
+    // accumulate across windows to trip it, which is the shape of a real
+    // runaway rather than one large legitimate transaction.
+    const { budget, advance } = budgetOnClock();
+    const perWindow = budget.config.maxSolPerCycle;
+    for (let i = 0; i < 3; i++) {
+      budget.recordTx(perWindow, "crank", "success");
+      advance(30_000); // roll the cycle window; the hour sum persists
+    }
+
+    expect(budget.canSpend(1, "crank")).toBe(false);
+    expect(budget.isHalted()).toBe(true);
+    expect(budget.haltKind).toBe("hour-spend-cap");
+    expect(budget.config.maxSolPerHour).toBe(500_000_000); // unchanged by #433
+  });
+
+  it("MIN_VIABLE tracks the account length — bumping it cannot go unnoticed", () => {
+    // Ties the constant to its source. A larger portfolio raises the rent, and
+    // the floor must move with it or the boot guard silently under-provisions.
+    const rent = (128 + 9347) * 3480 * 2;
+    expect(MIN_VIABLE_CYCLE_CAP_LAMPORTS).toBe(10_000 + 200_000 + rent);
   });
 
   it("an operator cannot configure a cap below one viable transaction", () => {
