@@ -5,6 +5,10 @@ import {
   resolveMinLiquidationNotional,
 } from "./services/liquidation.js";
 import { MIN_VIABLE_CYCLE_CAP_LAMPORTS } from "./lib/budget.js";
+import {
+  PRIORITY_FEE_FALLBACK_MAX,
+  PRIORITY_FEE_FALLBACK_MIN,
+} from "./lib/priority-fee.js";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
 const TEST_VALIDATOR_PORT = "8899";
@@ -193,6 +197,37 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
           `(v17 portfolio provisioning: rent + worst-case fee + Jito tip). A cap ` +
           `below that latches a keeper-wide halt the first time a new market is ` +
           `discovered, with nothing actually overspent.`,
+      );
+    }
+  }
+  // Validate the per-tier priority-fee fallbacks at boot, for the same reason
+  // as JITO_TIP_LAMPORTS above: they feed estimatedCost in keeper-send, which
+  // the KeeperBudget circuit breaker gates on. `parseBoundedIntEnv` silently
+  // reverts an out-of-range or malformed value to the default, so without this
+  // a typo is invisible until the fee RPC degrades — i.e. discovered
+  // mid-incident, which is exactly what these bounds exist to prevent.
+  // Unset/empty is fine; the read sites carry the defaults.
+  for (const name of [
+    "KEEPER_PRIORITY_FEE_FALLBACK_LIQUIDATION",
+    "KEEPER_PRIORITY_FEE_FALLBACK_ADL",
+    "KEEPER_PRIORITY_FEE_FALLBACK_CRANK",
+    "KEEPER_PRIORITY_FEE_FALLBACK_ORACLE",
+  ] as const) {
+    const raw = env[name]?.trim();
+    if (raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (
+      !Number.isInteger(value) ||
+      value < PRIORITY_FEE_FALLBACK_MIN ||
+      value > PRIORITY_FEE_FALLBACK_MAX
+    ) {
+      throw new Error(
+        `${name}='${raw.slice(0, 20)}' is invalid — expected an integer in ` +
+          `[${PRIORITY_FEE_FALLBACK_MIN}, ${PRIORITY_FEE_FALLBACK_MAX}] ` +
+          `(microLamports). Below the floor a lane would bid less than the flat ` +
+          `fallback it replaced — and a zero would disable priority fees on it ` +
+          `outright; above the ceiling would trip the latching keeper-wide spend ` +
+          `halt the first time the fee RPC degrades.`,
       );
     }
   }

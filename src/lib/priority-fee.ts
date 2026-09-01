@@ -6,7 +6,59 @@ const logger = createLogger("keeper:priority-fee");
 
 export type PriorityFeeTier = "crank" | "liquidation" | "oracle" | "adl";
 
-const FALLBACK_MICROLAMPORTS = 1_000;
+/**
+ * Per-tier fallback bids, used when the fee RPC is unreachable or malformed.
+ *
+ * The success path resolves a per-tier percentile (`DEFAULT_PERCENTILES` ->
+ * `percentileToLevel`: p75 -> `high`, p50 -> `medium`, p25 -> `low`), so a
+ * single flat fallback silently cancels the tier system at exactly the moment
+ * it matters — a degraded fee RPC during congestion, when a liquidation would
+ * otherwise be bidding p75.
+ *
+ * Two rules fix these numbers:
+ *
+ *  1. NO LANE REGRESSES. Every tier is floored at the historical flat 1_000.
+ *     `oracle` is p25 on the success path, but `budget.ts` counts it a
+ *     CRITICAL_LANE alongside liquidation and adl, so giving it the lowest bid
+ *     in the fleet on the degraded path would be strictly worse than the flat
+ *     constant it replaces. It therefore stays at 1_000 rather than dropping,
+ *     and coincides with `crank` by design.
+ *  2. THE URGENT LANES RISE. liquidation/adl bid 5x the base, restoring the
+ *     differentiation the success path guarantees.
+ *
+ * The magnitudes are a judgment call, not an API constant — Helius computes
+ * `priorityFeeLevels` dynamically per account-key set, so there is no fixed
+ * ladder to mirror. Only the ORDERING is derived from the percentile mapping.
+ *
+ * On overspend: `keeper-send` couples the broadcast fee to the value
+ * `budget.canSpend` gated on (#396). Note that the budget caps LATCH a
+ * manual-resume, keeper-wide halt (`budget.ts` `_halt("cycle-spend-cap")`)
+ * rather than refusing a single send — so the relevant safety property here is
+ * that these values stay far below the cycle cap, not that the gate is
+ * forgiving. At the 1.4M-CU ceiling, 5_000 uL costs ~12_000 lamports against a
+ * 50_000_000 default cycle cap. See #350 for the cap's own hazard.
+ */
+const DEFAULT_FALLBACK_MICROLAMPORTS: Record<PriorityFeeTier, number> = {
+  liquidation: 5_000,
+  adl: 5_000,
+  crank: 1_000,
+  oracle: 1_000,
+};
+
+/**
+ * Hard ceiling on an operator-supplied fallback override.
+ *
+ * Without a max, `parseBoundedIntEnv` admits anything up to
+ * `Number.MAX_SAFE_INTEGER`, and a fat-fingered value would sit dormant until
+ * the fee RPC degraded and then trip the LATCHING cycle-spend halt — bricking
+ * every lane, not just the one send. 1_000_000 uL is ~1.4M lamports at the
+ * 1.4M-CU ceiling: generous headroom for real congestion, ~35x below the
+ * 50_000_000 default cycle cap.
+ */
+export const PRIORITY_FEE_FALLBACK_MAX = 1_000_000;
+
+/** Floor: the historical flat fallback. No lane may bid below it. */
+export const PRIORITY_FEE_FALLBACK_MIN = 1_000;
 const DEFAULT_CACHE_MS = 5_000;
 const DEFAULT_CACHE_MAX_ENTRIES = 1_000;
 function parseBoundedIntEnv(
@@ -68,6 +120,31 @@ function accountSetHash(keys: string[]): string {
     .update([...keys].sort().join(","))
     .digest("hex")
     .slice(0, 16);
+}
+
+/**
+ * Fallback bid for `tier`, overridable per tier via
+ * `KEEPER_PRIORITY_FEE_FALLBACK_{LIQUIDATION,ADL,CRANK,ORACLE}`.
+ */
+function resolveFallback(tier: PriorityFeeTier): number {
+  const envMap: Record<PriorityFeeTier, string> = {
+    liquidation: "KEEPER_PRIORITY_FEE_FALLBACK_LIQUIDATION",
+    adl: "KEEPER_PRIORITY_FEE_FALLBACK_ADL",
+    crank: "KEEPER_PRIORITY_FEE_FALLBACK_CRANK",
+    oracle: "KEEPER_PRIORITY_FEE_FALLBACK_ORACLE",
+  };
+  // Floored at the historical flat fallback rather than at 1: `keeper-send`
+  // forwards the bid with `??`, which does not coalesce 0, so a zero override
+  // would reach `setComputeUnitPrice` and silently disable priority fees on
+  // the urgent lanes during an outage — passing the budget gate cleanly, with
+  // no metric and only one log line. Any value below the old flat constant is
+  // a regression on that lane, so the floor rejects the whole range, not just 0.
+  return parseBoundedIntEnv(
+    envMap[tier],
+    DEFAULT_FALLBACK_MICROLAMPORTS[tier],
+    PRIORITY_FEE_FALLBACK_MIN,
+    PRIORITY_FEE_FALLBACK_MAX,
+  );
 }
 
 function resolvePercentile(tier: PriorityFeeTier): number {
@@ -200,12 +277,13 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
       }
       return value;
     } catch (err) {
+      const fallback = resolveFallback(tier);
       logger.warn("Priority fee estimation failed — using fallback", {
         tier,
         error: err instanceof Error ? err.message : String(err),
-        fallback: FALLBACK_MICROLAMPORTS,
+        fallback,
       });
-      return FALLBACK_MICROLAMPORTS;
+      return fallback;
     }
   }
 }
