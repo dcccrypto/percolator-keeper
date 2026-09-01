@@ -168,13 +168,29 @@ const V17_PORTFOLIO_MARKET_OFFSET = 16;
  *            0n if there is no active nonzero leg.
  *  - assetIndex: assetIndex of that first active leg (-1 if none).
  *  - deficit: max(0, aggregateMaintenance - equity) — used only for prioritization.
+ *  - aggregateNotional: sum of every active leg's notional, on the SAME ceiling
+ *    basis as the maintenance calculation. This is the portfolio's exposure —
+ *    NOT `closeQ`, which is only the first leg. #348's dust floor must use it:
+ *    filtering on `closeQ` would let a dust leg in the lowest slot hide an
+ *    arbitrarily large position in a later slot, permanently.
+ *  - notionalComplete: false when any active leg's notional could not be
+ *    computed (#335.4, unresolvable price). The dust floor MUST NOT skip such a
+ *    portfolio — an incomplete notional understates exposure, and skipping on
+ *    it would turn a fail-closed check into a fail-open one.
  */
 export function evaluateV17PortfolioHealth(
   pf: ReturnType<typeof parsePortfolioV17>,
   marketData: Uint8Array,
   riskParams: { maintenanceMarginBps: bigint; minNonzeroMmReq: bigint },
   fallbackPrice: bigint,
-): { liquidatable: boolean; closeQ: bigint; assetIndex: number; deficit: bigint } {
+): {
+  liquidatable: boolean;
+  closeQ: bigint;
+  assetIndex: number;
+  deficit: bigint;
+  aggregateNotional: bigint;
+  notionalComplete: boolean;
+} {
   const { maintenanceMarginBps, minNonzeroMmReq } = riskParams;
 
   // #335.2 CONSERVATIVE equity: positive PnL contributes 0 (engine haircuts it
@@ -187,6 +203,9 @@ export function evaluateV17PortfolioHealth(
   let aggregateMaintenance = 0n;
   let firstActiveAssetIndex = -1;
   let candidateCloseQ = 0n;
+  // #348: portfolio-wide exposure, accumulated on the same basis as maintenance.
+  let aggregateNotional = 0n;
+  let notionalComplete = true;
   for (const leg of pf.legs) {
     if (!leg.active) continue;
     if (leg.basisPosQ === 0n) continue;
@@ -210,12 +229,16 @@ export function evaluateV17PortfolioHealth(
         closeQ: absPos,
         assetIndex: leg.assetIndex,
         deficit: aggregateMaintenance > equity ? aggregateMaintenance - equity : 0n,
+        // This leg's notional is unknowable, so the total understates exposure.
+        aggregateNotional,
+        notionalComplete: false,
       };
     }
 
     // Ceiling division to match on-chain risk_notional_ceil (POS_SCALE = 1e6).
     const notional = (absPos * legPrice + PRICE_E6_DIVISOR - 1n) / PRICE_E6_DIVISOR;
     if (notional === 0n) continue;
+    aggregateNotional += notional;
     // Base per-leg maintenance, clamped up to the minNonzeroMmReq floor.
     const legMaintenance = notional * maintenanceMarginBps / BPS_MULTIPLIER;
     let legMaintenanceClamped = legMaintenance < minNonzeroMmReq ? minNonzeroMmReq : legMaintenance;
@@ -233,14 +256,28 @@ export function evaluateV17PortfolioHealth(
   }
 
   if (firstActiveAssetIndex < 0) {
-    return { liquidatable: false, closeQ: 0n, assetIndex: -1, deficit: 0n };
+    return {
+      liquidatable: false,
+      closeQ: 0n,
+      assetIndex: -1,
+      deficit: 0n,
+      aggregateNotional: 0n,
+      notionalComplete: true,
+    };
   }
 
   // H-8 defense-in-depth: equity<=0n is unconditionally bankrupt.
   // #330: check AGGREGATE maintenance, not per-leg.
   const liquidatable = equity <= 0n || equity < aggregateMaintenance;
   const deficit = aggregateMaintenance > equity ? aggregateMaintenance - equity : 0n;
-  return { liquidatable, closeQ: candidateCloseQ, assetIndex: firstActiveAssetIndex, deficit };
+  return {
+    liquidatable,
+    closeQ: candidateCloseQ,
+    assetIndex: firstActiveAssetIndex,
+    deficit,
+    aggregateNotional,
+    notionalComplete,
+  };
 }
 
 // ─── #334: bounded v17 portfolio enumeration constants ───────────────────────
@@ -388,6 +425,10 @@ async function scanV17Portfolios(
 
   // #334: collect all qualifying candidates with their deficit so we can
   // prioritize by LARGEST deficit before applying the per-market candidate cap.
+  // #348: the MIN_LIQUIDATION_NOTIONAL dust floor is applied per candidate
+  // below — see isBelowLiquidationDustFloor. Resolved once per scan so an
+  // operator change takes effect without a restart, and so tests can stub it.
+  const dustFloor = resolveMinLiquidationNotional();
   const scored: Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number; closeQ: bigint; deficit: bigint }> = [];
   for (const { pubkey, account } of window) {
     try {
@@ -421,6 +462,29 @@ async function scanV17Portfolios(
       );
       if (health.assetIndex < 0) continue; // no active nonzero legs
       if (health.liquidatable) {
+        // #348: apply the dust floor that previously existed ONLY on the legacy
+        // v12 path (scanMarket), leaving MIN_LIQUIDATION_NOTIONAL silently
+        // inert on v17 — the path that actually runs. Uses the portfolio-wide
+        // aggregate, NOT closeQ; see isBelowLiquidationDustFloor, including
+        // what enabling this actually trades away.
+        if (
+          isBelowLiquidationDustFloor(
+            health.aggregateNotional,
+            health.notionalComplete,
+            dustFloor,
+          )
+        ) {
+          // Logged, not silent: #348 is a report about a control that was
+          // silently inert, so a skip must be discoverable.
+          logger.debug("scanV17Portfolios: candidate below dust floor — skipping", {
+            market: marketKey.slice(0, 8),
+            portfolio: pubkey.toBase58().slice(0, 8),
+            aggregateNotional: health.aggregateNotional.toString(),
+            deficit: health.deficit.toString(),
+            floor: dustFloor.toString(),
+          });
+          continue;
+        }
         scored.push({
           portfolioPubkey: pubkey,
           owner: pf.owner.toBase58(),
@@ -461,12 +525,114 @@ const MAX_LIQUIDATION_DRIFT_BPS = BigInt(
   parseInt(process.env.LIQUIDATION_MAX_ORACLE_DRIFT_BPS ?? "150", 10),
 );
 
+/**
+ * Is this candidate below the configured dust floor?
+ *
+ * Extracted as a pure function because `scanV17Portfolios` is not exported and
+ * this decision is the security-relevant part of the change: skipping a
+ * candidate means leaving a position underwater.
+ *
+ * Takes the PORTFOLIO-WIDE `aggregateNotional` from `evaluateV17PortfolioHealth`,
+ * never `closeQ`. `closeQ` is only the first active leg, so filtering on it
+ * would let a dust position in the lowest leg slot hide an arbitrarily large
+ * one in a later slot — and permanently, since the dust leg persists across
+ * cycles. That is a liquidation shield, cheap to arm deliberately and also
+ * reachable by accident, because on-chain liquidation is a PARTIAL close sized
+ * to restore maintenance health and can legitimately leave a dust remainder.
+ *
+ * Returns false (do not skip) when:
+ *  - the floor is disabled (`<= 0n`), which is the default — so this is a
+ *    strict no-op for any operator who has not opted in; or
+ *  - `notionalComplete` is false. `evaluateV17PortfolioHealth`'s #335.4 branch
+ *    reports an active leg with an unresolvable price as liquidatable, treating
+ *    a verification gap as a candidate rather than risking a false "healthy".
+ *    Its aggregate then UNDERSTATES exposure, so filtering on it would turn a
+ *    fail-closed check into a fail-open one.
+ *
+ * `aggregateNotional` is summed on the same ceiling basis the maintenance
+ * requirement uses (matching the engine's `risk_notional_ceil`), so the floor
+ * compares like with like. Ceiling also biases toward liquidating: it
+ * over-states the notional and therefore skips less.
+ *
+ * KNOWN APPROXIMATION: the floor measures EXPOSURE, not what a liquidation
+ * actually recovers. The program closes only enough to restore maintenance
+ * health, so a large portfolio needing a tiny partial close still clears the
+ * floor. The error is in the safe direction (fewer skips).
+ *
+ * WHAT THIS CONTROL ACTUALLY TRADES — read before enabling it.
+ *
+ * It is NOT a "the fee does not cover the tx cost" optimisation. The keeper is
+ * never paid for a liquidation: `charge_account_fee_current_not_atomic` moves
+ * the fee from the account's capital to the INSURANCE FUND (percolator
+ * `v16.rs`, `account_capital_to_insurance`), and an account still negative on
+ * pnl pays nothing at all. Every liquidation is a pure SOL cost to the keeper
+ * wallet, dust or not — so "cost exceeds reward" is true of all of them and
+ * cannot be what distinguishes dust.
+ *
+ * The real trade is operator SOL spend against protocol bad debt, and those
+ * sit on different balance sheets. Note also that the engine deliberately
+ * permits dust liquidations: `liquidation_fee_from_raw_fee` rejects an
+ * under-floor fee only when the close is PARTIAL, exempting a full close
+ * because "dust closes must still be able to progress" — so a keeper-side
+ * floor works against an on-chain intent rather than mirroring it.
+ *
+ * Default 0 (disabled) is therefore the right default, and this function is a
+ * strict no-op until an operator opts in.
+ */
+export function isBelowLiquidationDustFloor(
+  aggregateNotional: bigint,
+  notionalComplete: boolean,
+  floor: bigint,
+): boolean {
+  if (floor <= 0n) return false;
+  if (!notionalComplete) return false;
+  if (aggregateNotional <= 0n) return false;
+  return aggregateNotional < floor;
+}
+
 // N4: Minimum notional value (in collateral token base units) below which
 // liquidation is skipped — tx cost exceeds the reward for dust positions.
 // Default 0 = no filter (preserve existing behavior). Override via env var.
-const MIN_LIQUIDATION_NOTIONAL = BigInt(
-  process.env.MIN_LIQUIDATION_NOTIONAL ?? "0"
-);
+/**
+ * Resolve the dust floor from the environment.
+ *
+ * Resolved per scan rather than captured at module load, for two reasons.
+ * A `BigInt()` on a malformed value throws at MODULE TOP LEVEL, and
+ * `src/index.ts` imports this module before `validateKeeperEnvGuards()` runs —
+ * so a typo produced a bare `SyntaxError: Cannot convert 1.5 to a BigInt` that
+ * never named the variable. And a module-load capture cannot be stubbed, which
+ * is why the control that #348 is about had no call-site test.
+ *
+ * `"1_000"` and `"1e6"` are the forms an operator naturally reaches for and
+ * both throw, so the message names the variable and shows the value.
+ */
+export function resolveMinLiquidationNotional(
+  env: NodeJS.ProcessEnv = process.env,
+): bigint {
+  const raw = env.MIN_LIQUIDATION_NOTIONAL?.trim();
+  if (!raw) return 0n;
+  let value: bigint;
+  // Digits only. BigInt() would otherwise accept "0x10" and silently reinterpret
+  // it as hex 16 — a 16x misconfiguration of a control that decides whether a
+  // liquidation is attempted.
+  try {
+    if (!/^-?\d+$/.test(raw)) throw new SyntaxError("non-decimal");
+    value = BigInt(raw);
+  } catch {
+    throw new Error(
+      `MIN_LIQUIDATION_NOTIONAL='${raw.slice(0, 20)}' is not an integer — expected ` +
+        `collateral base units (e.g. 5000000 for 5 USDC at 6dp). Digits only: ` +
+        `underscores, decimals and exponent notation are all rejected.`,
+    );
+  }
+  if (value < 0n) {
+    throw new Error(
+      `MIN_LIQUIDATION_NOTIONAL='${raw.slice(0, 20)}' is negative. Use 0 to disable ` +
+        `the dust floor; a negative value would silently disable it instead.`,
+    );
+  }
+  return value;
+}
 
 /**
  * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
@@ -970,7 +1136,8 @@ export class LiquidationService {
           const notional = absBI(account.positionSize) * price / PRICE_E6_DIVISOR;
           if (notional === 0n) continue;
           // N4: Skip dust positions where liquidation tx cost exceeds reward
-          if (MIN_LIQUIDATION_NOTIONAL > 0n && notional < MIN_LIQUIDATION_NOTIONAL) continue;
+          const v12DustFloor = resolveMinLiquidationNotional();
+          if (v12DustFloor > 0n && notional < v12DustFloor) continue;
 
           // v12.17: entryPrice is always 0n (removed from on-chain struct).
           // Use account.pnl directly — it is always populated and accurate.

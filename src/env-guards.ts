@@ -1,5 +1,6 @@
 import { loadKeypair } from "@percolatorct/shared";
 import { isMainnetNetwork, isKnownNetwork, normalizeNetwork } from "./network.js";
+import { resolveMinLiquidationNotional } from "./services/liquidation.js";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
 const TEST_VALIDATOR_PORT = "8899";
@@ -114,6 +115,12 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
       );
     }
   }
+
+  // #348: MIN_LIQUIDATION_NOTIONAL gates whether a liquidation is attempted, so
+  // a malformed value must not be discovered mid-incident. resolveMinLiquidation-
+  // Notional throws with attribution; call it here so a typo fails at boot (a
+  // clean supervisor restart) rather than on the first scan.
+  resolveMinLiquidationNotional(env);
 
   const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
