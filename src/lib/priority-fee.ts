@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { createLogger } from "@percolatorct/shared";
-import { priorityFeeMicrolamports, priorityFeeEstimateTotal } from "./metrics.js";
+import {
+  priorityFeeMicrolamports,
+  priorityFeeEstimateTotal,
+  priorityFeeClampedTotal,
+  priorityFeeRawMicrolamports,
+  priorityFeeFetchTotal,
+} from "./metrics.js";
 
 const logger = createLogger("keeper:priority-fee");
 
@@ -38,7 +44,7 @@ export type PriorityFeeTier = "crank" | "liquidation" | "oracle" | "adl";
  * forgiving. At the 1.4M-CU ceiling, 5_000 uL costs ~12_000 lamports against a
  * 50_000_000 default cycle cap. See #350 for the cap's own hazard.
  */
-const DEFAULT_FALLBACK_MICROLAMPORTS: Record<PriorityFeeTier, number> = {
+export const DEFAULT_FALLBACK_MICROLAMPORTS: Record<PriorityFeeTier, number> = {
   liquidation: 5_000,
   adl: 5_000,
   crank: 1_000,
@@ -56,6 +62,57 @@ const DEFAULT_FALLBACK_MICROLAMPORTS: Record<PriorityFeeTier, number> = {
  * 50_000_000 default cycle cap.
  */
 export const PRIORITY_FEE_FALLBACK_MAX = 1_000_000;
+
+/**
+ * Sanity ceiling on a SUCCESS-path estimate, overridable with
+ * `KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS`.
+ *
+ * `estimate()` validated `fee >= 0` but had no upper bound, so whatever the fee
+ * RPC reported flowed into `estimateLamportCost` and then into
+ * `budget.canSpend`. A single proposal costing more than `maxSolPerCycle`
+ * (default 50_000_000 lamports) calls `_halt("cycle-spend-cap")` — which
+ * LATCHES, is persisted across restart, and stops every lane until an operator
+ * hits `POST /admin/budget/resume`. Crucially that fires with `_cycleSpend === 0`:
+ * nothing was overspent, one expensive *proposal* was enough. A transient
+ * upstream spike during congestion — no attacker needed — therefore became a
+ * manual-recovery outage at exactly the moment liquidations matter most (#350).
+ *
+ * SCOPE — this bounds the FEE TERM ONLY, not the whole cost. `estimateLamportCost`
+ * is `base + ceil(uL*cu/1e6) + jitoTip + extraLamports`, and the last two are
+ * unbounded by this ceiling. In particular `extraLamports` carries the v17
+ * portfolio rent (`crank.ts` `provisionKeeperPortfolio`), which is ~60.0M
+ * lamports on its own — ABOVE the 50M cycle cap — so that path latches the
+ * breaker regardless of the fee. Do not read this ceiling as "no send can
+ * latch the breaker"; it is "no FEE ESTIMATE can latch it by itself".
+ *
+ * VALUE — 10_000_000 uL, not a tighter number, because the ceiling is
+ * percentile-blind: `resolvePercentile` accepts 0-100 from env, and an operator
+ * raising a lane to p95 during congestion promotes the request to `veryHigh`,
+ * which is documented in the millions of uL. A 2_000_000 ceiling would silently
+ * cut that deliberate response, and a liquidation that does not land is worse
+ * than a halt an operator can see. 10_000_000 sits ~2x above observed
+ * `veryHigh` samples while still costing 15.6M lamports at the 1.54M-CU
+ * ceiling — 31% of the cycle cap, well under the ~32.3M uL single-send latch
+ * threshold. `percentileToLevel` tops out at `veryHigh`, so `unsafeMax` is not
+ * reachable and is not what this defends against; absurd/malformed values are.
+ *
+ * RESIDUAL — whenever the clamp binds, every tier bids the ceiling, so tier
+ * ordering collapses on the success path (the mirror of the degraded-path
+ * collapse the sibling change fixes). At 10_000_000 that needs a genuinely
+ * extreme market, and it fails safe on cost rather than on liveness.
+ *
+ * Clamping is deliberately LOUD — a warn log plus `priorityFeeClampedTotal` —
+ * rather than a silent min(). A sustained clamp rate means the fee RPC is
+ * reporting bids the keeper is refusing to pay, which an operator needs to see.
+ *
+ * This bounds a SINGLE send, not a cycle. At the clamped 2_000_000 uL and the
+ * worst-case 1.54M CU, ~16 sends in one 30s window still reach the cycle cap —
+ * and `maxTxPerCycle` (60) does not bite first at that cost. That is intended:
+ * sustained spend at the ceiling IS the genuine overspend signal the breaker
+ * exists to latch on. What this ceiling removes is the case where ONE proposal
+ * latches it with nothing spent.
+ */
+export const PRIORITY_FEE_ESTIMATE_MAX = 10_000_000;
 
 /** Floor: the historical flat fallback. No lane may bid below it. */
 export const PRIORITY_FEE_FALLBACK_MIN = 1_000;
@@ -120,6 +177,36 @@ function accountSetHash(keys: string[]): string {
     .update([...keys].sort().join(","))
     .digest("hex")
     .slice(0, 16);
+}
+
+/**
+ * Hard bound on how far an operator may RAISE the ceiling.
+ *
+ * The single-send latch threshold is ~32.3M uL (at the 1.54M-CU ceiling with the
+ * mainnet Jito tip), so 10_000_000 is a deliberately conservative cut well below
+ * it — ~15.6M lamports, 31% of the cycle cap — not the latch point itself.
+ */
+export const PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX = 20_000_000;
+
+/**
+ * Sanity ceiling for a success-path estimate.
+ *
+ * The floor is the per-tier fallback FLOOR, not the fallback ceiling, so an
+ * operator can TIGHTEN this bound — the safety-increasing direction. Clamping
+ * is a max: a lower ceiling leaves every bid beneath it untouched and does not
+ * affect the fallback path at all (`resolveFallback` returns outside the try).
+ * The invariant that does matter — the ceiling must not sit below the largest
+ * CONFIGURED fallback, or the degraded path would bid above the healthy path's
+ * own cap — is cross-checked at boot in `env-guards.ts`, against the real
+ * configuration rather than the theoretical worst case.
+ */
+function resolveEstimateCeiling(): number {
+  return parseBoundedIntEnv(
+    "KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS",
+    PRIORITY_FEE_ESTIMATE_MAX,
+    PRIORITY_FEE_FALLBACK_MIN,
+    PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX,
+  );
 }
 
 /**
@@ -230,6 +317,7 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
       return cached.value;
     }
 
+    priorityFeeFetchTotal.inc({ tier });
     const percentile = resolvePercentile(tier);
     const level = percentileToLevel(percentile);
 
@@ -263,11 +351,29 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
         levels?.[level] ??
         data.result?.priorityFeeEstimate;
 
-      if (typeof fee !== "number" || fee < 0) {
+      // Number.isFinite, not `typeof`: NaN slips BOTH `fee < 0` and the
+      // `rawValue > ceiling` clamp below, and would reach canSpend unclamped to
+      // latch _halt("non-finite-cost"). budget.ts documents the same hazard.
+      if (typeof fee !== "number" || !Number.isFinite(fee) || fee < 0) {
         throw new Error(`Unexpected fee value from Helius: ${JSON.stringify(fee)}`);
       }
 
-      const value = Math.round(fee);
+      const rawValue = Math.round(fee);
+      const ceiling = resolveEstimateCeiling();
+      // Record what the market ACTUALLY asked, before any clamping.
+      priorityFeeRawMicrolamports.set({ tier }, rawValue);
+      let value = rawValue;
+      if (rawValue > ceiling) {
+        // Do NOT broadcast this. Left unclamped it would latch the keeper-wide
+        // spend breaker on a single send — see PRIORITY_FEE_ESTIMATE_MAX.
+        priorityFeeClampedTotal.inc({ tier });
+        logger.warn("Priority fee estimate exceeded the sanity ceiling — clamping", {
+          tier,
+          estimate: rawValue,
+          ceiling,
+        });
+        value = ceiling;
+      }
       const now = Date.now();
       this._evictStaleEntries(now);
       this._cache.set(cacheKey, { value, expiresAt: now + this._cacheMs });
