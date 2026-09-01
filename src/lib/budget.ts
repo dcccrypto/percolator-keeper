@@ -134,31 +134,47 @@ interface TxRecord {
   success: boolean;
 }
 
+/** Size of a v17 keeper portfolio account — `V17_PORTFOLIO_ACCOUNT_LEN`, crank.ts. */
+const V17_PORTFOLIO_ACCOUNT_LEN = 9347;
+
 /**
- * Rent-exemption for a v17 keeper portfolio (`V17_PORTFOLIO_ACCOUNT_LEN` = 9347),
- * on mainnet: `(128 + 9347) * 3480 * 2`. Devnet's rent params differ (60_005_175);
- * the larger figure is the one the cap must accommodate.
+ * Rent-exemption for that account on mainnet: `(128 + len) * 3480 * 2`.
+ *
+ * Derived rather than hardcoded, so growing the account length moves this with
+ * it. Devnet returns 60_005_175 — MEASURED via
+ * `getMinimumBalanceForRentExemption`, not derived; it is not a multiple of the
+ * mainnet rate, so devnet's params genuinely differ. Mainnet is the larger and
+ * is what the cap must accommodate.
  */
-const V17_PORTFOLIO_RENT_LAMPORTS = 65_946_000;
+const V17_PORTFOLIO_RENT_LAMPORTS = (128 + V17_PORTFOLIO_ACCOUNT_LEN) * 3480 * 2;
 
 /**
  * Cost of the single most expensive LEGITIMATE transaction the keeper issues:
- * provisioning a v17 keeper portfolio, at the worst-case fee and CU.
+ * provisioning a v17 keeper portfolio.
  *
- *   base fee                                        5_000
- *   priority fee at the ceiling (10M uL x 1.54M CU) 15_400_000
- *   Jito tip (mainnet default)                      200_000
- *   portfolio rent                                  65_946_000
- *                                                   ----------
- *                                                   81_551_000
+ *   base fee, TWO signers (keeper + the new portfolio keypair)  10_000
+ *   Jito tip (mainnet default, USE_HELIUS_SENDER=true)         200_000
+ *   portfolio rent                                          65_946_000
+ *                                                           ----------
+ *                                                           66_156_000
  *
- * `maxSolPerCycle` MUST exceed this. A cap smaller than one unavoidable
+ * Deliberately EXCLUDES the priority fee. No enforced ceiling on the Helius
+ * estimate exists on this branch, so any figure folded in here would be an
+ * assumption rather than a bound — and a constant asserting a bound the code
+ * does not provide is worse than one that admits its scope. #432 adds that
+ * ceiling; this can absorb it when that lands.
+ *
+ * NOTE `estimateLamportCost` charges a flat 5_000 base fee regardless of
+ * signature count, so it UNDER-counts this transaction by 5_000. Pre-existing
+ * and not corrected here; this constant uses the true 10_000 so the floor stays
+ * conservative.
+ *
+ * `maxSolPerCycle` must exceed this. A cap smaller than one unavoidable
  * transaction cannot distinguish "provisioning a market" from "draining the
- * wallet", and picks the most disruptive response to the former: `canSpend`
- * latches a keeper-wide, manual-resume halt on the FIRST send of the cycle with
- * `_cycleSpend == 0` — nothing overspent. See #433.
+ * wallet". See #433.
  */
-export const MIN_VIABLE_CYCLE_CAP_LAMPORTS = 81_551_000;
+export const MIN_VIABLE_CYCLE_CAP_LAMPORTS =
+  10_000 + 200_000 + V17_PORTFOLIO_RENT_LAMPORTS;
 
 const DEFAULTS: KeeperBudgetConfig = {
   // #433: 200_000_000, not 50_000_000. The old value was BELOW the cost of
@@ -371,15 +387,30 @@ export class KeeperBudget {
     this._pruneOld(nowMs);
 
     // ── Settled-spend breaches HALT (latching, manual-resume) ──────────────
-    // These mirror the historical behavior exactly: if the ALREADY-BOOKED spend
-    // plus this one cost would breach a cap, that is a real overspend signal and
-    // the breaker latches. Reservations are intentionally excluded here so the
-    // halt semantics (and the existing cap tests) are unchanged.
+    // If the ALREADY-BOOKED spend plus this one cost would breach an HOUR or
+    // DAY cap, that is a real overspend signal and the breaker latches.
+    // Reservations are intentionally excluded here.
+    //
+    // #433: the per-CYCLE spend cap is no longer in this group — see below. It
+    // is a burst limiter over a 30s window that resets itself, and latching it
+    // was a permissionless cross-market DoS.
+    // #433: the per-cycle SPEND cap refuses without latching, exactly like the
+    // per-cycle COUNT cap after #333, and for the identical reason.
+    //
+    // This cap is documented as "a burst limiter scoped to this rolling window"
+    // whose counters reset automatically — not an anomaly detector. Market
+    // creation is permissionless, and `discover()` fires an unawaited
+    // `ensureKeeperPortfolio` per new market, so N markets appearing together
+    // produce N provisioning sends in one window, each carrying ~66M lamports
+    // of rent. Latching here let anyone stop ALL cranks and liquidations
+    // cross-market by creating a handful of markets — the same DoS #333
+    // removed from the count cap, left on the spend cap.
+    //
+    // Refusing defers the surplus sends to the next window, which
+    // `_rollCycleIfElapsed` opens with no operator action. The hour and day
+    // caps below still LATCH: they are the anomaly detectors, and the total
+    // drain bound is theirs, unchanged.
     if (this._cycleSpend + lamports > this.config.maxSolPerCycle) {
-      this._halt(
-        "cycle-spend-cap",
-        `proposed cycle spend ${this._cycleSpend + lamports} > cap ${this.config.maxSolPerCycle} (txType=${txType})`,
-      );
       return false;
     }
     if (this._hourSpendSum + lamports > this.config.maxSolPerHour) {

@@ -17,6 +17,24 @@ function makeClock(start = 1_700_000_000_000) {
   };
 }
 
+/**
+ * #433: the per-cycle SPEND cap is soft, so a single oversized tx is refused
+ * before hour/day are ever consulted. To exercise a LATCHING spend cap, spend
+ * has to ACCUMULATE across rolled windows — which is the real anomaly shape the
+ * hour cap exists to catch.
+ */
+function accumulateHourSpend(
+  b: KeeperBudget,
+  clock: { advance: (ms: number) => void },
+  perWindow: number,
+  windows: number,
+): void {
+  for (let i = 0; i < windows; i++) {
+    b.recordTx(perWindow, "crank", "success");
+    clock.advance(30_000);
+  }
+}
+
 const TIGHT_CONFIG = {
   maxSolPerCycle: 1_000,
   maxSolPerHour: 5_000,
@@ -94,23 +112,38 @@ describe("KeeperBudget — defaults", () => {
 });
 
 describe("KeeperBudget — cycle spend cap", () => {
-  it("permits spending up to the cycle cap", () => {
+  it("permits spending up to the cycle cap, then REFUSES without latching", () => {
     const clock = makeClock();
     const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
     expect(b.canSpend(500, "crank")).toBe(true);
     b.recordTx(500, "crank", "success");
     expect(b.canSpend(500, "crank")).toBe(true);
     b.recordTx(500, "crank", "success");
-    // 1000/1000 spent — next 1 lamport must trip
+    // 1000/1000 spent — the next lamport is refused...
     expect(b.canSpend(1, "crank")).toBe(false);
-    expect(b.isHalted()).toBe(true);
-    expect(b.haltKind).toBe("cycle-spend-cap");
+    // #433: ...but NOT latched. This cap is a burst limiter over a rolling
+    // window, and market creation is permissionless: latching here let anyone
+    // stop all cranks and liquidations cross-market by creating a few markets.
+    expect(b.isHalted()).toBe(false);
+    expect(b.haltKind).toBeUndefined();
+  });
+
+  it("#433: the soft cycle-spend refusal auto-clears next window", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    b.recordTx(1_000, "crank", "success");
+    expect(b.canSpend(1, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(false);
+
+    clock.advance(30_000); // window rolls → _cycleSpend zeroed
+    expect(b.canSpend(1, "crank")).toBe(true); // no operator action needed
   });
 
   it("beginCycle resets cycleSpend but does not clear halt", () => {
     const clock = makeClock();
     const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
-    b.recordTx(1_500, "crank", "success");
+    // #433: drive the HOUR cap — the cycle cap no longer latches.
+    accumulateHourSpend(b, clock, 1_000, 6);
     expect(b.canSpend(1, "crank")).toBe(false);
     expect(b.isHalted()).toBe(true);
     b.beginCycle();
@@ -228,13 +261,26 @@ describe("KeeperBudget — per-cycle window auto-reset", () => {
     expect(b.haltKind).toBeUndefined();
   });
 
-  it("#333: a genuine SPEND-cap burst still latches (brake intact for real anomalies)", () => {
+  it("#333/#433: a genuine SUSTAINED spend breach still latches (brake intact)", () => {
     const clock = makeClock();
-    // maxSolPerCycle = 1_000; one big spend breaches it → real overspend → latch.
     const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
-    expect(b.canSpend(2_000, "crank")).toBe(false);
+
+    // #433 moved the latch off the per-cycle cap, which is a burst limiter over
+    // a self-resetting window. The anomaly detector is the HOUR cap, and it is
+    // still latching: sustained spend across windows is a real overspend
+    // signal in a way that one oversized transaction is not.
+    accumulateHourSpend(b, clock, 1_000, 6); // 6_000 > maxSolPerHour 5_000
+    expect(b.canSpend(1, "crank")).toBe(false);
     expect(b.isHalted()).toBe(true);
-    expect(b.haltKind).toBe("cycle-spend-cap");
+    expect(b.haltKind).toBe("hour-spend-cap");
+  });
+
+  it("#433: one oversized transaction does NOT latch — that was the DoS", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    expect(b.canSpend(2_000, "crank")).toBe(false); // refused
+    expect(b.isHalted()).toBe(false); // but the keeper keeps working
+    expect(b.canSpend(500, "crank")).toBe(true); // other lanes unaffected
   });
 
   it("#333: count-cap soft refusal auto-clears next window (no resume needed)", () => {
@@ -250,11 +296,17 @@ describe("KeeperBudget — per-cycle window auto-reset", () => {
   it("window roll does NOT clear a latched SPEND halt — resume() is still required", () => {
     const clock = makeClock();
     const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
-    expect(b.canSpend(2_000, "crank")).toBe(false); // spend-cap breach → latch
+    accumulateHourSpend(b, clock, 1_000, 6); // hour-cap breach → latch
+    expect(b.canSpend(1, "crank")).toBe(false);
     expect(b.isHalted()).toBe(true);
-    clock.advance(120_000); // several windows elapse
+    clock.advance(120_000); // several CYCLE windows elapse
     expect(b.isHalted()).toBe(true); // a real breach stays halted until a human resumes
     expect(b.canSpend(1, "crank")).toBe(false);
+    // Age the hour window out too, so the only thing still blocking is the
+    // latch itself — otherwise resume() is immediately re-tripped by the same
+    // accumulated spend and this would assert nothing about resume().
+    clock.advance(3_600_000);
+    expect(b.isHalted()).toBe(true); // time alone does NOT clear a latch
     b.resume("op");
     expect(b.canSpend(1, "crank")).toBe(true);
   });
@@ -386,10 +438,11 @@ describe("KeeperBudget — resume() semantics", () => {
   it("resume clears halt state and lets canSpend return true again", () => {
     const clock = makeClock();
     const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
-    b.recordTx(2_000, "crank", "success");
+    accumulateHourSpend(b, clock, 1_000, 6);
     expect(b.canSpend(1, "crank")).toBe(false);
     expect(b.isHalted()).toBe(true);
 
+    clock.advance(3_600_000); // age the hour window out; the latch must remain
     b.beginCycle();
     b.resume("operator-alice");
 
@@ -423,17 +476,17 @@ describe("KeeperBudget — onHalt hook", () => {
     const clock = makeClock();
     const onHalt = vi.fn();
     const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onHalt });
-    b.recordTx(2_000, "crank", "success");
+    accumulateHourSpend(b, clock, 1_000, 6);
     b.canSpend(1, "crank");
     expect(onHalt).toHaveBeenCalledTimes(1);
-    expect(onHalt).toHaveBeenCalledWith("cycle-spend-cap", expect.any(String));
+    expect(onHalt).toHaveBeenCalledWith("hour-spend-cap", expect.any(String));
   });
 
   it("does not double-fire on subsequent canSpend calls", () => {
     const clock = makeClock();
     const onHalt = vi.fn();
     const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onHalt });
-    b.recordTx(2_000, "crank", "success");
+    accumulateHourSpend(b, clock, 1_000, 6);
     b.canSpend(1, "crank");
     b.canSpend(1, "crank");
     b.canSpend(1, "crank");
@@ -446,7 +499,7 @@ describe("KeeperBudget — onHalt hook", () => {
       throw new Error("metric backend down");
     });
     const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onHalt });
-    b.recordTx(2_000, "crank", "success");
+    accumulateHourSpend(b, clock, 1_000, 6);
     expect(() => b.canSpend(1, "crank")).not.toThrow();
     expect(b.isHalted()).toBe(true);
   });
@@ -532,15 +585,21 @@ describe("KeeperBudget — reservation / TOCTOU", () => {
     expect(b.isHalted()).toBe(false);
   });
 
-  it("a settled-spend breach still HALTS (unchanged semantics)", () => {
-    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+  it("a settled-spend breach still HALTS — at the HOUR cap (#433)", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+    // A settled breach of the per-CYCLE cap is now back-pressure, not an
+    // anomaly: the window resets itself and market creation is permissionless.
     expect(b.canSpend(600, "crank")).toBe(true);
-    b.recordTx(600, "crank", "success"); // settled cycleSpend = 600, reservation released
-    // Next send's settled spend alone (600 + 600 = 1200) breaches the 1000 cap →
-    // this is a real overspend signal, so it HALTS (not mere back-pressure).
+    b.recordTx(600, "crank", "success");
     expect(b.canSpend(600, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(false);
+
+    // A settled breach of the HOUR cap is still a real overspend signal.
+    accumulateHourSpend(b, clock, 1_000, 6);
+    expect(b.canSpend(1, "crank")).toBe(false);
     expect(b.isHalted()).toBe(true);
-    expect(b.haltKind).toBe("cycle-spend-cap");
+    expect(b.haltKind).toBe("hour-spend-cap");
   });
 
   it("reservation released on success: cycleSpend equals recorded amount, budget re-admits", () => {
