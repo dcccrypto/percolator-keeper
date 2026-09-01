@@ -36,7 +36,12 @@ describe("KeeperBudget — defaults", () => {
   it("starts with sane defaults when constructed with no config", () => {
     const b = new KeeperBudget({}, { env: {} });
     const stats = b.getStats();
-    expect(stats.config.maxSolPerCycle).toBe(50_000_000);
+    // #433: raised from 50_000_000, which was below the cost of provisioning a
+    // single v17 portfolio (rent 65_946_000) and so latched a keeper-wide halt
+    // on the first send of a cycle with nothing overspent.
+    expect(stats.config.maxSolPerCycle).toBe(200_000_000);
+    // Unchanged — the hour cap is what bounds sustained spend, so the drain
+    // bound did not move.
     expect(stats.config.maxSolPerHour).toBe(500_000_000);
     expect(stats.config.maxSolPerDay).toBe(3_000_000_000);
     expect(stats.config.maxTxPerCycle).toBe(60);
@@ -81,7 +86,7 @@ describe("KeeperBudget — defaults", () => {
         },
       },
     );
-    expect(b.config.maxSolPerCycle).toBe(50_000_000);
+    expect(b.config.maxSolPerCycle).toBe(200_000_000);
     expect(b.config.maxSolPerHour).toBe(500_000_000);
     expect(b.config.maxSolPerDay).toBe(3_000_000_000);
     expect(b.config.txSuccessRateThreshold).toBe(0.7);

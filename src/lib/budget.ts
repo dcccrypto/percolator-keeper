@@ -134,8 +134,42 @@ interface TxRecord {
   success: boolean;
 }
 
+/**
+ * Rent-exemption for a v17 keeper portfolio (`V17_PORTFOLIO_ACCOUNT_LEN` = 9347),
+ * on mainnet: `(128 + 9347) * 3480 * 2`. Devnet's rent params differ (60_005_175);
+ * the larger figure is the one the cap must accommodate.
+ */
+const V17_PORTFOLIO_RENT_LAMPORTS = 65_946_000;
+
+/**
+ * Cost of the single most expensive LEGITIMATE transaction the keeper issues:
+ * provisioning a v17 keeper portfolio, at the worst-case fee and CU.
+ *
+ *   base fee                                        5_000
+ *   priority fee at the ceiling (10M uL x 1.54M CU) 15_400_000
+ *   Jito tip (mainnet default)                      200_000
+ *   portfolio rent                                  65_946_000
+ *                                                   ----------
+ *                                                   81_551_000
+ *
+ * `maxSolPerCycle` MUST exceed this. A cap smaller than one unavoidable
+ * transaction cannot distinguish "provisioning a market" from "draining the
+ * wallet", and picks the most disruptive response to the former: `canSpend`
+ * latches a keeper-wide, manual-resume halt on the FIRST send of the cycle with
+ * `_cycleSpend == 0` — nothing overspent. See #433.
+ */
+export const MIN_VIABLE_CYCLE_CAP_LAMPORTS = 81_551_000;
+
 const DEFAULTS: KeeperBudgetConfig = {
-  maxSolPerCycle: 50_000_000,
+  // #433: 200_000_000, not 50_000_000. The old value was BELOW the cost of
+  // provisioning a single v17 portfolio, so discovering any new market latched
+  // the breaker with no attacker, no congestion and no fee spike.
+  //
+  // This does NOT loosen the drain bound. The hour cap (500_000_000) is
+  // unchanged and is what actually governs sustained spend: a runaway still
+  // latches after ~0.5 SOL exactly as before. Raising the per-cycle figure only
+  // stops a single legitimate transaction from being mistaken for a runaway.
+  maxSolPerCycle: 200_000_000,
   maxSolPerHour: 500_000_000,
   maxSolPerDay: 3_000_000_000,
   maxTxPerCycle: 60,
