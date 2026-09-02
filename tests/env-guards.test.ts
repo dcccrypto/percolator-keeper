@@ -39,7 +39,9 @@ describe("validateKeeperEnvGuards", () => {
 
   it("throws when SOLANA_RPC_URL uses http://", () => {
     const env = {
-      SOLANA_RPC_URL: "http://api.mainnet-beta.solana.com",
+      // #418: devnet host, so this exercises the SCHEME rule in isolation
+      // rather than passing for whichever guard happens to fire first.
+      SOLANA_RPC_URL: "http://api.devnet.solana.com",
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).toThrow("must use https://");
@@ -47,7 +49,8 @@ describe("validateKeeperEnvGuards", () => {
 
   it("throws when SOLANA_RPC_WS_URL uses ws://", () => {
     const env = {
-      SOLANA_RPC_WS_URL: "ws://api.mainnet-beta.solana.com",
+      // #418: devnet host — see above.
+      SOLANA_RPC_WS_URL: "ws://api.devnet.solana.com",
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).toThrow("must use wss://");
@@ -98,9 +101,12 @@ describe("validateKeeperEnvGuards", () => {
   });
 
   it("does not throw for https:// and wss:// URLs", () => {
+    // #418: devnet hosts, because NETWORK is unset here (=> non-mainnet) and a
+    // mainnet host is now refused. What this test is actually for — a
+    // well-formed https/wss pair is accepted — is unchanged.
     const env = {
-      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
-      SOLANA_RPC_WS_URL: "wss://api.mainnet-beta.solana.com",
+      SOLANA_RPC_URL: "https://api.devnet.solana.com",
+      SOLANA_RPC_WS_URL: "wss://api.devnet.solana.com",
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
