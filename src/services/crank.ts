@@ -856,6 +856,38 @@ export function isV17DiscoveredMarket(market: DiscoveredMarket): boolean {
   return header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1;
 }
 
+/**
+ * Which markets the fee-crank pass runs over.
+ *
+ * #404: every tracked market EXCEPT those flagged `permanentlySkipped`, which
+ * means the account is not initialized on-chain (error 0x4) — there is no
+ * market there to recover.
+ *
+ * Deliberately NOT filtered by this cycle's crank outcome. Tag 89
+ * (ExpireBackingBucket) takes one account, no signer and moves no tokens, and
+ * is documented as running unconditionally every cycle; the markets that get
+ * dropped from `toCrank` (foreign admin oracle, unprovisioned portfolio, stale
+ * pause, repeated failures) are the ones most likely to have a stuck backing
+ * domain, so excluding them inverted the control.
+ *
+ * Also deliberately NOT filtered to v17 here: `buildSnapshot` returns null for
+ * anything that is not a parseable v17 market group, so the pass filters by
+ * what the bytes actually are rather than by what the caller believes.
+ *
+ * Exported for tests — `crankAll` has no harness, and the selection is the
+ * security-relevant half of this change.
+ */
+export function selectFeeCrankMarkets(
+  states: Iterable<Pick<MarketCrankState, "market" | "permanentlySkipped">>,
+): { address: PublicKey; programId: PublicKey }[] {
+  const out: { address: PublicKey; programId: PublicKey }[] = [];
+  for (const state of states) {
+    if (state.permanentlySkipped) continue;
+    out.push({ address: state.market.slabAddress, programId: state.market.programId });
+  }
+  return out;
+}
+
 export class CrankService {
   private markets = new Map<string, MarketCrankState>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -1957,16 +1989,27 @@ export class CrankService {
     // every rejection — including genuine faults — as "no fees to crank".
     // runFeeCrankPass reads each market once and only sends where there is
     // pending work. OFF unless KEEPER_FEE_CRANK_ENABLED=true.
-    if (succeededSlabs.size > 0 && this._isRunning && isFeeCrankEnabled()) {
-      const feeCrankMarkets: { address: PublicKey; programId: PublicKey }[] = [];
-      for (const slabAddress of succeededSlabs) {
-        const state = this.markets.get(slabAddress);
-        if (!state) continue;
-        feeCrankMarkets.push({
-          address: state.market.slabAddress,
-          programId: state.market.programId,
-        });
-      }
+    // #404: the fee-crank pass is fed from EVERY tracked market, not from this
+    // cycle's `succeededSlabs`.
+    //
+    // Tag 89 (ExpireBackingBucket) takes one account, no signer, and moves no
+    // tokens; this module documents it as LIVENESS with no economic threshold,
+    // running every cycle. Gating it on per-market crank success inverted that:
+    // the markets dropped from `toCrank` — a foreign admin oracle the keeper
+    // can never crank, a not-yet-provisioned portfolio, a stale-oracle pause,
+    // or >= MAX_CONSECUTIVE_FAILURES — are exactly the ones whose backing
+    // domain is most likely stuck, and they were the ones structurally denied
+    // recovery. When `succeededSlabs` was empty the pass did not run at all.
+    //
+    // Widening is safe: `runFeeCrankPass` reads each market once and only sends
+    // where work is actually due, and `buildSnapshot` returns null for anything
+    // that is not a parseable v17 market group, so non-v17 accounts are filtered
+    // by construction rather than by the caller guessing.
+    //
+    // `permanentlySkipped` IS still excluded — that flag means the account is
+    // not initialized on-chain (error 0x4), so there is no market to recover.
+    if (this._isRunning && isFeeCrankEnabled()) {
+      const feeCrankMarkets = selectFeeCrankMarkets(this.markets.values());
       try {
         await runFeeCrankPass(getConnection(), this._keypair, feeCrankMarkets);
       } catch (err) {
