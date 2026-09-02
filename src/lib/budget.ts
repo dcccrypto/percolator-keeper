@@ -158,11 +158,14 @@ const V17_PORTFOLIO_RENT_LAMPORTS = (128 + V17_PORTFOLIO_ACCOUNT_LEN) * 3480 * 2
  *                                                           ----------
  *                                                           66_156_000
  *
- * Deliberately EXCLUDES the priority fee. No enforced ceiling on the Helius
- * estimate exists on this branch, so any figure folded in here would be an
- * assumption rather than a bound — and a constant asserting a bound the code
- * does not provide is worse than one that admits its scope. #432 adds that
- * ceiling; this can absorb it when that lands.
+ * Deliberately EXCLUDES the priority fee, and still does now that the ceiling
+ * exists (#350: PRIORITY_FEE_ESTIMATE_MAX). The reason has changed, so it is
+ * worth restating rather than deleting: this constant is the FLOOR the cap must
+ * clear, and folding a ceiling-level fee into a floor would overstate it. The
+ * composed worst case — this floor plus a fee pinned at the ceiling — is
+ * 79_951_000, comfortably under the 200_000_000 default, and is asserted in
+ * tests/poc/priority-fee-unclamped-latches-budget.poc.test.ts so the two
+ * numbers cannot drift apart silently.
  *
  * NOTE `estimateLamportCost` charges a flat 5_000 base fee regardless of
  * signature count, so it UNDER-counts this transaction by 5_000. Pre-existing
