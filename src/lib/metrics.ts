@@ -172,6 +172,21 @@ export const priorityFeeEstimateTotal = new Counter({
   registers: [registry],
 });
 
+// #347: conservation-invariant state per market. 1 = ok, 0 = VIOLATED,
+// -1 = UNCHECKED (could not be evaluated this cycle).
+//
+// -1 exists because "unevaluated" was previously indistinguishable from
+// healthy, which is what #347 was filed for. A market stuck at -1 — a vault ATA
+// that does not exist, a persistent RPC failure — leaves the only leak detector
+// dark, and without this it is visible nowhere: `ok: null` does not page and
+// does not degrade /health. Alert on `min_over_time(...) == -1` sustained.
+export const conservationInvariantState = new Gauge({
+  name: "keeper_conservation_invariant_state",
+  help: "Conservation invariant per market: 1 ok, 0 violated, -1 unchecked",
+  labelNames: ["market"] as const,
+  registers: [registry],
+});
+
 // Per-DEX-type UpdateHyperpMark instruction outcome counter.
 // Wired in crank.ts crankMarket() HYPERP branch.
 export const updateHyperpMarkTotal = new Counter({

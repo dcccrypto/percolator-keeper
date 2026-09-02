@@ -19,14 +19,17 @@ import {
   isV17Account,
   parseEngine,
   parseConfig,
+  parseWrapperConfigV17,
+  deriveCanonicalVault,
 } from "@percolatorct/sdk";
+import { readMarketGroupState, readU64LE } from "../lib/v17-fee-state.js";
 import {
   getConnection,
   createLogger,
   sendCriticalAlert,
   sendWarningAlert,
 } from "@percolatorct/shared";
-import { cycleDurationSeconds } from "../lib/metrics.js";
+import { cycleDurationSeconds, conservationInvariantState } from "../lib/metrics.js";
 import type { MarketCrankState } from "./crank-types.js";
 
 const logger = createLogger("keeper:monitor");
@@ -192,6 +195,176 @@ export class MonitorService {
     );
   }
 
+  /**
+   * #347: v17 conservation invariant — the program's accounted vault balance
+   * must never exceed the vault token account's real SPL balance.
+   *
+   * Identical in meaning to the v12 check; only the source of the accounted
+   * figure differs (`MarketGroupV16HeaderAccount.vault`, via MG_VAULT_OFF,
+   * rather than the v12 `engine.vault`).
+   *
+   * Every failure to EVALUATE reports `ok: null` with a reason — never `ok:
+   * true`, and never fabricated zeroes. That was the original defect: a
+   * dashboard showing `shortfall: "0"` reads as "checked, nothing missing".
+   *
+   * WHAT THIS ACTUALLY DETECTS. Tokens leaving the vault ATA without the wrapper
+ * debiting `header.vault` — realistically a program bug or a malicious upgrade,
+ * since the ATA authority is the `["vault", market]` PDA and delegate/close
+ * authority are rejected on every use. It does NOT detect a drain that goes
+ * THROUGH the wrapper's accounting: an attacker exploiting an inflated
+ * entitlement reduces `vault` and the balance in lockstep and this holds
+ * throughout. So it is a token-account-level leak detector, not a solvency
+ * check — green here is not assurance that the market is solvent.
+ *
+ * COVERAGE LIMIT — secondary collateral. Withdrawals may be denominated in a
+   * market's SECONDARY mint (`is_withdrawable_collateral_mint`), while the
+   * engine debits the single `header.vault`. On such a market `vault` can fall
+   * without the PRIMARY vault balance moving, so this check reads a growing
+   * surplus and would not notice a drained secondary vault. Latent today —
+   * `handle_set_collateral_mints` requires `vault == c_tot == insurance == 0`
+   * to configure a secondary, and live markets have none — but this control
+   * does not cover that case and should not be read as if it does.
+   *
+   * A surplus is deliberately `ok`: it is legitimate, e.g.
+   * `handle_swap_secondary_for_primary` moves primary tokens in without
+   * crediting `header.vault`.
+   */
+  /**
+   * Record an invariant result as UNEVALUATED.
+   *
+   * #347: the original defect was reporting a check that never ran as healthy.
+   * Every path that cannot evaluate must land here — including the outer
+   * per-market catch, because leaving the PREVIOUS cycle's result in place is
+   * the same false green with a stale `checkedAt`.
+   */
+  private _recordUnchecked(slabAddress: string, now: number, reason: string): void {
+    conservationInvariantState.set({ market: slabAddress.slice(0, 8) }, -1);
+    this._invariantResults.set(slabAddress, {
+      slabAddress,
+      ok: null,
+      vaultTokenBalance: null,
+      engineVault: null,
+      shortfall: null,
+      checkedAt: now,
+      skippedReason: `UNCHECKED — ${reason}. This is NOT a passing check.`,
+    });
+  }
+
+  private async _checkV17Conservation(
+    slabAddress: string,
+    data: Uint8Array,
+    marketPubkey: PublicKey,
+    programId: PublicKey,
+    now: number,
+    conn: ReturnType<typeof getConnection>,
+  ): Promise<void> {
+    const unchecked = (reason: string): void =>
+      this._recordUnchecked(slabAddress, now, reason);
+
+    // Derive the vault from the slab we already have. This read is only used
+    // to find the ADDRESS — the numbers compared below come from a second,
+    // single-slot read, never from here.
+    let vaultToken: PublicKey;
+    try {
+      const cfg = parseWrapperConfigV17(data);
+      [vaultToken] = deriveCanonicalVault(programId, marketPubkey, cfg.collateralMint);
+    } catch (err) {
+      unchecked(
+        `could not derive the v17 vault: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    // ATOMIC SNAPSHOT. Reading the slab and the token account separately would
+    // compare numbers from two different slots: every outflow debits
+    // `header.vault` and transfers in ONE transaction, so if a withdrawal lands
+    // between the reads the monitor sees a pre-withdrawal `vault` against a
+    // post-withdrawal balance and computes a shortfall exactly equal to the
+    // withdrawal — a spurious CRITICAL page. getMultipleAccountsInfo resolves
+    // both at a single slot context, so that skew cannot exist.
+    let accountedVault: bigint;
+    let vaultTokenBalance: bigint;
+    try {
+      const [slabInfo, vaultInfo] = await withTimeout(
+        conn.getMultipleAccountsInfo([marketPubkey, vaultToken]),
+        MONITOR_RPC_TIMEOUT_MS,
+        `getMultipleAccountsInfo(v17 ${slabAddress.slice(0, 8)})`,
+      );
+      if (!slabInfo) {
+        unchecked("market account not found in the snapshot read");
+        return;
+      }
+      if (!vaultInfo) {
+        // A market whose vault ATA does not exist yet is UNCHECKED, not healthy.
+        unchecked("vault token account does not exist");
+        return;
+      }
+      const vaultData = new Uint8Array(vaultInfo.data);
+      if (vaultData.length < 72) {
+        unchecked(`vault token account too short: ${vaultData.length} bytes`);
+        return;
+      }
+      accountedVault = readMarketGroupState(new Uint8Array(slabInfo.data)).vault;
+      // SPL token account: mint[32] owner[32] amount:u64 — amount at byte 64.
+      vaultTokenBalance = readU64LE(vaultData, 64);
+    } catch (err) {
+      // An RPC or parse failure is not evidence the vault is healthy.
+      unchecked(
+        `snapshot read failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    const ok = vaultTokenBalance >= accountedVault;
+    const shortfall = ok ? 0n : accountedVault - vaultTokenBalance;
+
+    conservationInvariantState.set({ market: slabAddress.slice(0, 8) }, ok ? 1 : 0);
+    this._invariantResults.set(slabAddress, {
+      slabAddress,
+      ok,
+      vaultTokenBalance: vaultTokenBalance.toString(),
+      engineVault: accountedVault.toString(),
+      shortfall: shortfall.toString(),
+      checkedAt: now,
+    });
+
+    if (!ok) {
+      // The result is already recorded above. Reporting must never be able to
+      // affect it: a failure to DELIVER a page is not a reason to downgrade a
+      // detected violation back to "unknown".
+      try {
+        logger.error("Conservation invariant VIOLATED (v17)", {
+          slabAddress,
+          vaultTokenBalance: vaultTokenBalance.toString(),
+          engineVault: accountedVault.toString(),
+          shortfall: shortfall.toString(),
+        });
+
+        const mState = this._getOrCreatePerMarket(slabAddress);
+        if (now - mState.lastInvariantAlert > ALERT_COOLDOWN_MS) {
+          mState.lastInvariantAlert = now;
+          await Promise.resolve(
+            sendCriticalAlert("Conservation invariant violated — v17 vault underfunded", [
+              { name: "Market", value: slabAddress.slice(0, 16) + "...", inline: false },
+              { name: "SPL Balance (actual)", value: vaultTokenBalance.toString(), inline: true },
+              {
+                name: "Accounted Vault (expected)",
+                value: accountedVault.toString(),
+                inline: true,
+              },
+              { name: "Shortfall", value: shortfall.toString(), inline: true },
+            ]),
+          ).catch(() => {});
+        }
+      } catch (err) {
+        logger.warn("Conservation invariant alert dispatch failed", {
+          slabAddress: slabAddress.slice(0, 8),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   private async _checkOneMarket(
     slabAddress: string,
     crankState: MarketCrankState,
@@ -200,6 +373,11 @@ export class MonitorService {
   ): Promise<void> {
     {
       // ── 6.1: Conservation invariant ───────────────────────────────────────
+      // Whether THIS invocation wrote an invariant result. Tracked explicitly
+      // rather than by comparing `checkedAt` to `now`: two cycles can land in
+      // the same millisecond, which would make a timestamp comparison silently
+      // skip the invalidation below.
+      let invariantRecorded = false;
       try {
         const data = await withTimeout(
           fetchSlab(conn, crankState.market.slabAddress, crankState.market.programId),
@@ -207,26 +385,29 @@ export class MonitorService {
           `fetchSlab(${slabAddress.slice(0, 8)})`,
         );
         if (isV17Account(data)) {
-          // #347: report UNCHECKED, not healthy. The legacy formula reads
-          // engine.vault, a v12 field, so it genuinely cannot run here — but
-          // "the old formula doesn't apply" is not "the vault is fine". The
-          // zeroed balances were just as misleading as ok:true: a dashboard
-          // showing shortfall "0" reads as "checked, nothing missing".
+          // #347: run the conservation invariant on v17 too.
           //
-          // A real v17 invariant (sum insurance fund + Σ portfolio capital/pnl
-          // backing vs getTokenAccountBalance) still needs building — see #347.
-          // Until then this surfaces the gap instead of masking it.
-          this._invariantResults.set(slabAddress, {
+          // The legacy path could not: `parseEngine` reads the v12 layout. But
+          // "the v12 PARSER doesn't apply" was never "v17 has no vault" — the
+          // v17 market-group header carries `vault: u128` in exactly the same
+          // role, and `MG_VAULT_OFF` already pins it. So this is the same
+          // comparison against a different offset, NOT a reconstruction of the
+          // program's accounting from portfolio sums: a hand-rolled sum would
+          // be a second implementation of the engine's books, and any drift
+          // would fire false alerts — which disables a tripwire through alert
+          // fatigue just as effectively as silence does.
+          //
+          // Anything that stops this from being EVALUATED still reports
+          // ok:null, never ok:true. An unevaluated check is not a passing one.
+          await this._checkV17Conservation(
             slabAddress,
-            ok: null,
-            vaultTokenBalance: null,
-            engineVault: null,
-            shortfall: null,
-            checkedAt: now,
-            skippedReason:
-              "UNCHECKED — v17 market account: the legacy engine.vault invariant does not apply " +
-              "and no v17 equivalent is implemented yet (#347). This is NOT a passing check.",
-          });
+            data,
+            crankState.market.slabAddress,
+            crankState.market.programId,
+            now,
+            conn,
+          );
+          invariantRecorded = true;
           this._adlStalenessResults.set(slabAddress, {
             slabAddress,
             adlNeeded: false,
@@ -269,6 +450,7 @@ export class MonitorService {
           checkedAt: now,
         };
         this._invariantResults.set(slabAddress, result);
+        invariantRecorded = true;
 
         if (!ok) {
           logger.error("Conservation invariant VIOLATED", {
@@ -346,10 +528,22 @@ export class MonitorService {
           }
         }
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         logger.warn("MonitorService check failed for market", {
           slabAddress: slabAddress.slice(0, 8),
-          error: err instanceof Error ? err.message : String(err),
+          error: message,
         });
+        // #347: invalidate rather than leaving the PREVIOUS cycle's result
+        // standing. Before v17 could evaluate to ok:true this was harmless;
+        // now a fetchSlab failure would otherwise keep a stale green on the
+        // health endpoint — the exact symptom this issue was filed for.
+        //
+        // But only if nothing was evaluated THIS invocation. A throw after the
+        // comparison (alert delivery, say) must not erase a real ok:false —
+        // that would turn a detected violation back into "unknown".
+        if (!invariantRecorded) {
+          this._recordUnchecked(slabAddress, now, `market check failed: ${message}`);
+        }
       }
     }
   }
