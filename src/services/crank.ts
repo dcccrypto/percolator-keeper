@@ -820,6 +820,24 @@ export async function processBatched<T>(
   return { succeeded, failed, skipped, errors };
 }
 
+/**
+ * Is this a v17 market group?
+ *
+ * #419: the same test `registerMarket()` and the LaserStream fast path already
+ * make inline, extracted so every caller shares one definition rather than
+ * three copies drifting apart. `_rawV17Config` is set by the v17 discovery path;
+ * the header check covers markets that arrived by another route.
+ */
+export function isV17DiscoveredMarket(market: DiscoveredMarket): boolean {
+  if (Boolean((market as DiscoveredMarket & { _rawV17Config?: unknown })._rawV17Config)) {
+    return true;
+  }
+  const header = (market as DiscoveredMarket & {
+    header?: { version?: number | bigint; kind?: number | bigint };
+  }).header;
+  return header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1;
+}
+
 export class CrankService {
   private markets = new Map<string, MarketCrankState>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -894,6 +912,28 @@ export class CrankService {
   private async ensureKeeperPortfolio(key: string, market: DiscoveredMarket): Promise<PublicKey | null> {
     try {
       const connection = getConnection();
+      // #419: provisioning is a v17 instruction — a createAccount for a
+      // 9347-byte v17 portfolio plus InitPortfolio (tag 1). registerMarket()
+      // already gates on this; the discover() paths did not, so a legacy v12
+      // market drew a fresh provisioning attempt every discovery cycle: wasted
+      // rent and fees, and a keeper-signed tag 1 that a v12 program may decode
+      // as an entirely different instruction.
+      //
+      // Gating here rather than before getConnection() is deliberate.
+      // getConnection() is a cached lookup, so the cost is nil, and
+      // crank.test.ts's provisioning tests are sensitive to how many times it
+      // is called: `discover()` takes its own connection first, and those tests
+      // queue a single `mockReturnValueOnce`, so changing the call count made a
+      // test that ALREADY fails in isolation on clean main fail in the full
+      // file too. Skipping the call would have meant silently reshaping an
+      // unrelated fragile harness to suit this change. See #300 for the
+      // function-level static state in the same area.
+      if (!isV17DiscoveredMarket(market)) {
+        logger.debug("ensureKeeperPortfolio: not a v17 market — skipping provisioning", {
+          market: key.slice(0, 8),
+        });
+        return null;
+      }
       const keypair = this._keypair;
       const portfolio = await provisionKeeperPortfolio(
         connection,
