@@ -6,14 +6,27 @@ import {
 } from "../../src/lib/boot-assertions.js";
 
 describe("assertMainnetProgramId", () => {
-  it("is a no-op when isMainnet=false (any programId)", () => {
+  it("accepts a non-mainnet programId when isMainnet=false", () => {
     expect(() =>
       assertMainnetProgramId({ isMainnet: false, programId: "anything" }),
     ).not.toThrow();
+  });
+
+  it("#418: REFUSES the mainnet programId when isMainnet=false", () => {
+    // This previously early-returned, which is the hole: a keeper the operator
+    // believes is on devnet would discover and sign against the live mainnet
+    // program with the live key and no guard firing. The program id is the
+    // definitive signal — an RPC host can be a proxy whose name says nothing.
+    expect(() =>
+      assertMainnetProgramId({ isMainnet: false, programId: MAINNET_PROGRAM_ID }),
+    ).toThrow(/canonical MAINNET program/);
+  });
+
+  it("keeps accepting a non-mainnet programId off mainnet", () => {
     expect(() =>
       assertMainnetProgramId({
         isMainnet: false,
-        programId: MAINNET_PROGRAM_ID,
+        programId: "So11111111111111111111111111111111111111112",
       }),
     ).not.toThrow();
     expect(() =>

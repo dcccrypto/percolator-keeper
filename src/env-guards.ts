@@ -53,6 +53,50 @@ function isDevnetOrTestnetHost(hostname: string): boolean {
 // for an unset FALLBACK_RPC_URL. The keeper runs ALL market discovery and
 // liquidation retry on the fallback connection, so a devnet host there means it
 // discovers zero mainnet markets and cranks nothing.
+/**
+ * #418: the mirror of `isDevnetOrTestnetHost`.
+ *
+ * Matches `mainnet` and `mainnet-beta` as whole DNS labels, so
+ * `api.mainnet-beta.solana.com` and `x.mainnet.helius-rpc.com` are caught while
+ * a host that merely contains the substring is not.
+ */
+function isMainnetHost(hostname: string): boolean {
+  const labels = hostname.toLowerCase().split(".");
+  return labels.includes("mainnet") || labels.includes("mainnet-beta");
+}
+
+/**
+ * #418: refuse a mainnet RPC host on a NON-mainnet keeper.
+ *
+ * Every host guard was one-directional — inside `if (isMainnetEnv(env))` — so a
+ * keeper with `NETWORK=devnet` (or unset) pointed at a mainnet endpoint
+ * discovered and signed against the live program with the live key and no guard
+ * firing. The realistic trigger is a stale env: copy a mainnet `.env`, flip
+ * `NETWORK`, leave the RPC url.
+ *
+ * Deliberately a HARD block with no override, matching
+ * `rejectDevnetTestnetRpcUrl`. An `ALLOW_MAINNET_RPC_ON_DEVNET`-style opt-out
+ * would live in that same copied `.env` and be copied along with everything
+ * else — it would be set in exactly the situation this exists to catch.
+ */
+function rejectMainnetRpcUrl(varName: string, raw: string | undefined): void {
+  if (!raw) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return; // malformed URLs are reported by the scheme/local guards
+  }
+  if (isMainnetHost(parsed.hostname)) {
+    throw new Error(
+      `${varName} points at mainnet host '${parsed.hostname}' but NETWORK is not mainnet — ` +
+        `refusing to boot. A non-mainnet keeper must not sign against the live program. ` +
+        `If this keeper is meant to run on mainnet, set NETWORK=mainnet explicitly so the ` +
+        `mainnet guards (local-host, devnet-host, fallback, alerting) all apply.`,
+    );
+  }
+}
+
 function rejectDevnetTestnetRpcUrl(varName: string, raw: string | undefined): void {
   if (!raw) return; // presence is enforced separately for FALLBACK_RPC_URL
   let parsed: URL;
@@ -306,5 +350,14 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
           "Set USE_HELIUS_SENDER=true (see .env.example) for mainnet.",
       );
     }
+  } else {
+    // #418: the symmetric guard. Placed as an `else` on the mainnet block, and
+    // therefore AFTER the https/wss scheme checks above, so a malformed
+    // mainnet URL still reports the scheme problem rather than being masked by
+    // a host-policy message. That ordering is deliberate and pinned by a test.
+    rejectMainnetRpcUrl("SOLANA_RPC_URL", env.SOLANA_RPC_URL?.trim());
+    rejectMainnetRpcUrl("SOLANA_RPC_WS_URL", env.SOLANA_RPC_WS_URL?.trim());
+    rejectMainnetRpcUrl("FALLBACK_RPC_URL", env.FALLBACK_RPC_URL?.trim());
+    rejectMainnetRpcUrl("RPC_URL", env.RPC_URL?.trim());
   }
 }

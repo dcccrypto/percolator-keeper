@@ -17,17 +17,36 @@ export const MAINNET_PROGRAM_ID =
   "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 
 /**
- * Refuse to boot when NETWORK=mainnet but the configured program id is not
- * the canonical mainnet program. Catches the failure mode where the keeper
- * is pointed at mainnet RPC but a devnet/test program id is still in the
- * config — which would cause real user funds to be signed against the
- * wrong program.
+ * Refuse to boot when the configured program id and NETWORK disagree, in
+ * EITHER direction.
+ *
+ * Forward: NETWORK=mainnet with a non-mainnet program id — the keeper is
+ * pointed at mainnet RPC but a devnet/test program id is still in the config,
+ * so real user funds get signed against the wrong program.
+ *
+ * Reverse (#418): NETWORK is NOT mainnet but the program id IS the canonical
+ * mainnet program. This used to early-return, so a keeper the operator believed
+ * was on devnet would discover and sign against the live mainnet program with
+ * the live key and no guard firing. It is the definitive signal — an RPC host
+ * can be a proxy or a private endpoint whose name says nothing, but the program
+ * id is unambiguous about which chain's state is being mutated.
  */
 export function assertMainnetProgramId(opts: {
   isMainnet: boolean;
   programId: string;
 }): void {
-  if (!opts.isMainnet) return;
+  if (!opts.isMainnet) {
+    if (opts.programId === MAINNET_PROGRAM_ID) {
+      throw new Error(
+        `SECURITY: PROGRAM_ID=${opts.programId} is the canonical MAINNET program ` +
+          `but NETWORK is not mainnet — refusing to boot. A keeper that believes ` +
+          `it is on devnet would otherwise sign against live mainnet state. If ` +
+          `this keeper is meant to run on mainnet, set NETWORK=mainnet so the ` +
+          `mainnet guards apply.`,
+      );
+    }
+    return;
+  }
   if (opts.programId === MAINNET_PROGRAM_ID) return;
   throw new Error(
     `SECURITY: NETWORK=mainnet but PROGRAM_ID=${opts.programId} — ` +
