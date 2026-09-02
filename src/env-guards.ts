@@ -5,6 +5,13 @@ import {
   resolveMinLiquidationNotional,
 } from "./services/liquidation.js";
 import { MIN_VIABLE_CYCLE_CAP_LAMPORTS } from "./lib/budget.js";
+import {
+  DEFAULT_FALLBACK_MICROLAMPORTS,
+  PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX,
+  PRIORITY_FEE_ESTIMATE_MAX,
+  PRIORITY_FEE_FALLBACK_MAX,
+  PRIORITY_FEE_FALLBACK_MIN,
+} from "./lib/priority-fee.js";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
 const TEST_VALIDATOR_PORT = "8899";
@@ -195,6 +202,82 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
           `discovered, with nothing actually overspent.`,
       );
     }
+  }
+  // Validate the per-tier priority-fee fallbacks at boot, for the same reason
+  // as JITO_TIP_LAMPORTS above: they feed estimatedCost in keeper-send, which
+  // the KeeperBudget circuit breaker gates on. `parseBoundedIntEnv` silently
+  // reverts an out-of-range or malformed value to the default, so without this
+  // a typo is invisible until the fee RPC degrades — i.e. discovered
+  // mid-incident, which is exactly what these bounds exist to prevent.
+  // Unset/empty is fine; the read sites carry the defaults.
+  // Effective fallback per tier: the override when set and valid, else the
+  // module default. Collected so the ceiling cross-check below can test the
+  // REAL configuration rather than the theoretical bounds.
+  const effectiveFallbacks: number[] = [];
+  for (const [tier, name] of [
+    ["liquidation", "KEEPER_PRIORITY_FEE_FALLBACK_LIQUIDATION"],
+    ["adl", "KEEPER_PRIORITY_FEE_FALLBACK_ADL"],
+    ["crank", "KEEPER_PRIORITY_FEE_FALLBACK_CRANK"],
+    ["oracle", "KEEPER_PRIORITY_FEE_FALLBACK_ORACLE"],
+  ] as const) {
+    const raw = env[name]?.trim();
+    if (raw === undefined || raw === "") {
+      effectiveFallbacks.push(DEFAULT_FALLBACK_MICROLAMPORTS[tier]);
+      continue;
+    }
+    const value = Number(raw);
+    if (
+      !Number.isInteger(value) ||
+      value < PRIORITY_FEE_FALLBACK_MIN ||
+      value > PRIORITY_FEE_FALLBACK_MAX
+    ) {
+      throw new Error(
+        `${name}='${raw.slice(0, 20)}' is invalid — expected an integer in ` +
+          `[${PRIORITY_FEE_FALLBACK_MIN}, ${PRIORITY_FEE_FALLBACK_MAX}] ` +
+          `(microLamports). Below the floor a lane would bid less than the flat ` +
+          `fallback it replaced — and a zero would disable priority fees on it ` +
+          `outright; above the ceiling would trip the latching keeper-wide spend ` +
+          `halt the first time the fee RPC degrades.`,
+      );
+    }
+    effectiveFallbacks.push(value);
+  }
+
+  // Same treatment for the success-path sanity ceiling (#350). An operator may
+  // TIGHTEN it (the safety-increasing direction), so the floor is the fallback
+  // floor, not the fallback ceiling.
+  const estimateMaxRaw = env.KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS?.trim();
+  let estimateCeiling = PRIORITY_FEE_ESTIMATE_MAX;
+  if (estimateMaxRaw !== undefined && estimateMaxRaw !== "") {
+    const value = Number(estimateMaxRaw);
+    if (
+      !Number.isInteger(value) ||
+      value < PRIORITY_FEE_FALLBACK_MIN ||
+      value > PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX
+    ) {
+      throw new Error(
+        `KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS='${estimateMaxRaw.slice(0, 20)}' ` +
+          `is invalid — expected an integer in [${PRIORITY_FEE_FALLBACK_MIN}, ` +
+          `${PRIORITY_FEE_ESTIMATE_CEILING_HARD_MAX}] (microLamports). Raising it ` +
+          `past the maximum walks back toward the single-send keeper-wide spend ` +
+          `halt this ceiling exists to close.`,
+      );
+    }
+    estimateCeiling = value;
+  }
+
+  // Cross-check the invariant that actually matters, against the REAL config
+  // rather than the theoretical bounds: the success-path ceiling must not sit
+  // below the largest configured fallback, or a degraded fee RPC would produce
+  // a HIGHER bid than a healthy one.
+  const largestFallback = Math.max(...effectiveFallbacks);
+  if (estimateCeiling < largestFallback) {
+    throw new Error(
+      `KEEPER_PRIORITY_FEE_ESTIMATE_MAX_MICROLAMPORTS=${estimateCeiling} is below the ` +
+        `largest configured per-tier fallback (${largestFallback}). The degraded ` +
+        `path would then bid MORE than the healthy path's own ceiling. Raise the ` +
+        `ceiling or lower the fallback.`,
+    );
   }
 
   const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();

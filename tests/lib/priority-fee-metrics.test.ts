@@ -117,14 +117,17 @@ describe("HeliusPriorityFeeEstimator — metric wiring", () => {
     expect(zeroEntry).toBeUndefined();
   });
 
-  it("falls back to FALLBACK_MICROLAMPORTS on fetch error — counter still increments", async () => {
+  it("falls back to the adl tier fallback on fetch error — counter still increments", async () => {
     mockFetch.mockRejectedValue(new Error("network failure"));
 
     const before = (await priorityFeeEstimateTotal.get()).values;
     const prevAdl = before.find((v) => v.labels.tier === "adl")?.value ?? 0;
 
     const fee = await estimator.estimate(["FfFfFf11111111111111111111111111111111111111"], "adl");
-    expect(fee).toBe(1_000); // FALLBACK_MICROLAMPORTS
+    // adl is an urgent tier (p75 on the success path), so it bids above the
+    // base lane instead of the flat 1_000 that used to apply to every tier.
+    // The magnitude is a judgment call; only the ordering is derived. #426 §5.1.
+    expect(fee).toBe(5_000);
 
     const after = (await priorityFeeEstimateTotal.get()).values;
     const nextAdl = after.find((v) => v.labels.tier === "adl")?.value ?? 0;
