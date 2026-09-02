@@ -4,6 +4,7 @@ import {
   resolveMaxLiquidationDriftBps,
   resolveMinLiquidationNotional,
 } from "./services/liquidation.js";
+import { MIN_VIABLE_CYCLE_CAP_LAMPORTS } from "./lib/budget.js";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
 const TEST_VALIDATOR_PORT = "8899";
@@ -172,6 +173,29 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   // liquidation is submitted at (the on-chain Liquidate carries none), and a
   // prefix-parsed value silently disabled it. Fail at boot, with attribution.
   resolveMaxLiquidationDriftBps(env);
+  // #433: a per-cycle spend cap below the cost of ONE unavoidable transaction
+  // is not a safety control, it is a scheduled outage: canSpend latches a
+  // keeper-wide, manual-resume halt on the first send of the cycle with nothing
+  // overspent. Reject it at boot rather than on the next market discovery.
+  const cycleCapRaw = env.KEEPER_MAX_SOL_PER_CYCLE?.trim();
+  if (cycleCapRaw !== undefined && cycleCapRaw !== "") {
+    const value = Number(cycleCapRaw);
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(
+        `KEEPER_MAX_SOL_PER_CYCLE='${cycleCapRaw.slice(0, 20)}' is invalid — ` +
+          `expected a positive integer (lamports).`,
+      );
+    }
+    if (value < MIN_VIABLE_CYCLE_CAP_LAMPORTS) {
+      throw new Error(
+        `KEEPER_MAX_SOL_PER_CYCLE=${value} is below ${MIN_VIABLE_CYCLE_CAP_LAMPORTS}, ` +
+          `the cost of the most expensive legitimate transaction the keeper issues ` +
+          `(v17 portfolio provisioning: rent + worst-case fee + Jito tip). A cap ` +
+          `below that latches a keeper-wide halt the first time a new market is ` +
+          `discovered, with nothing actually overspent.`,
+      );
+    }
+  }
 
   const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
