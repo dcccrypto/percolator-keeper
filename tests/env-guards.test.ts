@@ -98,12 +98,76 @@ describe("validateKeeperEnvGuards", () => {
   });
 
   it("does not throw for https:// and wss:// URLs", () => {
+    // #418: this asserts the URL SCHEME is accepted; the host is incidental. It
+    // used api.mainnet-beta.solana.com with NETWORK unset (i.e. devnet), which the
+    // new symmetric guard now rejects — so the fixture uses a devnet host to keep
+    // testing what this test is actually about.
     const env = {
-      SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
-      SOLANA_RPC_WS_URL: "wss://api.mainnet-beta.solana.com",
+      SOLANA_RPC_URL: "https://api.devnet.solana.com",
+      SOLANA_RPC_WS_URL: "wss://api.devnet.solana.com",
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  describe("#418 symmetric network guard", () => {
+    // Every RPC guard was gated on NETWORK=mainnet, so the reverse was unguarded:
+    // a devnet/unset keeper pointed at mainnet booted with nothing firing, then
+    // discovered live markets and signed against them with the crank key.
+    const MAINNET_HOSTS = [
+      "https://api.mainnet-beta.solana.com",
+      "https://mainnet.helius-rpc.com",
+    ];
+
+    it.each(MAINNET_HOSTS)("refuses %s when NETWORK is devnet", (url) => {
+      expect(() =>
+        validateKeeperEnvGuards({ NETWORK: "devnet", SOLANA_RPC_URL: url } as NodeJS.ProcessEnv),
+      ).toThrow(/points at mainnet host .* but NETWORK is not mainnet/i);
+    });
+
+    it("refuses a mainnet host when NETWORK is unset", () => {
+      expect(() =>
+        validateKeeperEnvGuards({
+          SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+        } as NodeJS.ProcessEnv),
+      ).toThrow(/#418/);
+    });
+
+    it.each(["FALLBACK_RPC_URL", "RPC_URL", "SOLANA_RPC_WS_URL"])(
+      "covers %s, not just SOLANA_RPC_URL",
+      (varName) => {
+        const url =
+          varName === "SOLANA_RPC_WS_URL"
+            ? "wss://api.mainnet-beta.solana.com"
+            : "https://api.mainnet-beta.solana.com";
+        expect(() =>
+          validateKeeperEnvGuards({ NETWORK: "devnet", [varName]: url } as NodeJS.ProcessEnv),
+        ).toThrow(new RegExp(varName));
+      },
+    );
+
+    it("does NOT false-positive on a host merely containing the text", () => {
+      // Label-anchored, mirroring isDevnetOrTestnetHost: "my-mainnet-migration"
+      // is one label, not the label "mainnet".
+      expect(() =>
+        validateKeeperEnvGuards({
+          NETWORK: "devnet",
+          SOLANA_RPC_URL: "https://my-mainnet-migration.example.com",
+        } as NodeJS.ProcessEnv),
+      ).not.toThrow();
+    });
+
+    it("still allows a mainnet host when NETWORK=mainnet", () => {
+      expect(() =>
+        validateKeeperEnvGuards({
+          NETWORK: "mainnet",
+          SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
+          FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+          USE_HELIUS_SENDER: "true",
+          DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/x",
+        } as NodeJS.ProcessEnv),
+      ).not.toThrow(/#418/);
+    });
   });
 
   it("throws when FALLBACK_RPC_URL uses http://", () => {

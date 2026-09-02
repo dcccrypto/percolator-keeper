@@ -46,6 +46,41 @@ function isDevnetOrTestnetHost(hostname: string): boolean {
   return labels.includes("devnet") || labels.includes("testnet");
 }
 
+// #418: the mirror of isDevnetOrTestnetHost. Same dot-label anchoring, so a host
+// that merely CONTAINS the text (e.g. "my-mainnet-migration.example.com", label
+// "my-mainnet-migration") is not a false positive. Catches the real forms:
+// api.mainnet-beta.solana.com, mainnet.helius-rpc.com.
+function isMainnetHost(hostname: string): boolean {
+  const labels = hostname.toLowerCase().split(".");
+  return labels.includes("mainnet") || labels.includes("mainnet-beta");
+}
+
+// #418: every RPC guard above fires ONLY when NETWORK=mainnet, so the reverse was
+// unguarded: a NETWORK=devnet (or unset) keeper pointed at a mainnet RPC signs
+// against the live program with the live key and nothing fires. Copying a mainnet
+// .env and flipping NETWORK to devnet — leaving the RPC URL — is exactly that.
+// Fail closed: a keeper that believes it is on devnet must never hold a mainnet
+// connection.
+function rejectMainnetRpcUrl(varName: string, raw: string | undefined): void {
+  if (!raw) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    // Malformed URLs are reported by rejectLocalRpcUrl (which runs first).
+    return;
+  }
+  if (isMainnetHost(parsed.hostname)) {
+    throw new Error(
+      `${varName} points at mainnet host '${parsed.hostname}' but NETWORK is not ` +
+        `mainnet — refusing to boot. A keeper that believes it is on devnet must ` +
+        `not open a mainnet connection: discovery would find live markets and the ` +
+        `crank key would sign against them with every mainnet guard inert. Set ` +
+        `NETWORK=mainnet deliberately, or point this at a devnet endpoint. (#418)`,
+    );
+  }
+}
+
 // A8: When NETWORK=mainnet, refuse any RPC URL whose host is a known
 // devnet/testnet cluster. Complements rejectLocalRpcUrl (localhost/port-8899);
 // this catches public devnet hosts that the local-host guard lets through —
@@ -306,5 +341,16 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
           "Set USE_HELIUS_SENDER=true (see .env.example) for mainnet.",
       );
     }
+  } else {
+    // #418: the symmetric direction. Every guard above is gated on
+    // isMainnetEnv, so a NETWORK=devnet (or unset) keeper pointed at a mainnet
+    // RPC previously booted with ZERO guards firing — discovery would find live
+    // mainnet markets and the crank key would sign against them. One stale env
+    // var (copy a mainnet .env, flip NETWORK to devnet, leave the RPC URL) is
+    // enough. Fail closed on the same four vars the mainnet branch covers.
+    rejectMainnetRpcUrl("SOLANA_RPC_URL", env.SOLANA_RPC_URL?.trim());
+    rejectMainnetRpcUrl("SOLANA_RPC_WS_URL", env.SOLANA_RPC_WS_URL?.trim());
+    rejectMainnetRpcUrl("FALLBACK_RPC_URL", env.FALLBACK_RPC_URL?.trim());
+    rejectMainnetRpcUrl("RPC_URL", env.RPC_URL?.trim());
   }
 }
