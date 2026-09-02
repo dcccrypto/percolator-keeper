@@ -79,6 +79,24 @@ export function __resetMainnetReaderForTests(): void {
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
 const RPC_TIMEOUT_MS = 15_000;
 
+/**
+ * #420: per-call ceiling for the discovery scans.
+ *
+ * Longer than RPC_TIMEOUT_MS because each of these fans out to ~8
+ * `getProgramAccounts` calls, but finite — the discovery budget below only
+ * means anything if every call underneath it actually terminates.
+ */
+const DISCOVER_RPC_TIMEOUT_MS = 90_000;
+
+/**
+ * #420: how long ONE program's discovery may legitimately take.
+ *
+ * The 429 retry walks DISCOVER_429_BACKOFF_MS = [3s, 9s, 27s, 81s] = 120s, x
+ * ~1.25 jitter ~= 150s, plus 3s inter-program spacing and the scans themselves.
+ * 240s per program leaves headroom without being unbounded.
+ */
+const PER_PROGRAM_DISCOVERY_BUDGET_MS = 240_000;
+
 // ─── v17 constants ───────────────────────────────────────────────────────────
 
 /**
@@ -860,6 +878,16 @@ export class CrankService {
   // doubled funding accrual + RPC storms. Cleared on natural cycle recovery
   // (the finally block) so transient slow cycles don't kill the process.
   private _watchdogArmedAt = 0;
+  /**
+   * #420: true while `discover()` is running, so the watchdog can apply the
+   * discovery budget instead of the crank-pass budget.
+   *
+   * NOT an exemption. Discovery is given a LARGER finite deadline, never an
+   * unlimited one: anchoring the deadline while discovering would turn a hung
+   * discovery into a silent permanent stall with no alert, which is strictly
+   * worse than the restart loop this fixes — at least a restart is visible.
+   */
+  private _discovering = false;
   // M8: per-market in-flight guard. `_cycling` is a process-wide flag for
   // the timer-driven crankAll cycle, but other entry points (registerMarket
   // from the /register HTTP endpoint, and potentially LaserStream debounce
@@ -1239,7 +1267,15 @@ export class CrankService {
 
       for (let attempt = 0; attempt <= CrankService.DISCOVER_429_BACKOFF_MS.length; attempt++) {
         try {
-          found = await discoverMarkets(discoveryConn, new PublicKey(id), { sequential: true, interTierDelayMs: 500 });
+          // #420: bounded. The SDK fires ~8 getProgramAccounts in parallel per
+          // program; without a timeout a connection the RPC accepts but never
+          // answers hangs this await forever, and the discovery budget below
+          // could not distinguish that from legitimate 429 backoff.
+          found = await withTimeout(
+            discoverMarkets(discoveryConn, new PublicKey(id), { sequential: true, interTierDelayMs: 500 }),
+            DISCOVER_RPC_TIMEOUT_MS,
+            `discoverMarkets(${id.slice(0, 8)})`,
+          );
           programSuccess = true;
           logger.debug("Program scan complete", { programId: id, marketCount: found.length });
           break;
@@ -1273,7 +1309,11 @@ export class CrankService {
       // The SDK's discoverMarkets() only recognizes legacy TALOCREP magic and will
       // never return v17 accounts. We run a separate memcmp-filtered query here.
       try {
-        const v17Found = await discoverV17Markets(discoveryConn, new PublicKey(id));
+        const v17Found = await withTimeout(
+          discoverV17Markets(discoveryConn, new PublicKey(id)),
+          DISCOVER_RPC_TIMEOUT_MS,
+          `discoverV17Markets(${id.slice(0, 8)})`,
+        );
         if (v17Found.length > 0) {
           logger.info("v17 market discovery found accounts", { programId: id, count: v17Found.length });
           allFound.push(...v17Found);
@@ -2150,18 +2190,34 @@ export class CrankService {
     this.timer = setInterval(async () => {
       if (this._cycling) {
         const elapsed = Date.now() - this._cycleStartedAt;
-        if (elapsed > MAX_CYCLE_MS) {
+        // #420: discovery is timed against its own budget, scaled by the number
+        // of programs it walks sequentially. The crank-pass budget
+        // (MAX_CYCLE_MS, 300s at the default interval) is smaller than
+        // discovery's own bounded 429 backoff for two or more programs
+        // (~150s each + 3s spacing), so a transient RPC rate-limit incident
+        // used to trip the watchdog and process.exit(1) into a restart loop
+        // that re-ran discovery straight back into the same 429s.
+        //
+        // The watchdog still fires if discovery genuinely hangs; it just does
+        // not mistake bounded backoff for a hang.
+        const programCount = Math.max(1, config.allProgramIds.length);
+        const budgetMs = this._discovering
+          ? Math.max(MAX_CYCLE_MS, programCount * PER_PROGRAM_DISCOVERY_BUDGET_MS)
+          : MAX_CYCLE_MS;
+        if (elapsed > budgetMs) {
           if (this._watchdogArmedAt === 0) {
             // First tick observing the hang — alert once, start grace timer.
             this._watchdogArmedAt = Date.now();
             logger.error("Crank cycle watchdog: cycle hung, grace period started before process exit", {
               elapsedMs: elapsed,
-              maxCycleMs: MAX_CYCLE_MS,
+              maxCycleMs: budgetMs,
+              phase: this._discovering ? "discovery" : "crank",
               graceMs: WATCHDOG_GRACE_MS,
             });
             sendCriticalAlert("Crank cycle hung — supervisor restart pending", [
               { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
-              { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
+              { name: "Max", value: `${Math.round(budgetMs / 1000)}s`, inline: true },
+              { name: "Phase", value: this._discovering ? "discovery" : "crank", inline: true },
               { name: "Grace", value: `${Math.round(WATCHDOG_GRACE_MS / 1000)}s`, inline: true },
             ])?.catch(() => {});
           } else if (Date.now() - this._watchdogArmedAt > WATCHDOG_GRACE_MS) {
@@ -2189,7 +2245,17 @@ export class CrankService {
         const needsDiscovery =
           Date.now() - this.lastDiscoveryTime >= this.discoveryIntervalMs;
         if (needsDiscovery) {
-          await this.discover();
+          // #420: mark the discovery phase so the watchdog applies the
+          // discovery budget, and re-anchor afterwards so the crank pass is
+          // timed on its own budget rather than inheriting discovery's elapsed.
+          this._discovering = true;
+          try {
+            await this.discover();
+          } finally {
+            this._discovering = false;
+            this._cycleStartedAt = Date.now();
+            this._watchdogArmedAt = 0;
+          }
         }
         if (this.markets.size > 0) {
           const result = await this.crankAll();
