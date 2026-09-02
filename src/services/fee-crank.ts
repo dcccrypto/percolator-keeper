@@ -877,11 +877,27 @@ export function isFeeCrankEnabled(): boolean {
 }
 
 /**
+ * Maximum pubkeys per `getMultipleAccountsInfo` call.
+ *
+ * The JSON-RPC limit is 100; above it the node rejects the entire request with
+ * -32602 rather than truncating. Mirrors `SNAPSHOT_CHUNK_SIZE` in
+ * `lib/account-loader.ts`, which chunks for the same reason. #423.
+ */
+const GMA_CHUNK_SIZE = 100;
+
+/**
  * Fetch the given markets, build snapshots and run one full cycle.
  *
- * Fetches in one `getMultipleAccountsInfo` batch rather than per leg: all four
- * legs read the same account, so the single-snapshot-per-market design costs
- * one RPC round trip for the whole cycle instead of four per market.
+ * Fetches by batch rather than per leg: all four legs read the same account, so
+ * the single-snapshot-per-market design costs one round trip per 100 markets
+ * instead of four per market.
+ *
+ * #423: the batch is CHUNKED. `getMultipleAccountsInfo` accepts at most 100
+ * pubkeys; above that the RPC rejects the whole call with -32602, so a single
+ * unchunked fetch turned "more than 100 markets" into the entire fee-crank pass
+ * running zero times every cycle — including the tag-89 backing-bucket recovery
+ * this module's header flags as stranding user funds — surfaced only as one
+ * warn line that reads like a transient blip.
  */
 export async function runFeeCrankPass(
   connection: Connection,
@@ -894,10 +910,19 @@ export async function runFeeCrankPass(
   let chainSlot: bigint;
   let infos: (Awaited<ReturnType<Connection["getAccountInfo"]>>)[];
   try {
-    [chainSlot, infos] = await Promise.all([
+    const addresses = markets.map((m) => m.address);
+    const chunks: Promise<(Awaited<ReturnType<Connection["getAccountInfo"]>>)[]>[] = [];
+    for (let i = 0; i < addresses.length; i += GMA_CHUNK_SIZE) {
+      chunks.push(connection.getMultipleAccountsInfo(addresses.slice(i, i + GMA_CHUNK_SIZE)));
+    }
+    // Chunks resolve in parallel and are concatenated IN ORDER, because the
+    // per-market loop below indexes `infos[i]` against `markets[i]`.
+    const [slot, ...chunkResults] = await Promise.all([
       connection.getSlot().then((s) => BigInt(s)),
-      connection.getMultipleAccountsInfo(markets.map((m) => m.address)),
+      ...chunks,
     ]);
+    chainSlot = slot as bigint;
+    infos = (chunkResults as (Awaited<ReturnType<Connection["getAccountInfo"]>>)[][]).flat();
   } catch (err) {
     // A failed fetch is not a per-market failure — nothing was evaluated, so
     // there is nothing to isolate. Report once and let the next cycle retry.
