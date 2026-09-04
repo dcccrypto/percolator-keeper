@@ -184,3 +184,118 @@ describe("registerSignedString matches launch's signer byte for byte", () => {
     );
   });
 });
+
+/**
+ * CROSS-REPO CONTRACT — the test whose absence let #2533 ship unfixed.
+ *
+ * Every other test in this file signs with `registerSignedString` and verifies with
+ * `authenticateRegister`, so they agree with each other no matter what the launch app
+ * does. That closed loop is exactly why the first fix passed CI while `/register`
+ * stayed broken in production.
+ *
+ * These tests hard-code the sender's algorithm instead of importing anything, so the
+ * only way they pass is if the keeper accepts bytes shaped the way percolator-launch
+ * actually shapes them.
+ */
+describe("the keeper accepts what percolator-launch actually sends (GH#2533)", () => {
+  const SECRET = "s3cr3t-register-key";
+  const BODY = JSON.stringify({ slab: "7RXTVmGcJMDqqTCFu5ADQRyLDvVZBi3r5U5WXzoULHJV" });
+
+  /**
+   * Verbatim reimplementation of `signKeeperRequest` from percolator-launch
+   * `app/lib/keeper-hmac.ts` @ `playground`:
+   *
+   *   createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex")
+   *
+   * Deliberately NOT imported from src/. If this drifts from launch, these tests must
+   * be the thing that fails.
+   */
+  function signAsLaunchDoes(secret: string, rawBody: string, timestamp: string): string {
+    return createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex");
+  }
+
+  it("accepts a signature produced by the live launch app", () => {
+    const now = Date.now();
+    const timestamp = String(now);
+    const result = authenticateRegister({
+      secret: SECRET,
+      providedSecret: "",
+      timestamp,
+      signature: signAsLaunchDoes(SECRET, BODY, timestamp),
+      rawBody: BODY,
+      method: "POST",
+      path: "/register",
+      now,
+    });
+    expect(result).toEqual({ ok: true, scheme: "hmac-legacy" });
+  });
+
+  it("still accepts the canonical method+path form, so a migrated sender needs no keeper change", () => {
+    const now = Date.now();
+    const timestamp = String(now);
+    const canonical = createHmac("sha256", SECRET)
+      .update([timestamp, "POST", "/register", BODY].join("\n"))
+      .digest("hex");
+    const result = authenticateRegister({
+      secret: SECRET,
+      providedSecret: "",
+      timestamp,
+      signature: canonical,
+      rawBody: BODY,
+      method: "POST",
+      path: "/register",
+      now,
+    });
+    expect(result).toEqual({ ok: true, scheme: "hmac" });
+  });
+
+  it("still rejects a signature made with the wrong secret", () => {
+    // The point of accepting two formats is not to accept two credentials.
+    const now = Date.now();
+    const timestamp = String(now);
+    const result = authenticateRegister({
+      secret: SECRET,
+      providedSecret: "",
+      timestamp,
+      signature: signAsLaunchDoes("not-the-secret", BODY, timestamp),
+      rawBody: BODY,
+      method: "POST",
+      path: "/register",
+      now,
+    });
+    expect(result).toEqual({ ok: false, reason: "bad-signature" });
+  });
+
+  it("still rejects a tampered body under the legacy format", () => {
+    const now = Date.now();
+    const timestamp = String(now);
+    const signature = signAsLaunchDoes(SECRET, BODY, timestamp);
+    const result = authenticateRegister({
+      secret: SECRET,
+      providedSecret: "",
+      timestamp,
+      signature,
+      rawBody: BODY.replace("7RXT", "0000"),
+      method: "POST",
+      path: "/register",
+      now,
+    });
+    expect(result).toEqual({ ok: false, reason: "bad-signature" });
+  });
+
+  it("still enforces the replay window on the legacy format", () => {
+    const now = Date.now();
+    const timestamp = String(now - MAX_SIGNATURE_AGE_MS - 1);
+    const result = authenticateRegister({
+      secret: SECRET,
+      providedSecret: "",
+      timestamp,
+      signature: signAsLaunchDoes(SECRET, BODY, timestamp),
+      rawBody: BODY,
+      method: "POST",
+      path: "/register",
+      now,
+    });
+    expect(result).toEqual({ ok: false, reason: "stale-timestamp" });
+  });
+});
