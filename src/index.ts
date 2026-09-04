@@ -1,6 +1,7 @@
 import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { authenticateRegister } from "./lib/register-auth.js";
 import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, getConnection, maskApiKeys } from "@percolatorct/shared";
 import { monitors } from "./lib/service-monitors.js";
 import { getKeeperKeypair } from "./lib/keypair-singleton.js";
@@ -372,29 +373,10 @@ res.writeHead(429, secureJsonHeaders);
       return;
     }
 
-    const provided = String(req.headers["x-shared-secret"] ?? "");
-    const secretBuf = Buffer.from(registerSecret, "utf8");
-    const providedBuf = Buffer.from(provided, "utf8");
-    // Pad both buffers to equal length so timingSafeEqual always runs in
-    // constant time regardless of input length — prevents attackers from
-    // binary-searching the secret length via response-time measurement.
-    const maxLen = Math.max(secretBuf.length, providedBuf.length, 1);
-    const secretPad = Buffer.alloc(maxLen);
-    const providedPad = Buffer.alloc(maxLen);
-    secretBuf.copy(secretPad);
-    providedBuf.copy(providedPad);
-    const lengthMatch = secretBuf.length === providedBuf.length;
-    // Always run timingSafeEqual — do NOT use || short-circuit, which skips
-    // the crypto comparison when lengths differ and leaks timing info.
-    const contentMatch = timingSafeEqual(secretPad, providedPad);
-    if (!lengthMatch || !contentMatch) {
-      recordAuthFailure(clientIp);
-req.resume();
-res.writeHead(401, secureJsonHeaders);
-      res.end(JSON.stringify({ success: false, message: "Unauthorized" }));
-      return;
-    }
-
+    // #2533: authentication happens AFTER the body is read, because the HMAC
+    // scheme signs the raw body. The body is still bounded first (4 KB below)
+    // and the rate limiter has already run, so an unauthenticated caller cannot
+    // use this to make us buffer anything meaningful.
     const MAX_BODY_BYTES = 4096;
     let body = "";
     let exceeded = false;
@@ -410,6 +392,28 @@ res.writeHead(401, secureJsonHeaders);
     });
     req.on("end", async () => {
       if (exceeded) return;
+      // #2533: accept EITHER the HMAC the launch app sends, or the legacy
+      // x-shared-secret. Before this, only the latter was checked while the app
+      // sends only the former, so every hot-registration 401'd and surfaced as
+      // "Keeper unreachable" — indistinguishable from the keeper being down.
+      const auth = authenticateRegister({
+        secret: registerSecret,
+        providedSecret: String(req.headers["x-shared-secret"] ?? ""),
+        timestamp: String(req.headers["x-keeper-timestamp"] ?? ""),
+        signature: String(req.headers["x-keeper-signature"] ?? ""),
+        rawBody: body,
+        method: "POST",
+        path: "/register",
+      });
+      if (!auth.ok) {
+        recordAuthFailure(clientIp);
+        logger.warn("Register auth rejected", { ip: clientIp, reason: auth.reason });
+        res.writeHead(401, secureJsonHeaders);
+        res.end(JSON.stringify({ success: false, message: "Unauthorized" }));
+        return;
+      }
+      logger.info("Register authenticated", { scheme: auth.scheme });
+
       try {
         const parsed = JSON.parse(body) as { slabAddress?: string; mainnetCA?: string };
         const { slabAddress, mainnetCA } = parsed;
