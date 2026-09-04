@@ -29,7 +29,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 export const MAX_SIGNATURE_AGE_MS = 5 * 60_000;
 
 export type RegisterAuthOutcome =
-  | { ok: true; scheme: "hmac" | "shared-secret" }
+  | { ok: true; scheme: "hmac" | "hmac-legacy" | "shared-secret" }
   | { ok: false; reason: string };
 
 /**
@@ -57,18 +57,13 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 /**
- * The exact bytes the sender signs.
+ * CANONICAL signed string: timestamp, method, path and body, newline-joined.
  *
- * MUST stay identical to `signedString` in percolator-launch
- * `app/lib/keeper-hmac.ts`:
+ * Binding the method and path (launch #2476) stops a signature captured for one
+ * endpoint being replayed against another that happens to accept the same body.
  *
- *     [timestamp, method.toUpperCase(), path, rawBody].join("\n")
- *
- * The method and path are part of it (launch #2476) so a signature captured for
- * one endpoint cannot be replayed against another that happens to accept the
- * same body. Drift here fails closed — the signature simply will not verify —
- * but it fails closed at market-creation time, which is a bad moment to discover
- * it. That is precisely how #2533 stayed hidden.
+ * NOTHING SENDS THIS YET. It is the target format, not the live one — see
+ * `legacyRegisterSignedString` below and the correction recorded there.
  */
 export function registerSignedString(
   timestamp: string,
@@ -77,6 +72,36 @@ export function registerSignedString(
   rawBody: string,
 ): string {
   return [timestamp, method.toUpperCase(), path, rawBody].join("\n");
+}
+
+/**
+ * The bytes the launch app ACTUALLY signs, today, on the branch that is deployed.
+ *
+ * percolator-launch `app/lib/keeper-hmac.ts` on `playground` — the only live
+ * deploy target; `main` is the marketing site and does not even contain the file:
+ *
+ *     createHmac("sha256", secret).update(`${timestamp}.${rawBody}`)
+ *
+ * There is no method, no path, and no `signedString` export. The first version of
+ * this module asserted there was one, cited launch #2476 for it, and verified only
+ * the canonical form — so `/register` went on returning 401 to every real caller,
+ * having merely swapped `bad-shared-secret` for `bad-signature`. The tests passed
+ * because they signed with this module's own helper and verified with the same
+ * helper: a closed loop that could not observe the sender.
+ *
+ * launch #2476 is CLOSED but its fix is not on `playground`. That is launch #2440
+ * — issues are filed against `playground` while work lands on a `main` that is
+ * hundreds of commits divorced from it — and it is why "the sender was migrated"
+ * looked true from the issue tracker and was false in the deployed code.
+ *
+ * Accepting both formats is deliberate. Only `/register` uses this HMAC, so there
+ * is no second endpoint to replay a signature at, and refusing the live format to
+ * hold a property nothing yet provides would keep the feature broken to protect
+ * an attack that cannot currently be mounted. Retire this once launch signs the
+ * canonical form — in lockstep, receiver first.
+ */
+export function legacyRegisterSignedString(timestamp: string, rawBody: string): string {
+  return `${timestamp}.${rawBody}`;
 }
 
 export interface RegisterAuthInput {
@@ -116,11 +141,20 @@ export function authenticateRegister(input: RegisterAuthInput): RegisterAuthOutc
     if (Math.abs(now - ts) > MAX_SIGNATURE_AGE_MS) {
       return { ok: false, reason: "stale-timestamp" };
     }
+    // Canonical form first, so a sender that migrates is accepted immediately and
+    // without a keeper change.
     const expected = createHmac("sha256", secret)
       .update(registerSignedString(timestamp, method, path, rawBody))
       .digest("hex");
     if (constantTimeEqual(expected, signature)) {
       return { ok: true, scheme: "hmac" };
+    }
+    // Then the format the deployed launch app actually sends.
+    const expectedLegacy = createHmac("sha256", secret)
+      .update(legacyRegisterSignedString(timestamp, rawBody))
+      .digest("hex");
+    if (constantTimeEqual(expectedLegacy, signature)) {
+      return { ok: true, scheme: "hmac-legacy" };
     }
     // Do NOT fall through to the shared-secret check. A caller that presented an
     // HMAC and got it wrong is not then invited to try a different credential in
