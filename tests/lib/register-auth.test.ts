@@ -186,32 +186,39 @@ describe("registerSignedString matches launch's signer byte for byte", () => {
 });
 
 /**
- * CROSS-REPO CONTRACT — the test whose absence let #2533 ship unfixed.
+ * CROSS-REPO CONTRACT.
  *
- * Every other test in this file signs with `registerSignedString` and verifies with
- * `authenticateRegister`, so they agree with each other no matter what the launch app
- * does. That closed loop is exactly why the first fix passed CI while `/register`
- * stayed broken in production.
+ * Every other test here signs with `registerSignedString` and verifies with
+ * `authenticateRegister` — a closed loop that agrees with itself no matter what the
+ * launch app does. That is how #2533 shipped "fixed" twice.
  *
- * These tests hard-code the sender's algorithm instead of importing anything, so the
- * only way they pass is if the keeper accepts bytes shaped the way percolator-launch
- * actually shapes them.
+ * These hard-code launch's algorithm instead of importing anything, so the only way
+ * they pass is if the keeper accepts bytes shaped the way percolator-launch actually
+ * shapes them.
  */
 describe("the keeper accepts what percolator-launch actually sends (GH#2533)", () => {
   const SECRET = "s3cr3t-register-key";
   const BODY = JSON.stringify({ slab: "7RXTVmGcJMDqqTCFu5ADQRyLDvVZBi3r5U5WXzoULHJV" });
 
   /**
-   * Verbatim reimplementation of `signKeeperRequest` from percolator-launch
-   * `app/lib/keeper-hmac.ts` @ `playground`:
+   * Verbatim reimplementation of `signedString` + `signKeeperRequest` from
+   * percolator-launch `app/lib/keeper-hmac.ts` @ `playground` (994b03a9, #2476):
    *
-   *   createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex")
+   *   [timestamp, method.toUpperCase(), path, rawBody].join("\n")
    *
-   * Deliberately NOT imported from src/. If this drifts from launch, these tests must
-   * be the thing that fails.
+   * Deliberately NOT imported from src/. If the two repos drift, THIS must be what
+   * fails.
    */
-  function signAsLaunchDoes(secret: string, rawBody: string, timestamp: string): string {
-    return createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex");
+  function signAsLaunchDoes(
+    secret: string,
+    rawBody: string,
+    timestamp: string,
+    method: string,
+    path: string,
+  ): string {
+    return createHmac("sha256", secret)
+      .update([timestamp, method.toUpperCase(), path, rawBody].join("\n"))
+      .digest("hex");
   }
 
   it("accepts a signature produced by the live launch app", () => {
@@ -221,26 +228,7 @@ describe("the keeper accepts what percolator-launch actually sends (GH#2533)", (
       secret: SECRET,
       providedSecret: "",
       timestamp,
-      signature: signAsLaunchDoes(SECRET, BODY, timestamp),
-      rawBody: BODY,
-      method: "POST",
-      path: "/register",
-      now,
-    });
-    expect(result).toEqual({ ok: true, scheme: "hmac-legacy" });
-  });
-
-  it("still accepts the canonical method+path form, so a migrated sender needs no keeper change", () => {
-    const now = Date.now();
-    const timestamp = String(now);
-    const canonical = createHmac("sha256", SECRET)
-      .update([timestamp, "POST", "/register", BODY].join("\n"))
-      .digest("hex");
-    const result = authenticateRegister({
-      secret: SECRET,
-      providedSecret: "",
-      timestamp,
-      signature: canonical,
+      signature: signAsLaunchDoes(SECRET, BODY, timestamp, "POST", "/register"),
       rawBody: BODY,
       method: "POST",
       path: "/register",
@@ -249,15 +237,20 @@ describe("the keeper accepts what percolator-launch actually sends (GH#2533)", (
     expect(result).toEqual({ ok: true, scheme: "hmac" });
   });
 
-  it("still rejects a signature made with the wrong secret", () => {
-    // The point of accepting two formats is not to accept two credentials.
+  it("REFUSES the unbound dot-joined form", () => {
+    // A previous revision accepted `${timestamp}.${rawBody}` on the false premise
+    // that launch still sent it. Accepting an unbound signature defeats #2476: it
+    // is valid for the same body at ANY endpoint sharing the secret.
     const now = Date.now();
     const timestamp = String(now);
+    const unbound = createHmac("sha256", SECRET)
+      .update(`${timestamp}.${BODY}`)
+      .digest("hex");
     const result = authenticateRegister({
       secret: SECRET,
       providedSecret: "",
       timestamp,
-      signature: signAsLaunchDoes("not-the-secret", BODY, timestamp),
+      signature: unbound,
       rawBody: BODY,
       method: "POST",
       path: "/register",
@@ -266,16 +259,16 @@ describe("the keeper accepts what percolator-launch actually sends (GH#2533)", (
     expect(result).toEqual({ ok: false, reason: "bad-signature" });
   });
 
-  it("still rejects a tampered body under the legacy format", () => {
+  it("REFUSES a signature bound to a different path", () => {
+    // The property #2476 buys, asserted directly rather than assumed.
     const now = Date.now();
     const timestamp = String(now);
-    const signature = signAsLaunchDoes(SECRET, BODY, timestamp);
     const result = authenticateRegister({
       secret: SECRET,
       providedSecret: "",
       timestamp,
-      signature,
-      rawBody: BODY.replace("7RXT", "0000"),
+      signature: signAsLaunchDoes(SECRET, BODY, timestamp, "POST", "/admin/budget/resume"),
+      rawBody: BODY,
       method: "POST",
       path: "/register",
       now,
@@ -283,19 +276,66 @@ describe("the keeper accepts what percolator-launch actually sends (GH#2533)", (
     expect(result).toEqual({ ok: false, reason: "bad-signature" });
   });
 
-  it("still enforces the replay window on the legacy format", () => {
+  it("REFUSES a signature bound to a different method", () => {
+    const now = Date.now();
+    const timestamp = String(now);
+    const result = authenticateRegister({
+      secret: SECRET,
+      providedSecret: "",
+      timestamp,
+      signature: signAsLaunchDoes(SECRET, BODY, timestamp, "GET", "/register"),
+      rawBody: BODY,
+      method: "POST",
+      path: "/register",
+      now,
+    });
+    expect(result).toEqual({ ok: false, reason: "bad-signature" });
+  });
+
+  it("still refuses a wrong secret and a tampered body", () => {
+    const now = Date.now();
+    const timestamp = String(now);
+    expect(
+      authenticateRegister({
+        secret: SECRET,
+        providedSecret: "",
+        timestamp,
+        signature: signAsLaunchDoes("not-the-secret", BODY, timestamp, "POST", "/register"),
+        rawBody: BODY,
+        method: "POST",
+        path: "/register",
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "bad-signature" });
+
+    expect(
+      authenticateRegister({
+        secret: SECRET,
+        providedSecret: "",
+        timestamp,
+        signature: signAsLaunchDoes(SECRET, BODY, timestamp, "POST", "/register"),
+        rawBody: BODY.replace("7RXT", "0000"),
+        method: "POST",
+        path: "/register",
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "bad-signature" });
+  });
+
+  it("still enforces the replay window", () => {
     const now = Date.now();
     const timestamp = String(now - MAX_SIGNATURE_AGE_MS - 1);
-    const result = authenticateRegister({
-      secret: SECRET,
-      providedSecret: "",
-      timestamp,
-      signature: signAsLaunchDoes(SECRET, BODY, timestamp),
-      rawBody: BODY,
-      method: "POST",
-      path: "/register",
-      now,
-    });
-    expect(result).toEqual({ ok: false, reason: "stale-timestamp" });
+    expect(
+      authenticateRegister({
+        secret: SECRET,
+        providedSecret: "",
+        timestamp,
+        signature: signAsLaunchDoes(SECRET, BODY, timestamp, "POST", "/register"),
+        rawBody: BODY,
+        method: "POST",
+        path: "/register",
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "stale-timestamp" });
   });
 });
