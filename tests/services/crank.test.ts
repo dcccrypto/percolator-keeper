@@ -1402,6 +1402,75 @@ describe('CrankService', () => {
   });
 
   describe('registerMarket', () => {
+    // Council r5 #2: opt-in stablecoin-underlying refusal.
+    describe('stablecoin-underlying refusal (REFUSE_STABLECOIN_UNDERLYINGS)', () => {
+      const USDS = 'USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA';
+      afterEach(() => {
+        delete process.env.REFUSE_STABLECOIN_UNDERLYINGS;
+      });
+
+      it('on: a stablecoin mainnetCA is refused before any RPC read or state write', async () => {
+        process.env.REFUSE_STABLECOIN_UNDERLYINGS = '1';
+        const slabAddress = 'So11111111111111111111111111111111111111112';
+        const getAccountInfo = vi.fn();
+        vi.mocked(shared.getConnection).mockReturnValue({ getAccountInfo } as any);
+
+        const result = await crankService.registerMarket(slabAddress, USDS);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/stablecoin/i);
+        expect(getAccountInfo).not.toHaveBeenCalled();
+        expect(crankService.getMarkets().has(slabAddress)).toBe(false);
+      });
+
+      it('off (default): the same mainnetCA is not refused by this gate (proceeds to the slab read)', async () => {
+        const slabAddress = 'So11111111111111111111111111111111111111112';
+        const getAccountInfo = vi.fn(async () => null);
+        vi.mocked(shared.getConnection).mockReturnValue({ getAccountInfo } as any);
+
+        const result = await crankService.registerMarket(slabAddress, USDS);
+
+        expect(getAccountInfo).toHaveBeenCalled();
+        expect(result.message).toMatch(/Slab account not found/);
+      });
+
+      it('discovery: on, a market whose Supabase mainnet_ca is a stablecoin is not tracked; a normal one is', async () => {
+        process.env.REFUSE_STABLECOIN_UNDERLYINGS = '1';
+        const mk = (slab: string) => ({
+          slabAddress: { toBase58: () => slab },
+          programId: { toBase58: () => '11111111111111111111111111111111' },
+          config: {
+            collateralMint: { toBase58: () => 'Mint1111111111111111111111111111111111' },
+            oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111', equals: () => false },
+            indexFeedId: { toBytes: () => new Uint8Array(32) },
+          },
+          params: { maintenanceMarginBps: 500n, initialMarginBps: 1000n },
+          header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+        });
+        const STABLE_SLAB = 'GRMMNsNPM1GbgxFh3S34f3jvUX6jPbPiH3oxopnDFiWM';
+        const OK_SLAB = '3t67LQPdgiSqGvXsYff3Pzv2uHtM1zZ7f29HsnEzb6vJ';
+        vi.mocked(core.discoverMarkets).mockResolvedValue([mk(STABLE_SLAB), mk(OK_SLAB)] as any);
+        vi.mocked(shared.getSupabase).mockReturnValueOnce({
+          from: vi.fn(() => ({
+            select: vi.fn(() => ({
+              in: vi.fn(() => ({
+                data: [
+                  { slab_address: STABLE_SLAB, mainnet_ca: USDS },
+                  { slab_address: OK_SLAB, mainnet_ca: 'CbcyNo7m1amFWqEQm2m4PLv1UNvpcL3C1Ujm6AkzpKoU' },
+                ],
+                error: null,
+              })),
+            })),
+          })),
+        } as any);
+
+        await crankService.discover();
+
+        expect(crankService.getMarkets().has(STABLE_SLAB)).toBe(false);
+        expect(crankService.getMarkets().has(OK_SLAB)).toBe(true);
+      });
+    });
+
     it('provisions a v17 keeper portfolio before reporting the initial hot-register crank', async () => {
       const slabAddress = 'So11111111111111111111111111111111111111112';
       const programId = new PublicKey('11111111111111111111111111111111');
