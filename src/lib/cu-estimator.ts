@@ -10,6 +10,7 @@ import { createLogger } from "@percolatorct/shared";
 
 const logger = createLogger("keeper:cu-estimator");
 
+// The margin multiplies the metered units once, after the simulator has settled: the tail lane rounds up, never the head.
 const DEFAULT_MARGIN = 1.1;
 const DEFAULT_FALLBACK_CU = 1_400_000;
 
