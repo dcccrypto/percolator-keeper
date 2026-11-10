@@ -2,6 +2,7 @@ import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { authenticateRegister } from "./lib/register-auth.js";
+import { registerResponse } from "./lib/register-response.js";
 import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, getConnection, maskApiKeys } from "@percolatorct/shared";
 import { monitors } from "./lib/service-monitors.js";
 import { getKeeperKeypair } from "./lib/keypair-singleton.js";
@@ -438,11 +439,9 @@ res.writeHead(429, secureJsonHeaders);
         if (!result.success) {
           logger.warn("registerMarket failed", { slabAddress, detail: result.message });
         }
-        const safeMessage = result.success
-          ? result.message
-          : "Registration failed";
-        res.writeHead(result.success ? 200 : 422, secureJsonHeaders);
-        res.end(JSON.stringify({ success: result.success, message: safeMessage }));
+        const out = registerResponse(result);
+        res.writeHead(out.status, secureJsonHeaders);
+        res.end(JSON.stringify(out.body));
       } catch (err) {
         logger.error("Register endpoint error", { error: err instanceof Error ? err.message : String(err) });
         res.writeHead(500, secureJsonHeaders);

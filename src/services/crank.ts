@@ -1406,11 +1406,12 @@ export class CrankService {
       const key = market.slabAddress.toBase58();
       discoveredKeys.add(key);
       const dbMeta = dbMarkets.get(key);
-      // Council r5 #2: a market whose registered token identity is a dollar stablecoin is not tracked (opt-in, see lib/stablecoin-refusal);
-      // one already tracked before the row said so is dropped.
+      // Council r5 #2: a market whose registered token identity is a dollar stablecoin is not NEWLY tracked (opt-in, see
+      // lib/stablecoin-refusal). One that is already tracked is NEVER evicted or stopped: it may hold user funds, and dropping it would
+      // stop its cranking, liquidations and funding. It keeps its normal handling below; we only warn.
       if (isRefusedStablecoinUnderlying(dbMeta?.mainnetCA)) {
-        if (this.markets.delete(key)) logger.warn("Dropping a stablecoin-underlying market", { slabAddress: key, mainnetCA: dbMeta?.mainnetCA });
-        continue;
+        if (!this.markets.has(key)) continue;
+        logger.warn("Stablecoin-underlying market is already tracked; kept (refusal only blocks new tracking)", { slabAddress: key, mainnetCA: dbMeta?.mainnetCA });
       }
       if (!this.markets.has(key)) {
         this.markets.set(key, {

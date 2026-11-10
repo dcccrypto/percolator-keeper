@@ -1434,6 +1434,49 @@ describe('CrankService', () => {
         expect(result.message).toMatch(/Slab account not found/);
       });
 
+      it('discovery: on, an ALREADY-TRACKED market whose mainnet_ca is a stablecoin is kept and still cranked', async () => {
+        process.env.REFUSE_STABLECOIN_UNDERLYINGS = '1';
+        const SLAB = 'GRMMNsNPM1GbgxFh3S34f3jvUX6jPbPiH3oxopnDFiWM';
+        const mkt = {
+          slabAddress: { toBase58: () => SLAB },
+          programId: { toBase58: () => '11111111111111111111111111111111' },
+          config: {
+            collateralMint: { toBase58: () => 'Mint1111111111111111111111111111111111' },
+            oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111', equals: () => false },
+            indexFeedId: { toBytes: () => new Uint8Array(32) },
+          },
+          params: { maintenanceMarginBps: 500n, initialMarginBps: 1000n },
+          header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+        };
+        vi.mocked(core.discoverMarkets).mockResolvedValue([mkt] as any);
+        await crankService.discover(); // tracked first (no Supabase row says stable yet)
+        expect(crankService.getMarkets().has(SLAB)).toBe(true);
+        setKeeperPortfolios(crankService);
+        const before = crankService.getMarkets().get(SLAB)!;
+
+        vi.mocked(shared.getSupabase).mockReturnValueOnce({
+          from: vi.fn(() => ({ select: vi.fn(() => ({ in: vi.fn(() => ({ data: [{ slab_address: SLAB, mainnet_ca: USDS }], error: null })) })) })),
+        } as any);
+        await crankService.discover();
+
+        expect(crankService.getMarkets().has(SLAB)).toBe(true); // not evicted
+        expect(crankService.getMarkets().get(SLAB)).toBe(before); // same state object: counters / portfolio not reset
+        // state untouched: still active, not skipped, keeper portfolio kept (crankAll iterates this map, so it keeps being cranked)
+        expect(before.isActive).toBe(true);
+        expect(before.permanentlySkipped).toBeFalsy();
+        expect(before.missingDiscoveryCount).toBe(0);
+        expect(before.keeperPortfolio).toBe(MOCK_PORTFOLIO);
+      });
+
+      it('/register maps a stablecoin refusal to HTTP 422 with the masked body', async () => {
+        process.env.REFUSE_STABLECOIN_UNDERLYINGS = '1';
+        vi.mocked(shared.getConnection).mockReturnValue({ getAccountInfo: vi.fn() } as any);
+        const result = await crankService.registerMarket('So11111111111111111111111111111111111111112', USDS);
+        const { registerResponse } = await import('../../src/lib/register-response.js');
+        expect(registerResponse(result)).toEqual({ status: 422, body: { success: false, message: 'Registration failed' } });
+        expect(registerResponse({ success: true, message: 'ok' })).toEqual({ status: 200, body: { success: true, message: 'ok' } });
+      });
+
       it('discovery: on, a market whose Supabase mainnet_ca is a stablecoin is not tracked; a normal one is', async () => {
         process.env.REFUSE_STABLECOIN_UNDERLYINGS = '1';
         const mk = (slab: string) => ({
