@@ -44,6 +44,7 @@ import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 import { isFeeCrankEnabled, runFeeCrankPass } from "./fee-crank.js";
+import { isRefusedStablecoinUnderlying } from "../lib/stablecoin-refusal.js";
 
 export type CrankResult = "success" | "skipped" | "failed";
 
@@ -1405,6 +1406,13 @@ export class CrankService {
       const key = market.slabAddress.toBase58();
       discoveredKeys.add(key);
       const dbMeta = dbMarkets.get(key);
+      // Council r5 #2: a market whose registered token identity is a dollar stablecoin is not NEWLY tracked (opt-in, see
+      // lib/stablecoin-refusal). One that is already tracked is NEVER evicted or stopped: it may hold user funds, and dropping it would
+      // stop its cranking, liquidations and funding. It keeps its normal handling below; we only warn.
+      if (isRefusedStablecoinUnderlying(dbMeta?.mainnetCA)) {
+        if (!this.markets.has(key)) continue;
+        logger.warn("Stablecoin-underlying market is already tracked; kept (refusal only blocks new tracking)", { slabAddress: key, mainnetCA: dbMeta?.mainnetCA });
+      }
       if (!this.markets.has(key)) {
         this.markets.set(key, {
           market,
@@ -2096,6 +2104,11 @@ export class CrankService {
    * Called by the /register HTTP endpoint when the frontend creates a new market.
    */
   async registerMarket(slabAddress: string, mainnetCA?: string): Promise<{ success: boolean; message: string }> {
+    // Council r5 #2: a dollar-stablecoin underlying is never tracked (opt-in, see lib/stablecoin-refusal). Before any RPC or state write.
+    if (isRefusedStablecoinUnderlying(mainnetCA)) {
+      logger.warn("Refusing to register a stablecoin-underlying market", { slabAddress, mainnetCA });
+      return { success: false, message: "Refused: dollar stablecoins are not perp underlyings" };
+    }
     if (this.markets.has(slabAddress)) {
       // Update mainnetCA even if already tracked (registration may have been partial)
       if (mainnetCA) {
