@@ -5,6 +5,7 @@ const logger = createLogger("keeper:slot-tracker");
 const POLL_INTERVAL_MS = 10_000;
 const DEFAULT_DRIFT_ALERT_SLOTS = 50;
 const DEFAULT_DRIFT_ALERT_COOLDOWN_MS = 5 * 60_000;
+// Cooldown is measured from the last alert, not the last poll, so a quiet stretch never banks a free alert.
 
 export class SlotTracker {
   private streamSlot = 0;
