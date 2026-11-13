@@ -473,7 +473,7 @@ packages:
     engines: {node: '>=20.0.0'}
 
   '@percolatorct/shared@https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/57b1de87c3c156e46f085612e3a73866934903bb':
-    resolution: {gitHosted: true, integrity: sha512-fKauIu/s+7AkKZ5ElMSM81HFbEj/356IadEz/1K7tFb2hgg8Xx+x5qFGPIk8JdEhy6hoN0dJMaHrOtfPCBJZfQ==, tarball: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/57b1de87c3c156e46f085612e3a73866934903bb}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/dcccrypto/percolator-shared/tar.gz/57b1de87c3c156e46f085612e3a73866934903bb}
     version: 1.0.0-beta.8
     peerDependencies:
       '@percolatorct/sdk': '>=2.0.5'

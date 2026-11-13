@@ -61,3 +61,6 @@ overrides:
   # source-map-js >=1.0.0 <1.2.2. Build-time only (vitest > vite > postcss).
   # Exact for the same reason as above; single instance in the tree.
   "source-map-js": 1.2.2
+  # GHSA-mrhx-c7xc-m3w5: zod < 4.6.6. RUNTIME: @percolatorct/shared > zod (its range is ^4.3.6, so 4.6.7
+  # is inside it). Exact, for the same reason as the pins above: the locked 4.3.6 would not move for a floor.
+  zod: 4.6.7
